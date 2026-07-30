@@ -1,3 +1,13 @@
+# 0.1.2
+
+## 07/30/2026
+
+1. [](#bugfix)
+    * A merge commit that is the only thing following a tag, and that genuinely
+      changes the tree, is no longer reported as released. Discounting merges
+      fixes the git-flow back-merge, but on its own it could hide work that
+      still needed releasing.
+
 # 0.1.1
 
 ## 07/30/2026
