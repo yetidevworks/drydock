@@ -1,0 +1,40 @@
+[package]
+name = "drydock"
+version.workspace = true
+edition.workspace = true
+rust-version = "1.80"
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage = "https://github.com/yetidevworks/drydock"
+readme = "README.md"
+description = "Live dashboard for a fleet of git repos: what's uncommitted, unpushed, and unreleased, at a glance."
+keywords = ["git", "tui", "dashboard", "monorepo", "release"]
+categories = ["command-line-utilities", "development-tools"]
+
+[[bin]]
+name = "drydock"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+tokio = { version = "1", features = ["full", "process"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+dirs = "6"
+anyhow = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+ratatui = "0.30"
+crossterm = "0.29"
+notify = "8"
+notify-debouncer-full = "0.7"
+globset = "0.4"
+walkdir = "2"
+num_cpus = "1"
+shellexpand = "3"
+
+[dev-dependencies]
+tempfile = "3"

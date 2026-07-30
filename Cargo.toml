@@ -1,0 +1,15 @@
+[workspace]
+resolver = "2"
+members = ["crates/drydock"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["Andy Miller <andy@trilbymedia.com>"]
+repository = "https://github.com/yetidevworks/drydock"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
