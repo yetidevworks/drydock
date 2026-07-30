@@ -1,3 +1,13 @@
+# 0.1.1
+
+## 07/30/2026
+
+1. [](#bugfix)
+    * Git-flow back-merges no longer count as unreleased work. After a release,
+      `develop` carries a "Merge tag 'x.y.z' into develop" commit the tag cannot
+      reach, which reported one commit to release when there was nothing to
+      release. Merge commits are now excluded from commits-since-tag.
+
 # 0.1.0
 
 ## 07/30/2026
