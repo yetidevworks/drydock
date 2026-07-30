@@ -94,29 +94,41 @@ jobs:
       - name: Check the tap token can push
         env:
           GITHUB_TOKEN: ${{ secrets.TAP_PUSH_TOKEN }}
+          # A real tag must stop dead on a bad credential. A rehearsal reports
+          # it and carries on, so the builds still get exercised.
+          FATAL: ${{ github.event_name == 'push' }}
         run: |
-          set -euo pipefail
+          set -uo pipefail
+          fail() {
+            if [[ "${FATAL}" == "true" ]]; then
+              echo "::error::$1"
+              exit 1
+            fi
+            echo "::warning::$1"
+            exit 0
+          }
+
           if [[ -z "${GITHUB_TOKEN:-}" ]]; then
-            echo "TAP_PUSH_TOKEN is not set on this repository." >&2
-            exit 1
+            fail "TAP_PUSH_TOKEN is not set on this repository."
           fi
 
-          PUSH=$(gh api "/repos/${TAP_REPO}" --jq '.permissions.push // false')
+          if ! PUSH=$(gh api "/repos/${TAP_REPO}" --jq '.permissions.push // false' 2>/tmp/gh.err); then
+            fail "TAP_PUSH_TOKEN was rejected by GitHub: $(tr -d '\n' < /tmp/gh.err)"
+          fi
           echo "Push permission on ${TAP_REPO}: ${PUSH}"
           if [[ "${PUSH}" != "true" ]]; then
-            echo "TAP_PUSH_TOKEN cannot push to ${TAP_REPO}." >&2
-            exit 1
+            fail "TAP_PUSH_TOKEN cannot push to ${TAP_REPO}."
           fi
 
           # Rehearse the push itself, so a token that reports write access but
           # is blocked in practice still fails here rather than mid-release.
-          gh repo clone "${TAP_REPO}" tap -- --depth 1
+          gh repo clone "${TAP_REPO}" tap -- --depth 1 || fail "Could not clone ${TAP_REPO}."
           cd tap
           git config user.name "drydock-bot"
           git config user.email "drydock-bot@users.noreply.github.com"
           git commit -q --allow-empty -m "rehearsal"
           gh auth setup-git
-          git push --dry-run origin HEAD:main
+          git push --dry-run origin HEAD:main || fail "A push to ${TAP_REPO} would be rejected."
           echo "The tap push path works."
 
   build:
