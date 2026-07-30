@@ -17,21 +17,12 @@ ones still have work sitting in them, this tells you, in one screen, live.
 
 Written in Rust. Works on macOS and Linux.
 
-```
- drydock  ~/Projects  312 repos · 41 dirty · 12 unpushed · 88 unreleased · live
- filter  dirty  any  unpushed   since 1w  sort activity
-┌ showing 14 of 312 ───────────────────────────────────────────────────────────────────────────────────────┐
-│GROUP         REPO                     BRANCH             STATE        CHANGES     AHEAD BEHIND TAG   +TAG │
-│acme          web-platform             main               ● dirty      +1 ~12 ?8       ·      · 1.4.0    1 │
-│acme          api-gateway              develop            ● dirty      ~5              3      2 2.1.7    4 │
-│acme          design-tokens            main               ↑ unpushed   ·               2      · 0.9.1    2 │
-│oss           parser-core              develop            ◆ unreleased ·               ·      · 3.2.0    6 │
-│oss           cli-tools                release/2.0        ⚠ rebasing   1 conflict      ·      · (1.9.4)  · │
-│sandbox       spike-wasm               main               ● dirty      ~2 ?4           1      · -        · │
-└──────────────────────────────────────────────────────────────────────────────────────────────────────────┘
- j/k move  ⏎ detail  d dirty  u unpushed  r unreleased  a clear  s sort  / search  ? help
- ~/Projects/acme/web-platform · 9m ago via file edit
-```
+![drydock](screenshot.png)
+
+Colour carries the state, so the rows worth acting on stand out without reading
+a word: yellow for uncommitted changes, cyan for commits you haven't pushed,
+magenta for commits past the last tag, red for conflicts and half-finished
+merges, and everything clean dimmed out of the way.
 
 ## What it answers
 
