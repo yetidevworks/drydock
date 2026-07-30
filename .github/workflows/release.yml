@@ -70,7 +70,7 @@ jobs:
       - name: Check the crate is publishable
         run: cargo publish -p drydock --dry-run
 
-      - name: Check the crates.io token works
+      - name: Check the crates.io token is present
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: |
@@ -79,19 +79,17 @@ jobs:
             echo "CARGO_REGISTRY_TOKEN is not set on this repository." >&2
             exit 1
           fi
-          # Ask crates.io who the token belongs to. `cargo owner --list` is no
-          # use here: for a crate that has never been published it fails with
-          # "not found" before the token is ever checked, so it would pass with
-          # any string at all.
-          CODE=$(curl -sS -o /tmp/me.json -w '%{http_code}' \
-            -H "Authorization: ${CARGO_REGISTRY_TOKEN}" \
-            -A 'drydock-release (github actions)' \
-            https://crates.io/api/v1/me)
-          if [[ "${CODE}" != "200" ]]; then
-            echo "crates.io rejected the token (HTTP ${CODE})." >&2
-            exit 1
-          fi
-          echo "crates.io accepted the token for: $(jq -r '.user.login' /tmp/me.json)"
+          echo "CARGO_REGISTRY_TOKEN is set (${#CARGO_REGISTRY_TOKEN} characters)."
+          # Presence is all this can honestly check. crates.io has no
+          # non-destructive endpoint that accepts an API token:
+          #   - `cargo owner --list <crate>` fails with "not found" before the
+          #     token is examined when the crate is unpublished, so it passes
+          #     with any value at all.
+          #   - `/api/v1/me` needs a browser session and returns 403 even for a
+          #     perfectly valid API token.
+          # Every endpoint that does accept a token (publish, yank, owner add)
+          # changes something. So the token itself is only ever proven by the
+          # real publish, and a bad one fails there with nothing released.
 
       - name: Check the tap token can push
         env:
