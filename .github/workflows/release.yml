@@ -79,15 +79,19 @@ jobs:
             echo "CARGO_REGISTRY_TOKEN is not set on this repository." >&2
             exit 1
           fi
-          # Reaches crates.io as the token's owner without publishing anything.
-          cargo owner --list drydock 2>&1 | tee /tmp/owner.txt || true
-          if grep -qi "not found\|does not exist" /tmp/owner.txt; then
-            echo "drydock is unpublished, so ownership cannot be listed yet."
-            echo "The token was accepted, which is what this step checks."
-          elif grep -qi "unauthorized\|invalid token\|authentication" /tmp/owner.txt; then
-            echo "crates.io rejected the token." >&2
+          # Ask crates.io who the token belongs to. `cargo owner --list` is no
+          # use here: for a crate that has never been published it fails with
+          # "not found" before the token is ever checked, so it would pass with
+          # any string at all.
+          CODE=$(curl -sS -o /tmp/me.json -w '%{http_code}' \
+            -H "Authorization: ${CARGO_REGISTRY_TOKEN}" \
+            -A 'drydock-release (github actions)' \
+            https://crates.io/api/v1/me)
+          if [[ "${CODE}" != "200" ]]; then
+            echo "crates.io rejected the token (HTTP ${CODE})." >&2
             exit 1
           fi
+          echo "crates.io accepted the token for: $(jq -r '.user.login' /tmp/me.json)"
 
       - name: Check the tap token can push
         env:
