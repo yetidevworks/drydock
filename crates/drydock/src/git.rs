@@ -243,6 +243,20 @@ pub async fn probe_refs(root: &Path, cfg: &Config) -> Result<RefsInfo> {
     };
 
     let cfg_scan = scan_git_config(&git_dir);
+    let is_shallow = git_dir.join("shallow").exists();
+
+    // Only worth asking when HEAD couldn't describe: if it could, the tag is
+    // reachable by definition. A shallow clone is excluded because its history
+    // is truncated, so `--contains` reports nothing for tags that are really
+    // there.
+    let tags_orphaned = if described_tag.is_none() && !is_shallow {
+        match &newest_tag {
+            Some(tag) => tag_is_orphaned(root, &tag.name).await,
+            None => false,
+        }
+    } else {
+        false
+    };
 
     let mut refs = RefsInfo {
         head,
@@ -254,11 +268,12 @@ pub async fn probe_refs(root: &Path, cfg: &Config) -> Result<RefsInfo> {
         described_tag,
         commits_since_tag,
         since_tag_subjects,
+        tags_orphaned,
         index_mtime: mtime_secs(&git_dir.join("index")),
         remote_url: cfg_scan.remote_url,
         changelog: None,
         is_bare: cfg_scan.bare,
-        is_shallow: git_dir.join("shallow").exists(),
+        is_shallow,
     };
 
     if cfg.release.read_changelog {
@@ -352,6 +367,37 @@ async fn head_commit(root: &Path) -> Option<CommitInfo> {
 /// that accounted for 86 of 193 unreleased flags, and not one of them had a
 /// tree that differed from its tag. A merge commit contributes no work of its
 /// own; whatever it brought along is counted through its own commits.
+/// True when no branch anywhere, local or remote, can reach this tag.
+///
+/// Repos get reused. A theme gets rewritten from scratch, a skeleton gets
+/// rebuilt on a fresh history, and the old tags stay behind pointing at commits
+/// nothing references any more. Treating those as releases of what is checked
+/// out now reports work against a version that was never cut from this code.
+///
+/// One `for-each-ref`, and only for repos where HEAD already failed to
+/// describe, so this costs nothing on the common path.
+async fn tag_is_orphaned(root: &Path, tag: &str) -> bool {
+    let contains = format!("--contains={tag}");
+    match try_git(
+        root,
+        &[
+            "for-each-ref",
+            &contains,
+            "--count=1",
+            "--format=%(refname)",
+            "refs/heads",
+            "refs/remotes",
+        ],
+    )
+    .await
+    {
+        Some(out) => out.trim().is_empty(),
+        // A failed call means we don't know, and guessing "orphaned" would
+        // silently downgrade a real release to never-released.
+        None => false,
+    }
+}
+
 async fn describe_since_tag(
     root: &Path,
     tags: &[TagInfo],
@@ -771,6 +817,7 @@ fn stat_changed_files(root: &Path, info: &mut WorkInfo) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::{ReleaseState, RepoStatus};
 
     #[test]
     fn track_parsing() {
@@ -871,6 +918,78 @@ mod tests {
             "Merge tag '1.0.0' into develop",
         ]);
         dir
+    }
+
+    /// A repo rebuilt on a fresh history keeps its old tags, but they describe
+    /// code that is no longer here. Those must read as never released, not as
+    /// a release the current work has run past.
+    #[tokio::test]
+    async fn tags_left_over_from_a_previous_life_are_not_releases() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(path)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@example.com")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@example.com")
+                .output()
+                .expect("git should run");
+            assert!(out.status.success(), "git {args:?} failed");
+        };
+
+        git(&["init", "-q", "-b", "main"]);
+        std::fs::write(path.join("old.txt"), "old").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-qm", "the old theme"]);
+        git(&["tag", "1.1.0"]);
+
+        // Rewritten from scratch: a fresh root commit, and `main` moved onto it
+        // so nothing references the tagged commit any more.
+        git(&["checkout", "-q", "--orphan", "rewrite"]);
+        git(&["rm", "-rqf", "."]);
+        std::fs::write(path.join("new.txt"), "new").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-qm", "rewritten from scratch"]);
+        git(&["branch", "-qM", "main"]);
+
+        let refs = probe_refs(path, &Config::default()).await.unwrap();
+        assert_eq!(
+            refs.newest_tag.as_ref().map(|t| t.name.as_str()),
+            Some("1.1.0")
+        );
+        assert!(refs.described_tag.is_none(), "the tag is unreachable");
+        assert!(refs.tags_orphaned, "no branch can reach it either");
+        assert!(!refs.tag_off_branch(), "an orphaned tag is not off-branch");
+
+        let mut repo = RepoStatus::new(path.to_path_buf(), "g".into(), "r".into());
+        repo.refs = Some(refs);
+        assert_eq!(repo.release_state(), ReleaseState::Unreleased);
+        assert_eq!(repo.tag_label(), "-");
+    }
+
+    /// The same unreachable tag, but still sitting on another branch, is a real
+    /// release. Only the checked-out branch has moved off it.
+    #[tokio::test]
+    async fn a_tag_on_a_sibling_branch_is_still_a_release() {
+        let dir = git_flow_repo();
+        let path = dir.path();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(path)
+                .output()
+                .expect("git should run");
+            assert!(out.status.success(), "git {args:?} failed");
+        };
+        // A branch that forked before the release ever happened.
+        git(&["checkout", "-q", "-b", "side", "master~1"]);
+
+        let refs = probe_refs(path, &Config::default()).await.unwrap();
+        assert!(refs.described_tag.is_none(), "the tag is unreachable");
+        assert!(!refs.tags_orphaned, "master still holds it");
     }
 
     /// A git-flow back-merge must not read as something to release.

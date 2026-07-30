@@ -442,6 +442,7 @@ mod tests {
                 subject: "work".into(),
             }],
             last_commit: None,
+            tags_orphaned: false,
             stashes: 0,
             operation: None,
             newest_tag: None,

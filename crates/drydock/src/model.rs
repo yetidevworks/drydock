@@ -121,6 +121,12 @@ pub struct RefsInfo {
     pub commits_since_tag: Option<u32>,
     /// Subjects of those commits, newest first, capped.
     pub since_tag_subjects: Vec<String>,
+    /// True when `newest_tag` sits on history no branch can reach, local or
+    /// remote. That happens when a repo is reused: the tags come from an
+    /// import or an earlier life, and the current work shares no commits with
+    /// them. Such tags are not releases of what is checked out now.
+    #[serde(default)]
+    pub tags_orphaned: bool,
     pub index_mtime: Option<i64>,
     pub remote_url: Option<String>,
     pub changelog: Option<ChangelogInfo>,
@@ -149,6 +155,9 @@ impl RefsInfo {
     /// (tags land on `master`, work continues on `develop`) but it means
     /// "commits since tag" needs reading with care.
     pub fn tag_off_branch(&self) -> bool {
+        if self.tags_orphaned {
+            return false;
+        }
         match (&self.newest_tag, &self.described_tag) {
             (Some(newest), Some(described)) => newest.name != described.name,
             (Some(_), None) => true,
@@ -394,12 +403,13 @@ impl RepoStatus {
     /// Uncommitted changes count as needing a release: whatever is in the
     /// working tree is not in the tag either. A tag that exists but is not
     /// reachable from HEAD also counts, because this branch has never been
-    /// released even though some other one has.
+    /// released even though some other one has. Orphaned tags are the
+    /// exception, and read as never released: see `tags_orphaned`.
     pub fn release_state(&self) -> ReleaseState {
         let Some(refs) = self.refs.as_ref() else {
             return ReleaseState::Unreleased;
         };
-        if refs.newest_tag.is_none() {
+        if refs.newest_tag.is_none() || refs.tags_orphaned {
             return ReleaseState::Unreleased;
         }
         let past_tag = refs.commits_since_tag.unwrap_or(0) > 0;
@@ -439,12 +449,17 @@ impl RepoStatus {
     }
 
     pub fn tag_label(&self) -> String {
-        match self.refs.as_ref().and_then(|r| r.described_tag.as_ref()) {
+        let Some(refs) = self.refs.as_ref() else {
+            return "-".into();
+        };
+        match refs.described_tag.as_ref() {
             Some(t) => t.name.clone(),
-            None => self
-                .refs
+            // An orphaned tag is not this repo's version, so showing it would
+            // only mislead.
+            None if refs.tags_orphaned => "-".into(),
+            None => refs
+                .newest_tag
                 .as_ref()
-                .and_then(|r| r.newest_tag.as_ref())
                 .map(|t| format!("({})", t.name))
                 .unwrap_or_else(|| "-".into()),
         }

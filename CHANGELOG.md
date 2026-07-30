@@ -12,6 +12,12 @@
       for never-released repos.
 
 1. [](#improved)
+    * Tags left over from a repo's previous life no longer count as releases.
+      A theme rewritten from scratch keeps its old tags pointing at commits no
+      branch can reach any more, and those were reading as a release the
+      current work had run past. When no branch anywhere can reach the newest
+      tag, the repo reads as never released. Shallow clones are exempt, since
+      their history is truncated and the check would be wrong.
     * `--unreleased` and the `r` key changed meaning. `--unreleased` now means
       never tagged, and `r` toggles needs-release, which is the actionable one.
     * `groups` gained a `NEEDS RELEASE` column, and JSON output gained a
