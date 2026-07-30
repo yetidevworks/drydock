@@ -1,0 +1,263 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+env:
+  CARGO_TERM_COLOR: always
+  TAP_REPO: yetidevworks/homebrew-drydock
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            artifact_name: drydock
+            asset_name: drydock-darwin-x86_64
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            artifact_name: drydock
+            asset_name: drydock-darwin-aarch64
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            artifact_name: drydock
+            asset_name: drydock-linux-x86_64
+            use_cross: true
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-musl
+            artifact_name: drydock
+            asset_name: drydock-linux-aarch64
+            use_cross: true
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cross
+        if: matrix.use_cross
+        run: cargo install cross --git https://github.com/cross-rs/cross
+
+      - name: Build
+        run: |
+          if [ "${{ matrix.use_cross }}" = "true" ]; then
+            cross build --release --target ${{ matrix.target }} -p drydock
+          else
+            cargo build --release --target ${{ matrix.target }} -p drydock
+          fi
+
+      - name: Package
+        shell: bash
+        run: |
+          cd target/${{ matrix.target }}/release
+          tar czvf ../../../${{ matrix.asset_name }}.tar.gz ${{ matrix.artifact_name }}
+          cd -
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.asset_name }}
+          path: ${{ matrix.asset_name }}.tar.gz
+
+  release:
+    name: Create Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v3
+        with:
+          files: artifacts/**/*.tar.gz
+          generate_release_notes: true
+          draft: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  publish-crate:
+    name: Publish to crates.io
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Publish to crates.io
+        run: cargo publish -p drydock --allow-dirty
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+  update-formula:
+    name: Update Homebrew tap
+    needs: release
+    runs-on: ubuntu-latest
+    env:
+      FORMULA_PATH: Formula/drydock.rb
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Download tarballs from the GitHub Release
+        # Pull from the release page (populated by the `release` job) rather
+        # than the Actions artifact API, which can 403 when this job and
+        # publish-crate hit ListArtifacts on the same run concurrently.
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/artifacts
+          cd /tmp/artifacts
+          for f in \
+            drydock-darwin-aarch64.tar.gz \
+            drydock-darwin-x86_64.tar.gz \
+            drydock-linux-x86_64.tar.gz \
+            drydock-linux-aarch64.tar.gz; do
+            gh release download "${GITHUB_REF_NAME}" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --pattern "${f}" \
+              --clobber
+          done
+          ls -la
+
+      - name: Compute SHAs
+        id: shas
+        run: |
+          set -euo pipefail
+          hash() { sha256sum "$1" | awk '{print $1}'; }
+
+          f=/tmp/artifacts/drydock-darwin-aarch64.tar.gz
+          [[ -f "$f" ]] && echo "darwin_arm64_sha=$(hash "$f")" >> $GITHUB_OUTPUT
+
+          f=/tmp/artifacts/drydock-darwin-x86_64.tar.gz
+          [[ -f "$f" ]] && echo "darwin_x86_64_sha=$(hash "$f")" >> $GITHUB_OUTPUT
+
+          f=/tmp/artifacts/drydock-linux-x86_64.tar.gz
+          [[ -f "$f" ]] && echo "linux_x86_64_sha=$(hash "$f")" >> $GITHUB_OUTPUT
+
+          f=/tmp/artifacts/drydock-linux-aarch64.tar.gz
+          [[ -f "$f" ]] && echo "linux_aarch64_sha=$(hash "$f")" >> $GITHUB_OUTPUT
+
+      - name: Read version from Cargo.toml
+        id: cargo
+        run: |
+          set -euo pipefail
+          # The version lives under [workspace.package] in the root manifest.
+          VERSION=$(awk '
+            /^\[workspace.package\]/ {pkg=1; next}
+            /^\[/ {pkg=0}
+            pkg && $1 == "version" && $2 == "=" {
+              gsub(/"/, "", $3)
+              print $3
+              exit
+            }
+          ' Cargo.toml)
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Verify version matches tag
+        run: |
+          set -euo pipefail
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          CARGO_VERSION='${{ steps.cargo.outputs.version }}'
+          if [[ "${TAG_VERSION}" != "${CARGO_VERSION}" ]]; then
+            echo "Tag version (${TAG_VERSION}) does not match Cargo version (${CARGO_VERSION})." >&2
+            exit 1
+          fi
+
+      - name: Write formula and push
+        env:
+          GITHUB_TOKEN: ${{ secrets.TAP_PUSH_TOKEN }}
+          VER: ${{ steps.cargo.outputs.version }}
+          DARWIN_ARM64_SHA: ${{ steps.shas.outputs.darwin_arm64_sha }}
+          DARWIN_X86_64_SHA: ${{ steps.shas.outputs.darwin_x86_64_sha }}
+          LINUX_X86_64_SHA: ${{ steps.shas.outputs.linux_x86_64_sha }}
+          LINUX_AARCH64_SHA: ${{ steps.shas.outputs.linux_aarch64_sha }}
+        run: |
+          set -euo pipefail
+          TAP_URL="https://github.com/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}"
+
+          if [[ -z "${DARWIN_ARM64_SHA}" || -z "${DARWIN_X86_64_SHA}" || -z "${LINUX_X86_64_SHA}" || -z "${LINUX_AARCH64_SHA}" ]]; then
+            echo "Missing required SHAs for Homebrew formula." >&2
+            exit 1
+          fi
+
+          gh repo clone "${TAP_REPO}" tap || git init tap
+
+          cd tap
+          mkdir -p "$(dirname "${FORMULA_PATH}")"
+
+          # Top-level `if OS.mac?` / `if OS.linux?` with an arch `else` fallback
+          # is the reliable form; the on_macos/on_intel DSL and
+          # Hardware::CPU.intel? both misbehave on Homebrew setups where CPU
+          # detection returns :dunno (yetidevworks/bosun#1).
+          printf '%s\n' \
+            "class Drydock < Formula" \
+            "  desc \"What's uncommitted, unpushed, and unreleased across every repo you own\"" \
+            "  homepage \"https://github.com/${GITHUB_REPOSITORY}\"" \
+            "  license \"MIT\"" \
+            "  version \"${VER}\"" \
+            "" \
+            "  if OS.mac?" \
+            "    if Hardware::CPU.arm?" \
+            "      url \"${TAP_URL}/drydock-darwin-aarch64.tar.gz\"" \
+            "      sha256 \"${DARWIN_ARM64_SHA}\"" \
+            "    else" \
+            "      url \"${TAP_URL}/drydock-darwin-x86_64.tar.gz\"" \
+            "      sha256 \"${DARWIN_X86_64_SHA}\"" \
+            "    end" \
+            "  end" \
+            "" \
+            "  if OS.linux?" \
+            "    if Hardware::CPU.arm?" \
+            "      url \"${TAP_URL}/drydock-linux-aarch64.tar.gz\"" \
+            "      sha256 \"${LINUX_AARCH64_SHA}\"" \
+            "    else" \
+            "      url \"${TAP_URL}/drydock-linux-x86_64.tar.gz\"" \
+            "      sha256 \"${LINUX_X86_64_SHA}\"" \
+            "    end" \
+            "  end" \
+            "" \
+            "  def install" \
+            "    bin.install \"drydock\"" \
+            "  end" \
+            "" \
+            "  test do" \
+            "    assert_match \"drydock\", shell_output(\"#{bin}/drydock --version\")" \
+            "  end" \
+            "end" > "${FORMULA_PATH}"
+
+          git config user.name "drydock-bot"
+          git config user.email "drydock-bot@users.noreply.github.com"
+          git add "${FORMULA_PATH}"
+          if git diff --cached --quiet; then
+            echo "No formula changes to commit."
+            exit 0
+          fi
+          git commit -m "drydock ${VER}: update Homebrew formula"
+
+          git remote set-url origin "https://github.com/${TAP_REPO}.git" || git remote add origin "https://github.com/${TAP_REPO}.git"
+          gh auth setup-git
+          git push origin HEAD:main
