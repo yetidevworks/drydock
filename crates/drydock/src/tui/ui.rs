@@ -14,7 +14,7 @@ use ratatui::{
 
 use super::{App, Mode};
 use crate::fmt;
-use crate::model::{ChangeKind, RepoStatus};
+use crate::model::{ChangeKind, ReleaseState, RepoStatus};
 use crate::paths;
 
 const ACCENT: Color = Color::Cyan;
@@ -31,6 +31,7 @@ struct Columns {
     name: usize,
     branch: usize,
     state: usize,
+    release: usize,
     changes: usize,
     ahead: usize,
     behind: usize,
@@ -45,15 +46,16 @@ impl Columns {
         // remainder. That keeps the right-hand numbers in the same place as the
         // terminal resizes, which is what makes the table scannable.
         let group = 14;
-        // Wide enough for "◆ unreleased" without an ellipsis.
-        let state = 13;
+        let state = 12;
+        // "◆ needs release" is 15 wide, plus a space before the next column.
+        let release = 16;
         let changes = 12;
         let ahead = 6;
         let behind = 7;
         let tag = 14;
         let since_tag = 5;
         let age = 5;
-        let fixed = group + state + changes + ahead + behind + tag + since_tag + age;
+        let fixed = group + state + release + changes + ahead + behind + tag + since_tag + age;
 
         // Split the leftover between the repo name and the branch. Branch names
         // like `codex/starvector-spike` deserve the room as much as repo names
@@ -68,6 +70,7 @@ impl Columns {
             name,
             branch,
             state,
+            release,
             changes,
             ahead,
             behind,
@@ -122,7 +125,11 @@ fn roots_label(app: &App) -> String {
 fn render_title(f: &mut Frame, app: &App, area: Rect) {
     let dirty = app.repos.iter().filter(|r| r.flags().dirty).count();
     let unpushed = app.repos.iter().filter(|r| r.flags().unpushed).count();
-    let unreleased = app.repos.iter().filter(|r| r.flags().unreleased).count();
+    let needs_release = app
+        .repos
+        .iter()
+        .filter(|r| r.release_state() == ReleaseState::NeedsRelease)
+        .count();
     let mut spans = vec![
         Span::styled(
             " drydock ",
@@ -147,7 +154,7 @@ fn render_title(f: &mut Frame, app: &App, area: Rect) {
         ),
         Span::raw(" · "),
         Span::styled(
-            format!("{unreleased} unreleased"),
+            format!("{needs_release} need release"),
             Style::default().fg(UNRELEASED),
         ),
     ];
@@ -292,6 +299,7 @@ fn header_line(cols: &Columns) -> Line<'static> {
         Span::styled(pad("REPO", cols.name), style),
         Span::styled(pad("BRANCH", cols.branch), style),
         Span::styled(pad("STATE", cols.state), style),
+        Span::styled(pad("RELEASE", cols.release), style),
         Span::styled(pad("CHANGES", cols.changes), style),
         Span::styled(rpad("AHEAD", cols.ahead), style),
         Span::styled(rpad("BEHIND", cols.behind), style),
@@ -309,8 +317,6 @@ fn repo_line(repo: &RepoStatus, cols: &Columns, now: i64, selected: bool) -> Lin
         DIRTY
     } else if flags.unpushed {
         UNPUSHED
-    } else if flags.unreleased {
-        UNRELEASED
     } else {
         CLEAN
     };
@@ -327,8 +333,6 @@ fn repo_line(repo: &RepoStatus, cols: &Columns, now: i64, selected: bool) -> Lin
         "●"
     } else if flags.unpushed {
         "↑"
-    } else if flags.unreleased {
-        "◆"
     } else if repo.work.is_none() {
         "·"
     } else {
@@ -365,6 +369,14 @@ fn repo_line(repo: &RepoStatus, cols: &Columns, now: i64, selected: bool) -> Lin
         Span::styled(
             pad(&format!("{marker} {}", repo.state_label()), cols.state),
             Style::default().fg(state_colour),
+        ),
+        Span::styled(
+            pad(&release_cell(repo), cols.release),
+            match repo.release_state() {
+                ReleaseState::NeedsRelease => Style::default().fg(UNRELEASED),
+                ReleaseState::Unreleased => base.fg(DIM),
+                ReleaseState::Released => base.fg(CLEAN),
+            },
         ),
         Span::styled(
             pad(
@@ -413,6 +425,17 @@ fn repo_line(repo: &RepoStatus, cols: &Columns, now: i64, selected: bool) -> Lin
     Line::from(spans)
 }
 
+/// The release cell, with a marker so the column scans without reading words.
+fn release_cell(repo: &RepoStatus) -> String {
+    let state = repo.release_state();
+    let marker = match state {
+        ReleaseState::NeedsRelease => "◆",
+        ReleaseState::Unreleased => "·",
+        ReleaseState::Released => "✓",
+    };
+    format!("{marker} {}", state.label())
+}
+
 fn render_keys(f: &mut Frame, app: &App, area: Rect) {
     let keys: &[(&str, &str)] = match app.mode {
         Mode::Detail => &[
@@ -428,7 +451,7 @@ fn render_keys(f: &mut Frame, app: &App, area: Rect) {
             ("⏎", "detail"),
             ("d", "dirty"),
             ("u", "unpushed"),
-            ("r", "unreleased"),
+            ("r", "needs release"),
             ("a", "clear"),
             ("s", "sort"),
             ("/", "search"),
@@ -517,7 +540,8 @@ fn render_help(f: &mut Frame, app: &App, area: Rect) {
             &[
                 ("d", "uncommitted changes"),
                 ("u", "commits not pushed"),
-                ("r", "commits since the last tag"),
+                ("r", "needs a release: commits or changes past the tag"),
+                ("N", "never released: no tags at all"),
                 ("b", "behind the upstream"),
                 ("c / i", "conflicts / operation in progress"),
                 ("x / e", "detached HEAD / probe errors"),

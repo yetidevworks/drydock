@@ -97,9 +97,15 @@ pub struct ListArgs {
     /// Repos with commits their upstream doesn't have.
     #[arg(long)]
     pub unpushed: bool,
-    /// Repos with commits since their last tag.
+    /// Repos that have never been released: no tags at all.
     #[arg(long)]
     pub unreleased: bool,
+    /// Repos with commits or uncommitted changes past their last tag.
+    #[arg(long)]
+    pub needs_release: bool,
+    /// Repos tagged with nothing since.
+    #[arg(long)]
+    pub released: bool,
     /// Repos whose upstream is ahead. Only as fresh as your last fetch.
     #[arg(long)]
     pub behind: bool,

@@ -8,14 +8,19 @@ use std::str::FromStr;
 use std::time::Duration;
 
 use crate::config::parse_duration;
-use crate::model::RepoStatus;
+use crate::model::{ReleaseState, RepoStatus};
 
 /// A state a repo can be in. Toggling these is the main way to narrow the list.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Filter {
     Dirty,
     Unpushed,
+    /// Never released: no tags at all.
     Unreleased,
+    /// Tagged, with commits or uncommitted changes past the tag.
+    NeedsRelease,
+    /// Tagged, with nothing since.
+    Released,
     Behind,
     Conflicted,
     InProgress,
@@ -33,7 +38,9 @@ impl Filter {
         match self {
             Filter::Dirty => f.dirty,
             Filter::Unpushed => f.unpushed,
-            Filter::Unreleased => f.unreleased,
+            Filter::Unreleased => repo.release_state() == ReleaseState::Unreleased,
+            Filter::NeedsRelease => repo.release_state() == ReleaseState::NeedsRelease,
+            Filter::Released => repo.release_state() == ReleaseState::Released,
             Filter::Behind => repo.behind_total() > 0,
             Filter::Conflicted => f.conflicted,
             Filter::InProgress => f.in_progress,
@@ -51,6 +58,8 @@ impl Filter {
             Filter::Dirty => "dirty",
             Filter::Unpushed => "unpushed",
             Filter::Unreleased => "unreleased",
+            Filter::NeedsRelease => "needs-release",
+            Filter::Released => "released",
             Filter::Behind => "behind",
             Filter::Conflicted => "conflicted",
             Filter::InProgress => "in-progress",
@@ -68,6 +77,8 @@ impl Filter {
             Filter::Dirty,
             Filter::Unpushed,
             Filter::Unreleased,
+            Filter::NeedsRelease,
+            Filter::Released,
             Filter::Behind,
             Filter::Conflicted,
             Filter::InProgress,
@@ -360,7 +371,7 @@ fn state_rank(repo: &RepoStatus) -> u8 {
         4
     } else if f.unpushed {
         3
-    } else if f.unreleased {
+    } else if repo.release_state() == ReleaseState::NeedsRelease {
         2
     } else if repo.work.is_none() {
         1

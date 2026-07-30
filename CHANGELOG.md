@@ -1,3 +1,22 @@
+# 0.1.3
+
+## 07/30/2026
+
+1. [](#new)
+    * Release state is now its own axis with three values, in its own `RELEASE`
+      column: `unreleased` (no tags at all), `released` (tagged with nothing
+      since), and `needs release` (commits or uncommitted changes past the tag).
+      It sits alongside the working state rather than competing with it, so a
+      repo can be dirty and released, or clean and still needing a release.
+    * New `--needs-release` and `--released` filters, and `N` in the dashboard
+      for never-released repos.
+
+1. [](#improved)
+    * `--unreleased` and the `r` key changed meaning. `--unreleased` now means
+      never tagged, and `r` toggles needs-release, which is the actionable one.
+    * `groups` gained a `NEEDS RELEASE` column, and JSON output gained a
+      `release_state` field.
+
 # 0.1.2
 
 ## 07/30/2026

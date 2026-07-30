@@ -235,12 +235,45 @@ impl ActivitySource {
     }
 }
 
+/// Where a repo stands against its own release history.
+///
+/// This is a separate axis from the working state. A repo can be dirty and
+/// released, or spotless and still needing a release, and the two questions get
+/// asked at different times: "what am I in the middle of" versus "what have I
+/// not shipped".
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ReleaseState {
+    /// No tags at all. Never been released.
+    Unreleased,
+    /// Tagged, with nothing since.
+    Released,
+    /// Tagged, but there are commits or uncommitted changes past the tag.
+    NeedsRelease,
+}
+
+impl ReleaseState {
+    pub fn label(&self) -> &'static str {
+        match self {
+            ReleaseState::Unreleased => "unreleased",
+            ReleaseState::Released => "released",
+            ReleaseState::NeedsRelease => "needs release",
+        }
+    }
+
+    pub fn key(&self) -> &'static str {
+        match self {
+            ReleaseState::Unreleased => "unreleased",
+            ReleaseState::Released => "released",
+            ReleaseState::NeedsRelease => "needs-release",
+        }
+    }
+}
+
 /// Coarse state used for colouring and the default filters.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Flags {
     pub dirty: bool,
     pub unpushed: bool,
-    pub unreleased: bool,
     pub conflicted: bool,
     pub in_progress: bool,
     pub detached: bool,
@@ -251,13 +284,10 @@ pub struct Flags {
 }
 
 impl Flags {
+    /// Nothing outstanding in the working tree or against the upstream. Says
+    /// nothing about releases; that is [`ReleaseState`].
     pub fn clean(&self) -> bool {
-        !self.dirty
-            && !self.unpushed
-            && !self.unreleased
-            && !self.conflicted
-            && !self.in_progress
-            && !self.error
+        !self.dirty && !self.unpushed && !self.conflicted && !self.in_progress && !self.error
     }
 }
 
@@ -341,9 +371,6 @@ impl RepoStatus {
         Flags {
             dirty: work.map(|w| w.is_dirty()).unwrap_or(false),
             unpushed: refs.map(|r| r.unpushed() > 0).unwrap_or(false),
-            unreleased: refs
-                .map(|r| r.commits_since_tag.unwrap_or(0) > 0)
-                .unwrap_or(false),
             conflicted: work.map(|w| w.conflicts > 0).unwrap_or(false),
             in_progress: refs.map(|r| r.operation.is_some()).unwrap_or(false),
             detached: refs
@@ -359,6 +386,29 @@ impl RepoStatus {
                 .unwrap_or(false),
             stashed: refs.map(|r| r.stashes > 0).unwrap_or(false),
             error: self.error.is_some(),
+        }
+    }
+
+    /// Where this repo stands against its own release history.
+    ///
+    /// Uncommitted changes count as needing a release: whatever is in the
+    /// working tree is not in the tag either. A tag that exists but is not
+    /// reachable from HEAD also counts, because this branch has never been
+    /// released even though some other one has.
+    pub fn release_state(&self) -> ReleaseState {
+        let Some(refs) = self.refs.as_ref() else {
+            return ReleaseState::Unreleased;
+        };
+        if refs.newest_tag.is_none() {
+            return ReleaseState::Unreleased;
+        }
+        let past_tag = refs.commits_since_tag.unwrap_or(0) > 0;
+        let dirty = self.work.as_ref().map(|w| w.is_dirty()).unwrap_or(false);
+        let unreachable_tag = refs.described_tag.is_none();
+        if past_tag || dirty || unreachable_tag {
+            ReleaseState::NeedsRelease
+        } else {
+            ReleaseState::Released
         }
     }
 
@@ -417,8 +467,6 @@ impl RepoStatus {
             "dirty"
         } else if f.unpushed {
             "unpushed"
-        } else if f.unreleased {
-            "unreleased"
         } else if self.work.is_none() {
             "…"
         } else {

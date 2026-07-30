@@ -102,6 +102,8 @@ fn build_query(args: &ListArgs) -> Result<Query> {
         (args.dirty, Filter::Dirty),
         (args.unpushed, Filter::Unpushed),
         (args.unreleased, Filter::Unreleased),
+        (args.needs_release, Filter::NeedsRelease),
+        (args.released, Filter::Released),
         (args.behind, Filter::Behind),
         (args.conflicted, Filter::Conflicted),
         (args.in_progress, Filter::InProgress),

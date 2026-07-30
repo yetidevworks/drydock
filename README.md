@@ -34,8 +34,20 @@ merges, and everything clean dimmed out of the way.
 - **What have I not pushed?** Across *every* local branch, not just the one
   that happens to be checked out. Side branches are exactly where work goes
   missing.
-- **What's worth releasing?** Commits since the last tag, with the actual commit
-  subjects, and whether `CHANGELOG.md` has run ahead of the newest tag.
+- **What's worth releasing?** Every repo sits in one of three release states,
+  in their own column:
+
+  | | |
+  |---|---|
+  | `· unreleased` | no tags at all, never been released |
+  | `✓ released` | tagged, with nothing since |
+  | `◆ needs release` | tagged, but with commits or uncommitted changes past the tag |
+
+  Plus the commits since the last tag with their actual subjects, and whether
+  `CHANGELOG.md` has run ahead of the newest tag.
+
+  Release state is a separate axis from working state: a repo can be dirty and
+  released, or spotless and still needing a release.
 
 ## Install
 
@@ -76,7 +88,8 @@ current directory, so it behaves the same wherever you invoke it.
 |---|---|
 | `j` `k` `↑` `↓` | move · `ctrl-d` / `ctrl-u` half a page · `home` / `end` ends |
 | `⏎` | detail view: branches, commits since the last tag, changed files |
-| `d` `u` `r` `b` | filter to dirty, unpushed, unreleased, behind |
+| `d` `u` `b` | filter to dirty, unpushed, behind |
+| `r` `N` | filter to needs-release, never-released |
 | `c` `i` `x` `e` | conflicts, operation in progress, detached HEAD, probe errors |
 | `n` | only repos with nothing outstanding |
 | `&` | switch between matching **any** active filter and **all** of them |
@@ -108,8 +121,10 @@ to drive a status line.
 
 ### Filters
 
-`--dirty` `--unpushed` `--unreleased` `--behind` `--conflicted` `--in-progress`
-`--detached` `--no-remote` `--no-upstream` `--stashed` `--clean` `--errored`
+`--dirty` `--unpushed` `--behind` `--conflicted` `--in-progress` `--detached`
+`--no-remote` `--no-upstream` `--stashed` `--clean` `--errored`
+
+Release state: `--unreleased` (never tagged), `--needs-release`, `--released`.
 
 Several filters **widen** the result by default: `--dirty --unpushed` means
 "either". Pass `--match all` (or press `&`) to require all of them instead.
@@ -150,6 +165,11 @@ Some implementation notes worth knowing:
 - The index mtime is deliberately **not** treated as activity. Any tool that runs
   `git status` refreshes it, so an editor sitting open on a repo would otherwise
   make it read as recently active when nothing had happened.
+- **Git-flow back-merges are not counted** as work to release. After a release,
+  `develop` carries a "Merge tag 'x.y.z' into develop" commit the tag cannot
+  reach; counting it reported one commit to release when there was none. Merge
+  commits are excluded, unless a merge is the only thing there and it genuinely
+  changes the tree.
 - Discovery **stops descending the moment it finds a repo**, which keeps
   submodules and vendored checkouts out of the list without enumerating them.
 

@@ -4,7 +4,7 @@ use anyhow::Result;
 use serde::Serialize;
 
 use crate::fmt;
-use crate::model::{ChangeKind, RepoStatus};
+use crate::model::{ChangeKind, ReleaseState, RepoStatus};
 use crate::paths;
 use crate::probe::Timings;
 
@@ -57,10 +57,12 @@ pub fn table(headers: &[&str], aligns: &[Align], rows: &[Vec<String>]) -> String
 }
 
 const LIST_HEADERS: &[&str] = &[
-    "GROUP", "REPO", "BRANCH", "STATE", "CHANGES", "AHEAD", "BEHIND", "TAG", "+TAG", "AGE",
+    "GROUP", "REPO", "BRANCH", "STATE", "RELEASE", "CHANGES", "AHEAD", "BEHIND", "TAG", "+TAG",
+    "AGE",
 ];
 
 const LIST_ALIGNS: &[Align] = &[
+    Align::Left,
     Align::Left,
     Align::Left,
     Align::Left,
@@ -95,6 +97,7 @@ pub fn list_table(repos: &[&RepoStatus], now: i64, show_paths: bool) -> String {
                 repo_cell,
                 fmt::truncate(&r.branch_label(), 24),
                 r.state_label().to_string(),
+                r.release_state().label().to_string(),
                 changes,
                 fmt::count(r.unpushed_total()),
                 fmt::count(r.behind_total()),
@@ -116,15 +119,26 @@ pub fn list_table(repos: &[&RepoStatus], now: i64, show_paths: bool) -> String {
 pub fn summary(repos: &[RepoStatus], timings: Option<&Timings>) -> String {
     let dirty = repos.iter().filter(|r| r.flags().dirty).count();
     let unpushed = repos.iter().filter(|r| r.flags().unpushed).count();
-    let unreleased = repos.iter().filter(|r| r.flags().unreleased).count();
-    let attention = repos.iter().filter(|r| !r.flags().clean()).count();
+    let needs_release = repos
+        .iter()
+        .filter(|r| r.release_state() == ReleaseState::NeedsRelease)
+        .count();
+    let never = repos
+        .iter()
+        .filter(|r| r.release_state() == ReleaseState::Unreleased)
+        .count();
+    let attention = repos
+        .iter()
+        .filter(|r| !r.flags().clean() || r.release_state() == ReleaseState::NeedsRelease)
+        .count();
     let errors = repos.iter().filter(|r| r.error.is_some()).count();
 
     let mut parts = vec![
         format!("{} repos", repos.len()),
         format!("{dirty} dirty"),
         format!("{unpushed} unpushed"),
-        format!("{unreleased} unreleased"),
+        format!("{needs_release} need release"),
+        format!("{never} unreleased"),
         format!("{attention} need attention"),
     ];
     if errors > 0 {
@@ -155,6 +169,7 @@ pub fn groups_table(repos: &[RepoStatus]) -> String {
         total: usize,
         dirty: usize,
         unpushed: usize,
+        needs_release: usize,
         unreleased: usize,
     }
 
@@ -170,7 +185,8 @@ pub fn groups_table(repos: &[RepoStatus]) -> String {
         entry.total += 1;
         entry.dirty += f.dirty as usize;
         entry.unpushed += f.unpushed as usize;
-        entry.unreleased += f.unreleased as usize;
+        entry.needs_release += (repo.release_state() == ReleaseState::NeedsRelease) as usize;
+        entry.unreleased += (repo.release_state() == ReleaseState::Unreleased) as usize;
     }
 
     let rows: Vec<Vec<String>> = groups
@@ -181,15 +197,24 @@ pub fn groups_table(repos: &[RepoStatus]) -> String {
                 t.total.to_string(),
                 t.dirty.to_string(),
                 t.unpushed.to_string(),
+                t.needs_release.to_string(),
                 t.unreleased.to_string(),
             ]
         })
         .collect();
 
     table(
-        &["GROUP", "REPOS", "DIRTY", "UNPUSHED", "UNRELEASED"],
+        &[
+            "GROUP",
+            "REPOS",
+            "DIRTY",
+            "UNPUSHED",
+            "NEEDS RELEASE",
+            "UNRELEASED",
+        ],
         &[
             Align::Left,
+            Align::Right,
             Align::Right,
             Align::Right,
             Align::Right,
@@ -207,6 +232,10 @@ pub fn detail(repo: &RepoStatus, now: i64) -> String {
     out.push_str(&format!("{}\n", repo.slug()));
     out.push_str(&format!("  path         {}\n", paths::contract(&repo.root)));
     out.push_str(&format!("  state        {}\n", repo.state_label()));
+    out.push_str(&format!(
+        "  release      {}\n",
+        repo.release_state().label()
+    ));
     out.push_str(&format!(
         "  activity     {} ago ({})\n",
         fmt::age(activity_at, now),
@@ -372,6 +401,7 @@ pub struct RepoView<'a> {
     pub name: &'a str,
     pub slug: String,
     pub state: &'a str,
+    pub release_state: &'static str,
     pub branch: String,
     pub upstream: Option<String>,
     pub ahead: u32,
@@ -407,7 +437,6 @@ pub fn view<'a>(repo: &'a RepoStatus, now: i64) -> RepoView<'a> {
     for (on, label) in [
         (f.dirty, "dirty"),
         (f.unpushed, "unpushed"),
-        (f.unreleased, "unreleased"),
         (f.conflicted, "conflicted"),
         (f.in_progress, "in-progress"),
         (f.detached, "detached"),
@@ -430,6 +459,7 @@ pub fn view<'a>(repo: &'a RepoStatus, now: i64) -> RepoView<'a> {
         name: &repo.name,
         slug: repo.slug(),
         state: repo.state_label(),
+        release_state: repo.release_state().key(),
         branch: repo.branch_label(),
         upstream: refs
             .and_then(|r| r.current_branch())

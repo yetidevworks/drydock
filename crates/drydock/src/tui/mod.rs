@@ -704,7 +704,8 @@ fn handle_normal_key(app: &mut App, key: KeyEvent, tx: &mpsc::UnboundedSender<In
         // Filter toggles.
         KeyCode::Char('d') => toggle(app, Filter::Dirty),
         KeyCode::Char('u') => toggle(app, Filter::Unpushed),
-        KeyCode::Char('r') => toggle(app, Filter::Unreleased),
+        KeyCode::Char('r') => toggle(app, Filter::NeedsRelease),
+        KeyCode::Char('N') => toggle(app, Filter::Unreleased),
         KeyCode::Char('b') => toggle(app, Filter::Behind),
         KeyCode::Char('c') => toggle(app, Filter::Conflicted),
         KeyCode::Char('i') => toggle(app, Filter::InProgress),
