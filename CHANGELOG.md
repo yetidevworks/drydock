@@ -10,6 +10,10 @@
       repo can be dirty and released, or clean and still needing a release.
     * New `--needs-release` and `--released` filters, and `N` in the dashboard
       for never-released repos.
+    * Mouse support in the dashboard. Click a row to select it, and the wheel
+      moves the selection the same way `j` and `k` do, so the selected row
+      never scrolls off screen. Over the detail view the wheel scrolls the
+      pane instead.
 
 1. [](#improved)
     * Tags left over from a repo's previous life no longer count as releases.

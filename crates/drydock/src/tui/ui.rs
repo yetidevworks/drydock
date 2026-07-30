@@ -87,6 +87,13 @@ pub fn table_rows(area: Rect) -> usize {
     area.height.saturating_sub(7).max(1) as usize
 }
 
+/// Screen row of the first repo in the table, so a click can be turned back
+/// into a row. Counts down past the title, the filter bar, the table's top
+/// border and the column header.
+pub fn table_first_row(area: Rect) -> u16 {
+    area.y + 4
+}
+
 pub fn render(f: &mut Frame, app: &App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -531,6 +538,8 @@ fn render_help(f: &mut Frame, app: &App, area: Rect) {
                 ("j / k, ↑ / ↓", "move the selection"),
                 ("ctrl-d / ctrl-u", "half a page"),
                 ("home / end", "first and last row"),
+                ("click", "select that row"),
+                ("wheel", "move the selection, or scroll the detail view"),
                 ("enter", "open the detail view"),
                 ("q", "quit"),
             ],

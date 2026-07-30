@@ -87,6 +87,7 @@ current directory, so it behaves the same wherever you invoke it.
 | | |
 |---|---|
 | `j` `k` `↑` `↓` | move · `ctrl-d` / `ctrl-u` half a page · `home` / `end` ends |
+| mouse | click a row to select it · wheel moves the selection |
 | `⏎` | detail view: branches, commits since the last tag, changed files |
 | `d` `u` `b` | filter to dirty, unpushed, behind |
 | `r` `N` | filter to needs-release, never-released |

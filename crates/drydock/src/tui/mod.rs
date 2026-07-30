@@ -10,12 +10,16 @@ use anyhow::Result;
 use crossterm::{
     event::{
         self, DisableMouseCapture, EnableMouseCapture, Event as TermEvent, KeyCode, KeyEvent,
-        KeyEventKind, KeyModifiers, MouseEventKind,
+        KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
     },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
-use ratatui::{backend::CrosstermBackend, Terminal};
+use ratatui::{
+    backend::CrosstermBackend,
+    layout::{Rect, Size},
+    Terminal,
+};
 use std::collections::HashMap;
 use std::io::{self, Stdout};
 use std::path::PathBuf;
@@ -235,6 +239,22 @@ impl App {
         self.clamp_scroll();
     }
 
+    /// Put the selection on whatever repo is drawn at this screen row.
+    /// Returns false for a click on the header, the border, or past the end of
+    /// the list, so the caller can leave the selection alone.
+    fn select_at_row(&mut self, row: u16, first_row: u16) -> bool {
+        if row < first_row {
+            return false;
+        }
+        let idx = self.scroll + (row - first_row) as usize;
+        if idx >= self.visible.len() {
+            return false;
+        }
+        self.selected = idx;
+        self.selected_root = self.current().map(|r| r.root.clone());
+        true
+    }
+
     fn clamp_scroll(&mut self) {
         let rows = self.rows_on_screen.max(1);
         if self.selected < self.scroll {
@@ -437,11 +457,7 @@ async fn run_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut A
                 dirty = true;
             }
             Input::Term(TermEvent::Mouse(ev)) => {
-                match ev.kind {
-                    MouseEventKind::ScrollDown => app.move_selection(1),
-                    MouseEventKind::ScrollUp => app.move_selection(-1),
-                    _ => {}
-                }
+                handle_mouse(app, ev, terminal.size().ok());
                 dirty = true;
             }
             Input::Term(_) => {}
@@ -593,6 +609,41 @@ fn reprobe_paths(app: &mut App, paths: Vec<PathBuf>, tx: &mpsc::UnboundedSender<
 // ---------------------------------------------------------------------------
 // Keys
 // ---------------------------------------------------------------------------
+
+/// Mouse input. The wheel moves the selection rather than scrolling the
+/// viewport under it, so it lands in the same place as `j` and `k` and the
+/// selected row never drifts off screen.
+fn handle_mouse(app: &mut App, ev: MouseEvent, size: Option<Size>) {
+    // The detail and help panes cover the table, so a click there has nothing
+    // to hit and the wheel belongs to the pane.
+    match app.mode {
+        Mode::Detail => {
+            match ev.kind {
+                MouseEventKind::ScrollDown => {
+                    app.detail_scroll = app.detail_scroll.saturating_add(1)
+                }
+                MouseEventKind::ScrollUp => app.detail_scroll = app.detail_scroll.saturating_sub(1),
+                _ => {}
+            }
+            return;
+        }
+        Mode::Help => return,
+        _ => {}
+    }
+
+    match ev.kind {
+        MouseEventKind::ScrollDown => app.move_selection(1),
+        MouseEventKind::ScrollUp => app.move_selection(-1),
+        MouseEventKind::Down(MouseButton::Left) => {
+            let Some(size) = size else { return };
+            let first = ui::table_first_row(Rect::new(0, 0, size.width, size.height));
+            if app.select_at_row(ev.row, first) {
+                app.detail_scroll = 0;
+            }
+        }
+        _ => {}
+    }
+}
 
 fn handle_key(app: &mut App, key: KeyEvent, tx: &mpsc::UnboundedSender<Input>) {
     if key.modifiers.contains(KeyModifiers::CONTROL) {
@@ -1057,6 +1108,66 @@ fn render_once(app: &App, width: u16, height: u16) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn app_with(rows: usize) -> App {
+        let mut app = App::new(Arc::new(Config::default()));
+        app.repos = (0..rows)
+            .map(|i| {
+                RepoStatus::new(
+                    PathBuf::from(format!("/p/g/r{i}")),
+                    "g".into(),
+                    format!("r{i}"),
+                )
+            })
+            .collect();
+        app.reindex();
+        app.query.filters.clear();
+        app.recompute();
+        app.visible = (0..rows).collect();
+        app
+    }
+
+    /// The click-to-row arithmetic has to agree with what actually gets drawn.
+    /// Both sides are pinned here so a layout change can't quietly shift the
+    /// selection by a row.
+    #[test]
+    fn a_click_lands_on_the_row_under_it() {
+        let mut app = app_with(50);
+        app.rows_on_screen = 10;
+        let first = ui::table_first_row(Rect::new(0, 0, 130, 16));
+        assert_eq!(first, 4, "title, filter bar, border, column header");
+
+        assert!(app.select_at_row(first, first));
+        assert_eq!(app.selected, 0);
+        assert!(app.select_at_row(first + 3, first));
+        assert_eq!(app.selected, 3);
+
+        // Scrolled, the same screen row is a different repo.
+        app.scroll = 20;
+        assert!(app.select_at_row(first + 3, first));
+        assert_eq!(app.selected, 23);
+
+        // The header, the border and the title are not rows.
+        app.selected = 7;
+        for y in 0..first {
+            assert!(!app.select_at_row(y, first), "row {y} is chrome");
+        }
+        assert_eq!(app.selected, 7, "a click on chrome leaves the selection");
+    }
+
+    /// Clicking past the end of a short list must not select a row that isn't
+    /// there. Easy to get wrong, since the table is drawn full height.
+    #[test]
+    fn a_click_below_the_last_repo_does_nothing() {
+        let mut app = app_with(3);
+        let first = ui::table_first_row(Rect::new(0, 0, 130, 40));
+        assert!(app.select_at_row(first + 2, first));
+        assert_eq!(app.selected, 2);
+        assert!(!app.select_at_row(first + 3, first));
+        assert_eq!(app.selected, 2);
+        assert!(!app.select_at_row(first + 30, first));
+        assert_eq!(app.selected, 2);
+    }
 
     #[test]
     fn ssh_remotes_become_browsable() {
