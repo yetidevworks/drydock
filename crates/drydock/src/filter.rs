@@ -462,8 +462,10 @@ mod tests {
             repo("grav", "b", 0, 2, 0), // dirty only
             repo("grav", "c", 1, 1, 0), // both
         ];
-        let mut q = Query::default();
-        q.filters = vec![Filter::Dirty, Filter::Unpushed];
+        let mut q = Query {
+            filters: vec![Filter::Dirty, Filter::Unpushed],
+            ..Query::default()
+        };
 
         q.match_mode = MatchMode::Any;
         assert_eq!(q.apply(&repos, 10_000).len(), 3);

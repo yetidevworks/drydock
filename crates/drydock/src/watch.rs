@@ -252,8 +252,10 @@ mod tests {
         std::fs::create_dir_all(repo.join(".git")).unwrap();
         std::fs::write(repo.join("tracked.txt"), "before").unwrap();
 
-        let mut cfg = Config::default();
-        cfg.roots = vec![root.to_string_lossy().to_string()];
+        let mut cfg = Config {
+            roots: vec![root.to_string_lossy().to_string()],
+            ..Config::default()
+        };
         cfg.refresh.debounce = "200ms".into();
 
         let (tx, rx) = std::sync::mpsc::channel();
