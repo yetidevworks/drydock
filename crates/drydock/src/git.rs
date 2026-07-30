@@ -344,6 +344,14 @@ async fn head_commit(root: &Path) -> Option<CommitInfo> {
 /// git-flow, tags land on `master` while work carries on on `develop`, so the
 /// newest tag by date is often not an ancestor of HEAD at all. Both values get
 /// stored so the difference can be shown rather than silently papered over.
+///
+/// Merge commits are excluded from the count. Immediately after a git-flow
+/// release, `develop` carries a "Merge tag 'x.y.z' into develop" commit that is
+/// not reachable from the tag, so a raw count reports one commit to release
+/// when there is nothing to release at all. Across a real tree of 558 repos
+/// that accounted for 86 of 193 unreleased flags, and not one of them had a
+/// tree that differed from its tag. A merge commit contributes no work of its
+/// own; whatever it brought along is counted through its own commits.
 async fn describe_since_tag(
     root: &Path,
     tags: &[TagInfo],
@@ -373,14 +381,14 @@ async fn describe_since_tag(
     };
 
     let range = format!("{name}..HEAD");
-    let count = try_git(root, &["rev-list", "--count", &range])
+    let count = try_git(root, &["rev-list", "--count", "--no-merges", &range])
         .await
         .and_then(|s| s.trim().parse::<u32>().ok());
 
     let subjects = match count {
         Some(n) if n > 0 && cfg.max_subjects > 0 => {
             let limit = format!("--max-count={}", cfg.max_subjects);
-            try_git(root, &["log", &limit, "--format=%s", &range])
+            try_git(root, &["log", &limit, "--no-merges", "--format=%s", &range])
                 .await
                 .map(|s| s.lines().map(|l| l.to_string()).collect())
                 .unwrap_or_default()
@@ -784,6 +792,114 @@ mod tests {
         // Unmerged: 10 fields precede the path.
         let rest = "UU N... 100644 100644 100644 100644 h1 h2 h3 conflicted.rs";
         assert_eq!(field_tail(rest, 10), "conflicted.rs");
+    }
+
+    /// Build a repo shaped like a git-flow release: work on `develop`, the
+    /// release merged to `master` and tagged there, then the tag merged back
+    /// into `develop`.
+    fn git_flow_repo() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(path)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@example.com")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@example.com")
+                .output()
+                .expect("git should run");
+            assert!(
+                out.status.success(),
+                "git {:?} failed: {}",
+                args,
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+
+        git(&["init", "-q", "-b", "master"]);
+        std::fs::write(path.join("a.txt"), "a").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-qm", "initial"]);
+
+        git(&["checkout", "-q", "-b", "develop"]);
+        std::fs::write(path.join("b.txt"), "b").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-qm", "the work being released"]);
+
+        // Release: develop merges to master, tagged there.
+        git(&["checkout", "-q", "master"]);
+        git(&[
+            "merge",
+            "-q",
+            "--no-ff",
+            "develop",
+            "-m",
+            "Merge release/1.0.0",
+        ]);
+        git(&["tag", "1.0.0"]);
+
+        // And the tag merges back into develop, which is the whole problem.
+        git(&["checkout", "-q", "develop"]);
+        git(&[
+            "merge",
+            "-q",
+            "--no-ff",
+            "1.0.0",
+            "-m",
+            "Merge tag '1.0.0' into develop",
+        ]);
+        dir
+    }
+
+    /// A git-flow back-merge must not read as something to release.
+    #[tokio::test]
+    async fn back_merge_is_not_unreleased_work() {
+        let dir = git_flow_repo();
+        let cfg = Config::default();
+
+        // The back-merge is genuinely a commit the tag cannot reach, so a raw
+        // count sees one. It carries no work, so the reported count is zero.
+        let raw = std::process::Command::new("git")
+            .args(["rev-list", "--count", "1.0.0..HEAD"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&raw.stdout).trim(), "1");
+
+        let refs = probe_refs(dir.path(), &cfg).await.unwrap();
+        assert_eq!(refs.described_tag.map(|t| t.name), Some("1.0.0".into()));
+        assert_eq!(refs.commits_since_tag, Some(0));
+        assert!(refs.since_tag_subjects.is_empty());
+    }
+
+    /// Real work after the tag still counts, back-merge or not.
+    #[tokio::test]
+    async fn commits_after_the_back_merge_still_count() {
+        let dir = git_flow_repo();
+        std::fs::write(dir.path().join("c.txt"), "c").unwrap();
+        for args in [
+            vec!["add", "-A"],
+            vec!["commit", "-qm", "a genuine fix after the release"],
+        ] {
+            std::process::Command::new("git")
+                .args(&args)
+                .current_dir(dir.path())
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@example.com")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@example.com")
+                .output()
+                .unwrap();
+        }
+
+        let refs = probe_refs(dir.path(), &Config::default()).await.unwrap();
+        assert_eq!(refs.commits_since_tag, Some(1));
+        assert_eq!(
+            refs.since_tag_subjects,
+            vec!["a genuine fix after the release".to_string()]
+        );
     }
 
     #[test]
