@@ -1,9 +1,13 @@
 name: Release
 
+# A tag push does the real thing. Running this manually from the Actions tab is
+# a rehearsal: it builds every target, validates the crate, and checks the tap
+# credentials, but publishes nothing.
 on:
   push:
     tags:
       - 'v*'
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
@@ -13,8 +17,109 @@ permissions:
   contents: write
 
 jobs:
+  verify:
+    name: Verify
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.cargo.outputs.version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Read version from Cargo.toml
+        id: cargo
+        run: |
+          set -euo pipefail
+          # The version lives under [workspace.package] in the root manifest.
+          VERSION=$(awk '
+            /^\[workspace.package\]/ {pkg=1; next}
+            /^\[/ {pkg=0}
+            pkg && $1 == "version" && $2 == "=" {
+              gsub(/"/, "", $3)
+              print $3
+              exit
+            }
+          ' Cargo.toml)
+          if [[ -z "${VERSION}" ]]; then
+            echo "Could not read a version from Cargo.toml." >&2
+            exit 1
+          fi
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "Cargo version: ${VERSION}"
+
+      # This gate has to come before anything publishes, not alongside it.
+      # `cargo publish` uploads whatever Cargo.toml says regardless of the tag
+      # name, so a mismatched tag would otherwise burn a version number that can
+      # never be reused.
+      - name: Verify the tag matches the crate version
+        if: github.event_name == 'push'
+        run: |
+          set -euo pipefail
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          CARGO_VERSION='${{ steps.cargo.outputs.version }}'
+          if [[ "${TAG_VERSION}" != "${CARGO_VERSION}" ]]; then
+            echo "Tag ${GITHUB_REF_NAME} does not match Cargo version ${CARGO_VERSION}." >&2
+            echo "Nothing has been published. Fix one or the other and re-tag." >&2
+            exit 1
+          fi
+          echo "Tag ${GITHUB_REF_NAME} matches Cargo version ${CARGO_VERSION}."
+
+      - name: Check the crate is publishable
+        run: cargo publish -p drydock --dry-run
+
+      - name: Check the crates.io token works
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${CARGO_REGISTRY_TOKEN:-}" ]]; then
+            echo "CARGO_REGISTRY_TOKEN is not set on this repository." >&2
+            exit 1
+          fi
+          # Reaches crates.io as the token's owner without publishing anything.
+          cargo owner --list drydock 2>&1 | tee /tmp/owner.txt || true
+          if grep -qi "not found\|does not exist" /tmp/owner.txt; then
+            echo "drydock is unpublished, so ownership cannot be listed yet."
+            echo "The token was accepted, which is what this step checks."
+          elif grep -qi "unauthorized\|invalid token\|authentication" /tmp/owner.txt; then
+            echo "crates.io rejected the token." >&2
+            exit 1
+          fi
+
+      - name: Check the tap token can push
+        env:
+          GITHUB_TOKEN: ${{ secrets.TAP_PUSH_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${GITHUB_TOKEN:-}" ]]; then
+            echo "TAP_PUSH_TOKEN is not set on this repository." >&2
+            exit 1
+          fi
+
+          PUSH=$(gh api "/repos/${TAP_REPO}" --jq '.permissions.push // false')
+          echo "Push permission on ${TAP_REPO}: ${PUSH}"
+          if [[ "${PUSH}" != "true" ]]; then
+            echo "TAP_PUSH_TOKEN cannot push to ${TAP_REPO}." >&2
+            exit 1
+          fi
+
+          # Rehearse the push itself, so a token that reports write access but
+          # is blocked in practice still fails here rather than mid-release.
+          gh repo clone "${TAP_REPO}" tap -- --depth 1
+          cd tap
+          git config user.name "drydock-bot"
+          git config user.email "drydock-bot@users.noreply.github.com"
+          git commit -q --allow-empty -m "rehearsal"
+          gh auth setup-git
+          git push --dry-run origin HEAD:main
+          echo "The tap push path works."
+
   build:
     name: Build ${{ matrix.target }}
+    needs: verify
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -75,7 +180,8 @@ jobs:
 
   release:
     name: Create Release
-    needs: build
+    needs: [verify, build]
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -97,7 +203,8 @@ jobs:
 
   publish-crate:
     name: Publish to crates.io
-    needs: release
+    needs: [verify, release]
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -113,10 +220,12 @@ jobs:
 
   update-formula:
     name: Update Homebrew tap
-    needs: release
+    needs: [verify, release]
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
     env:
       FORMULA_PATH: Formula/drydock.rb
+      VER: ${{ needs.verify.outputs.version }}
     steps:
       - name: Checkout
         uses: actions/checkout@v5
@@ -161,36 +270,9 @@ jobs:
           f=/tmp/artifacts/drydock-linux-aarch64.tar.gz
           [[ -f "$f" ]] && echo "linux_aarch64_sha=$(hash "$f")" >> $GITHUB_OUTPUT
 
-      - name: Read version from Cargo.toml
-        id: cargo
-        run: |
-          set -euo pipefail
-          # The version lives under [workspace.package] in the root manifest.
-          VERSION=$(awk '
-            /^\[workspace.package\]/ {pkg=1; next}
-            /^\[/ {pkg=0}
-            pkg && $1 == "version" && $2 == "=" {
-              gsub(/"/, "", $3)
-              print $3
-              exit
-            }
-          ' Cargo.toml)
-          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
-
-      - name: Verify version matches tag
-        run: |
-          set -euo pipefail
-          TAG_VERSION="${GITHUB_REF_NAME#v}"
-          CARGO_VERSION='${{ steps.cargo.outputs.version }}'
-          if [[ "${TAG_VERSION}" != "${CARGO_VERSION}" ]]; then
-            echo "Tag version (${TAG_VERSION}) does not match Cargo version (${CARGO_VERSION})." >&2
-            exit 1
-          fi
-
       - name: Write formula and push
         env:
           GITHUB_TOKEN: ${{ secrets.TAP_PUSH_TOKEN }}
-          VER: ${{ steps.cargo.outputs.version }}
           DARWIN_ARM64_SHA: ${{ steps.shas.outputs.darwin_arm64_sha }}
           DARWIN_X86_64_SHA: ${{ steps.shas.outputs.darwin_x86_64_sha }}
           LINUX_X86_64_SHA: ${{ steps.shas.outputs.linux_x86_64_sha }}
