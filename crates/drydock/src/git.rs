@@ -381,13 +381,33 @@ async fn describe_since_tag(
     };
 
     let range = format!("{name}..HEAD");
-    let count = try_git(root, &["rev-list", "--count", "--no-merges", &range])
+    let mut count = try_git(root, &["rev-list", "--count", "--no-merges", &range])
         .await
         .and_then(|s| s.trim().parse::<u32>().ok());
+
+    // Discounting merges is right for the back-merge, but a merge can also be
+    // the only commit that introduces a change, and reporting that as released
+    // would hide work rather than merely nag about it. So when nothing but
+    // merges follow the tag, compare the trees before believing it. The extra
+    // call only happens for repos that look released, and the diff is against
+    // an ancestor, so it is cheap.
+    if count == Some(0) {
+        let unchanged = run_git(root, &["diff", "--quiet", &name, "HEAD"])
+            .await
+            .is_ok();
+        if !unchanged {
+            count = try_git(root, &["rev-list", "--count", &range])
+                .await
+                .and_then(|s| s.trim().parse::<u32>().ok());
+        }
+    }
 
     let subjects = match count {
         Some(n) if n > 0 && cfg.max_subjects > 0 => {
             let limit = format!("--max-count={}", cfg.max_subjects);
+            // Merge subjects are dropped here too: they are never the release
+            // note. If a merge is the only thing there, the count above still
+            // reports it, so nothing goes unnoticed.
             try_git(root, &["log", &limit, "--no-merges", "--format=%s", &range])
                 .await
                 .map(|s| s.lines().map(|l| l.to_string()).collect())
@@ -872,6 +892,45 @@ mod tests {
         assert_eq!(refs.described_tag.map(|t| t.name), Some("1.0.0".into()));
         assert_eq!(refs.commits_since_tag, Some(0));
         assert!(refs.since_tag_subjects.is_empty());
+    }
+
+    /// A merge that is the only commit after the tag but genuinely changes the
+    /// tree must still count. Discounting merges is about the back-merge, and
+    /// must never hide real work.
+    #[tokio::test]
+    async fn a_merge_that_changes_the_tree_still_counts() {
+        let dir = git_flow_repo();
+        let path = dir.path();
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(path)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@example.com")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@example.com")
+                .output()
+                .unwrap();
+        };
+
+        // A branch off the tagged commit, merged into develop. The merge is the
+        // only thing develop gains that isn't already reachable another way.
+        git(&["checkout", "-q", "-b", "hotfix", "1.0.0"]);
+        std::fs::write(path.join("fix.txt"), "fix").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-qm", "the hotfix"]);
+        git(&["checkout", "-q", "develop"]);
+        git(&["merge", "-q", "--no-ff", "hotfix", "-m", "Merge hotfix"]);
+
+        let refs = probe_refs(path, &Config::default()).await.unwrap();
+        assert_eq!(
+            refs.described_tag.as_ref().map(|t| t.name.as_str()),
+            Some("1.0.0")
+        );
+        assert!(
+            refs.commits_since_tag.unwrap_or(0) > 0,
+            "a merge that changes the tree must not read as released"
+        );
     }
 
     /// Real work after the tag still counts, back-merge or not.
