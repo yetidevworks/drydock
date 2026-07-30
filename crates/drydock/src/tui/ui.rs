@@ -109,17 +109,20 @@ pub fn render(f: &mut Frame, app: &App) {
     }
 }
 
+/// The scan roots as displayed, e.g. `~/Projects`.
+fn roots_label(app: &App) -> String {
+    app.cfg
+        .root_paths()
+        .iter()
+        .map(|p| paths::contract(p))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 fn render_title(f: &mut Frame, app: &App, area: Rect) {
     let dirty = app.repos.iter().filter(|r| r.flags().dirty).count();
     let unpushed = app.repos.iter().filter(|r| r.flags().unpushed).count();
     let unreleased = app.repos.iter().filter(|r| r.flags().unreleased).count();
-    let roots: Vec<String> = app
-        .cfg
-        .root_paths()
-        .iter()
-        .map(|p| paths::contract(p))
-        .collect();
-
     let mut spans = vec![
         Span::styled(
             " drydock ",
@@ -129,7 +132,7 @@ fn render_title(f: &mut Frame, app: &App, area: Rect) {
                 .add_modifier(Modifier::BOLD),
         ),
         Span::raw(" "),
-        Span::styled(roots.join(" "), Style::default().fg(DIM)),
+        Span::styled(roots_label(app), Style::default().fg(DIM)),
         Span::raw("  "),
         Span::styled(
             format!("{} repos", app.repos.len()),
@@ -152,11 +155,11 @@ fn render_title(f: &mut Frame, app: &App, area: Rect) {
     if app.watching {
         spans.push(Span::styled(" · live", Style::default().fg(CLEAN)));
     }
-    if app.sweeping {
-        let (done, total) = app.progress;
+    if let Some(note) = app.activity_note() {
+        spans.push(Span::raw(" · "));
         spans.push(Span::styled(
-            format!(" · scanning {done}/{total}"),
-            Style::default().fg(DIM),
+            format!("{} {note}", app.spinner_frame()),
+            Style::default().fg(ACCENT),
         ));
     }
 
@@ -258,10 +261,25 @@ fn render_table(f: &mut Frame, app: &App, area: Rect) {
     }
 
     if app.visible.is_empty() {
-        lines.push(Line::from(Span::styled(
-            "  Nothing matches the current filters. Press a to clear them.",
-            Style::default().fg(DIM),
-        )));
+        lines.push(Line::from(""));
+        // On a cold start there is nothing cached to show, so say what's
+        // happening rather than leaving an empty box that reads as a hang.
+        lines.push(match app.activity_note() {
+            Some(note) => Line::from(vec![
+                Span::styled(
+                    format!("  {} ", app.spinner_frame()),
+                    Style::default().fg(ACCENT),
+                ),
+                Span::styled(
+                    format!("First scan of {} · {note}", roots_label(app)),
+                    Style::default().fg(Color::White),
+                ),
+            ]),
+            None => Line::from(Span::styled(
+                "  Nothing matches the current filters. Press a to clear them.",
+                Style::default().fg(DIM),
+            )),
+        });
     }
 
     f.render_widget(Paragraph::new(lines), inner);
@@ -437,6 +455,9 @@ fn render_status(f: &mut Frame, app: &App, area: Rect) {
         Some(message) => Span::styled(format!(" {message}"), Style::default().fg(Color::White)),
         None => {
             let mut parts = Vec::new();
+            if let Some(note) = app.activity_note() {
+                parts.push(note);
+            }
             if app.timings.total > std::time::Duration::ZERO {
                 parts.push(format!("last sweep {}", fmt::duration(app.timings.total)));
             }

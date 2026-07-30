@@ -14,8 +14,8 @@
 //! repo state are honoured.
 
 use anyhow::{Context, Result};
-use notify::RecursiveMode;
-use notify_debouncer_full::{new_debouncer, DebounceEventResult};
+use notify::{RecommendedWatcher, RecursiveMode};
+use notify_debouncer_full::{new_debouncer_opt, DebounceEventResult, Debouncer, NoCache};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -25,7 +25,7 @@ use crate::config::Config;
 /// Keeps the watcher alive. Dropping it stops watching and ends the worker
 /// thread.
 pub struct Handle {
-    _debouncer: Box<dyn std::any::Any + Send>,
+    _debouncer: Debouncer<RecommendedWatcher, NoCache>,
 }
 
 /// Paths under `.git` that reflect something worth re-reading. Everything else
@@ -54,8 +54,26 @@ where
 {
     let (tx, rx) = std::sync::mpsc::channel::<DebounceEventResult>();
 
-    let mut debouncer =
-        new_debouncer(cfg.debounce(), None, tx).context("Starting the filesystem watcher")?;
+    // `NoCache`, emphatically, rather than the default recommended cache.
+    //
+    // On macOS the default is a file-ID map used to stitch rename events back
+    // together, and building it makes `watch()` walk the entire tree with
+    // `follow_links(true)`, stat-ing every file it finds. Pointed at a tree like
+    // `~/Projects` that means every `node_modules`, `target` and `.git/objects`
+    // in it, plus anything symlinks lead to, all synchronously before the call
+    // returns, and all retained in memory.
+    //
+    // Nothing here needs rename stitching: an event's only job is to name the
+    // repo that changed, which `owning_repo` derives from the path. So the walk
+    // buys nothing and costs everything.
+    let mut debouncer: Debouncer<RecommendedWatcher, NoCache> = new_debouncer_opt(
+        cfg.debounce(),
+        None,
+        tx,
+        NoCache::new(),
+        notify::Config::default(),
+    )
+    .context("Starting the filesystem watcher")?;
 
     // Canonicalize the roots. On macOS the events arrive with symlinks already
     // resolved (`/var/...` is reported as `/private/var/...`), so comparing
@@ -111,7 +129,7 @@ where
     });
 
     Ok(Handle {
-        _debouncer: Box::new(debouncer),
+        _debouncer: debouncer,
     })
 }
 
@@ -280,6 +298,34 @@ mod tests {
             "expected {} in {:?}",
             canonical_repo.display(),
             paths
+        );
+    }
+
+    /// The watcher must start promptly even on a very large tree.
+    ///
+    /// This is a regression test with teeth: the default debouncer cache walks
+    /// the whole tree inside `watch()`, which froze the dashboard before its
+    /// first frame. Run with `cargo test -- --ignored` (it needs a real, large
+    /// directory, so it isn't part of the normal run).
+    #[test]
+    #[ignore = "needs a large real tree; run explicitly"]
+    fn watcher_starts_promptly_on_a_large_tree() {
+        let cfg = Config::default();
+        let root = cfg.root_paths().into_iter().next().unwrap();
+        if !root.is_dir() {
+            eprintln!("skipping: {} is not a directory", root.display());
+            return;
+        }
+
+        let started = std::time::Instant::now();
+        let handle = spawn(Arc::new(cfg), |_| {}).expect("watcher should start");
+        let elapsed = started.elapsed();
+        drop(handle);
+
+        println!("watch::spawn on {} took {elapsed:?}", root.display());
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "watch::spawn took {elapsed:?}; it must not walk the tree"
         );
     }
 

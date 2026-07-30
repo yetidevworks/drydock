@@ -34,9 +34,12 @@ use crate::watch;
 /// How long a status message stays on screen.
 const MESSAGE_TTL: Duration = Duration::from_secs(6);
 
-/// Repaint cadence. Fast enough that ages tick over and progress feels live,
-/// slow enough to stay invisible in `top`.
-const TICK: Duration = Duration::from_millis(500);
+/// Repaint cadence while a sweep is running, so the spinner reads as motion.
+/// When idle, only every fourth tick repaints.
+const TICK: Duration = Duration::from_millis(250);
+
+/// Braille spinner frames, advanced once per tick.
+pub const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
@@ -78,6 +81,8 @@ pub struct App {
     pub timings: Timings,
     pub last_sweep_at: Option<Instant>,
     pub watching: bool,
+    /// Advances every tick; drives the scanning spinner.
+    pub spinner: usize,
     pub now: i64,
     pub rows_on_screen: usize,
     pub should_quit: bool,
@@ -118,6 +123,7 @@ impl App {
             timings: Timings::default(),
             last_sweep_at: None,
             watching: false,
+            spinner: 0,
             now: git::now_unix(),
             rows_on_screen: 20,
             should_quit: false,
@@ -187,6 +193,24 @@ impl App {
 
     pub fn current(&self) -> Option<&RepoStatus> {
         self.visible.get(self.selected).map(|i| &self.repos[*i])
+    }
+
+    pub fn spinner_frame(&self) -> &'static str {
+        SPINNER[self.spinner % SPINNER.len()]
+    }
+
+    /// What the dashboard is busy doing, if anything, for the header and the
+    /// empty-table placeholder.
+    pub fn activity_note(&self) -> Option<String> {
+        if !self.sweeping {
+            return None;
+        }
+        let (done, total) = self.progress;
+        Some(if total == 0 {
+            "walking the scan roots".to_string()
+        } else {
+            format!("scanning {done}/{total} repos")
+        })
     }
 
     pub fn notify(&mut self, message: impl Into<String>) {
@@ -293,6 +317,12 @@ pub async fn run() -> Result<()> {
 async fn run_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) -> Result<()> {
     let (tx, mut rx) = mpsc::unbounded_channel::<Input>();
 
+    // Paint before doing anything else, always. Nothing below this line gets to
+    // decide whether the user sees a window or a blank screen: if some piece of
+    // setup turns out to be slow, the dashboard is already up and saying so.
+    app.sweeping = true;
+    draw(terminal, app)?;
+
     // Terminal events come from a blocking thread; crossterm's reader isn't
     // async and this keeps the loop free of polling.
     {
@@ -320,6 +350,10 @@ async fn run_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut A
         });
     }
 
+    // Start scanning before setting up the watcher, so the slower of the two
+    // never delays the other.
+    start_sweep(app, &tx, Tier::Full);
+
     // Filesystem watcher, so edits show up without waiting for the next sweep.
     // The handle lives until the loop exits; dropping it stops the watcher.
     let _watcher = if app.cfg.refresh.watch {
@@ -339,8 +373,6 @@ async fn run_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut A
     } else {
         None
     };
-
-    start_sweep(app, &tx, Tier::Full);
 
     // Periodic full sweep as a backstop for anything the watcher misses.
     {
@@ -375,19 +407,27 @@ async fn run_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut A
     }
 
     let mut dirty = true;
+    let mut idle_ticks = 0u32;
     loop {
         if dirty {
-            app.now = git::now_unix();
-            terminal.draw(|f| {
-                app.rows_on_screen = ui::table_rows(f.area());
-                ui::render(f, app);
-            })?;
+            draw(terminal, app)?;
             dirty = false;
         }
 
         let Some(input) = rx.recv().await else { break };
         match input {
-            Input::Tick => dirty = true,
+            Input::Tick => {
+                // While a sweep is running, every tick repaints so the spinner
+                // turns and the counter climbs. Idle, repaint about once a
+                // second, which is often enough for the age column and quiet
+                // enough to leave open all day.
+                app.spinner = app.spinner.wrapping_add(1);
+                idle_ticks += 1;
+                if app.sweeping || idle_ticks >= 4 {
+                    idle_ticks = 0;
+                    dirty = true;
+                }
+            }
             Input::Term(TermEvent::Key(key)) if key.kind == KeyEventKind::Press => {
                 handle_key(app, key, &tx);
                 dirty = true;
@@ -441,6 +481,16 @@ async fn run_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut A
             break;
         }
     }
+    Ok(())
+}
+
+/// One frame. Kept separate so the first paint can happen before any setup.
+fn draw(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) -> Result<()> {
+    app.now = git::now_unix();
+    terminal.draw(|f| {
+        app.rows_on_screen = ui::table_rows(f.area());
+        ui::render(f, app);
+    })?;
     Ok(())
 }
 
@@ -937,6 +987,22 @@ pub async fn snapshot(width: u16, height: u16, view: &str) -> Result<String> {
     let cfg = Arc::new(cfg);
     let mut app = App::new(cfg.clone());
 
+    // Cold-start states are rendered without probing, so the "first scan"
+    // placeholder can be checked the same way every other view is.
+    if view == "scanning" {
+        app.repos.clear();
+        app.reindex();
+        app.sweeping = true;
+        app.progress = (0, 0);
+        app.rows_on_screen = height.saturating_sub(6) as usize;
+        app.recompute();
+        return render_once(&app, width, height);
+    }
+    if view == "scanning-partial" {
+        app.sweeping = true;
+        app.progress = (137, 558);
+    }
+
     if app.repos.is_empty() {
         // Nothing cached, so probe enough to render something real.
         let fleet = probe::sweep(cfg, Tier::Full, None).await?;
@@ -964,9 +1030,13 @@ pub async fn snapshot(width: u16, height: u16, view: &str) -> Result<String> {
         _ => {}
     }
 
+    render_once(&app, width, height)
+}
+
+fn render_once(app: &App, width: u16, height: u16) -> Result<String> {
     let backend = ratatui::backend::TestBackend::new(width, height);
     let mut terminal = Terminal::new(backend)?;
-    terminal.draw(|f| ui::render(f, &app))?;
+    terminal.draw(|f| ui::render(f, app))?;
 
     let buffer = terminal.backend().buffer();
     let mut out = String::new();
