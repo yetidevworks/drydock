@@ -1,3 +1,16 @@
+# 0.1.5
+
+## 08/03/2026
+
+1. [](#bugfix)
+    * Fixed the dashboard being pushed off the top of the screen, taking the
+      title and filter bars with it, until the window was resized. Warnings
+      were logged to stderr, which is not redirected while the dashboard owns
+      the terminal, so any one of them printed straight over the frame and
+      scrolled it. Under the dashboard the log now goes to `drydock.log` in the
+      cache directory, and the one warning you are likely to hit is shown in
+      the status bar as well. Every other command still logs to stderr.
+
 # 0.1.4
 
 ## 08/03/2026

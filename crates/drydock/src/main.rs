@@ -25,14 +25,9 @@ use probe::Tier;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "warn".into()),
-        )
-        .with_writer(std::io::stderr)
-        .init();
-
     let cli = Cli::parse();
+    init_tracing(cli.command.is_none());
+
     match cli.command {
         None => tui::run().await,
         Some(Commands::List(args)) => cmd_list(args).await,
@@ -53,6 +48,43 @@ async fn main() -> Result<()> {
             print!("{}", tui::snapshot(width, height, &view).await?);
             Ok(())
         }
+    }
+}
+
+/// Start logging somewhere that won't wreck the output.
+///
+/// The dashboard owns the terminal, and stderr is not redirected while it
+/// runs, so a single warning printed there lands on top of the frame and
+/// scrolls the whole thing up. Under the dashboard the log goes to a file
+/// instead, and to nowhere at all if that file cannot be opened. Every other
+/// command is ordinary CLI output, where stderr is exactly right.
+fn init_tracing(dashboard: bool) {
+    let filter =
+        tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "warn".into());
+    if !dashboard {
+        tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_writer(std::io::stderr)
+            .init();
+        return;
+    }
+    let file = paths::log_file().ok().and_then(|path| {
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .ok()
+    });
+    match file {
+        Some(file) => tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_ansi(false)
+            .with_writer(std::sync::Mutex::new(file))
+            .init(),
+        None => tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_writer(std::io::sink)
+            .init(),
     }
 }
 

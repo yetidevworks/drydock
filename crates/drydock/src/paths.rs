@@ -30,6 +30,10 @@ pub fn cache_file() -> Result<PathBuf> {
     Ok(cache_dir()?.join("state.json"))
 }
 
+pub fn log_file() -> Result<PathBuf> {
+    Ok(cache_dir()?.join("drydock.log"))
+}
+
 /// Expand a leading `~` and make the path absolute.
 pub fn expand(input: &str) -> PathBuf {
     let expanded = shellexpand::tilde(input);

@@ -565,6 +565,7 @@ fn start_sweep(app: &mut App, tx: &mpsc::UnboundedSender<Input>, tier: Tier) {
             return;
         }
         tracing::warn!("previous sweep never finished; starting another");
+        app.notify("The last sweep never finished. Starting another.");
     }
     app.sweeping = true;
     app.sweep_started = Some(Instant::now());
