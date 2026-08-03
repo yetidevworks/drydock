@@ -193,7 +193,22 @@ pub async fn sweep(
     let mut timings = Timings::default();
 
     let t0 = Instant::now();
-    let discovered = discover_repos(cfg.clone()).await?;
+    // Every exit from here has to report Done. The dashboard treats a sweep as
+    // still running until it hears that, and refuses to start another one while
+    // it thinks one is in flight, so a silent early return here wedges every
+    // future sweep for the life of the process.
+    let discovered = match discover_repos(cfg.clone()).await {
+        Ok(d) => d,
+        Err(err) => {
+            emit(
+                &tx,
+                Event::Done {
+                    elapsed: started.elapsed(),
+                },
+            );
+            return Err(err);
+        }
+    };
     timings.discovery = t0.elapsed();
     timings.repos = discovered.len();
     emit(

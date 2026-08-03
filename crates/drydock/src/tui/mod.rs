@@ -42,6 +42,12 @@ const MESSAGE_TTL: Duration = Duration::from_secs(6);
 /// When idle, only every fourth tick repaints.
 const TICK: Duration = Duration::from_millis(250);
 
+/// How long a sweep may claim to be running before the next one starts anyway.
+/// A cold sweep of 550-plus repos takes seconds, so anything past this means
+/// the sweep died without saying so, and a dashboard left open for days would
+/// otherwise sit on the state it started with.
+const SWEEP_STUCK_AFTER: Duration = Duration::from_secs(180);
+
 /// Braille spinner frames, advanced once per tick.
 pub const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
@@ -83,7 +89,12 @@ pub struct App {
     pub progress: (usize, usize),
     pub sweeping: bool,
     pub timings: Timings,
-    pub last_sweep_at: Option<Instant>,
+    /// When the last sweep finished, as unix seconds. Wall clock rather than
+    /// an `Instant`, because `Instant` stops while the machine is asleep and
+    /// this is shown to a person.
+    pub last_sweep_at: Option<i64>,
+    /// When the in-flight sweep started, for the stuck check.
+    sweep_started: Option<Instant>,
     pub watching: bool,
     /// Advances every tick; drives the scanning spinner.
     pub spinner: usize,
@@ -126,6 +137,7 @@ impl App {
             sweeping: false,
             timings: Timings::default(),
             last_sweep_at: None,
+            sweep_started: None,
             watching: false,
             spinner: 0,
             now: git::now_unix(),
@@ -531,7 +543,8 @@ fn handle_probe_event(app: &mut App, event: probe::Event) {
         probe::Event::Done { elapsed } => {
             app.sweeping = false;
             app.timings.total = elapsed;
-            app.last_sweep_at = Some(Instant::now());
+            app.last_sweep_at = Some(git::now_unix());
+            app.sweep_started = None;
             app.reindex();
             let _ = cache::save(&app.repos);
         }
@@ -542,9 +555,19 @@ fn handle_probe_event(app: &mut App, event: probe::Event) {
 /// Kick off a sweep in the background, streaming results into the loop.
 fn start_sweep(app: &mut App, tx: &mpsc::UnboundedSender<Input>, tier: Tier) {
     if app.sweeping {
-        return;
+        // Only skip if the sweep is plausibly still going. A sweep that never
+        // reported back must not be able to block every one after it.
+        let stuck = app
+            .sweep_started
+            .map(|at| at.elapsed() >= SWEEP_STUCK_AFTER)
+            .unwrap_or(true);
+        if !stuck {
+            return;
+        }
+        tracing::warn!("previous sweep never finished; starting another");
     }
     app.sweeping = true;
+    app.sweep_started = Some(Instant::now());
     let cfg = app.cfg.clone();
     let tx = tx.clone();
     tokio::spawn(async move {
@@ -1167,6 +1190,34 @@ mod tests {
         assert_eq!(app.selected, 2);
         assert!(!app.select_at_row(first + 30, first));
         assert_eq!(app.selected, 2);
+    }
+
+    /// A sweep that never reports back must not block the ones after it. This
+    /// is what left a dashboard sitting on four-day-old data: one sweep died
+    /// without emitting Done, and every later sweep hit the in-flight guard.
+    #[tokio::test]
+    async fn a_sweep_that_never_finished_does_not_block_the_next_one() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = app_with(1);
+
+        start_sweep(&mut app, &tx, Tier::Full);
+        assert!(app.sweeping);
+        let first = app.sweep_started.expect("a sweep in flight is timed");
+
+        // Still plausibly running, so nothing new starts.
+        start_sweep(&mut app, &tx, Tier::Full);
+        assert_eq!(app.sweep_started, Some(first), "no second sweep yet");
+
+        // Past the point where it can still be alive, another one starts.
+        app.sweep_started = Some(first - SWEEP_STUCK_AFTER);
+        start_sweep(&mut app, &tx, Tier::Full);
+        assert!(app.sweep_started.expect("restarted") > first);
+
+        // And a sweep marked in flight with no start time at all, which no
+        // longer happens but would be indistinguishable from wedged, restarts.
+        app.sweep_started = None;
+        start_sweep(&mut app, &tx, Tier::Full);
+        assert!(app.sweep_started.is_some());
     }
 
     #[test]

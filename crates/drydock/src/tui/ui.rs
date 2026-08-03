@@ -488,8 +488,15 @@ fn render_status(f: &mut Frame, app: &App, area: Rect) {
             if let Some(note) = app.activity_note() {
                 parts.push(note);
             }
-            if app.timings.total > std::time::Duration::ZERO {
-                parts.push(format!("last sweep {}", fmt::duration(app.timings.total)));
+            // How long ago, not just how long it took. Without this a dashboard
+            // whose sweeps have stopped looks exactly like one that is up to
+            // date, which is the worst way for this tool to fail.
+            if let Some(at) = app.last_sweep_at {
+                parts.push(format!(
+                    "swept {} ago in {}",
+                    fmt::age(at, app.now),
+                    fmt::duration(app.timings.total)
+                ));
             }
             if app.timings.work_cached > 0 {
                 parts.push(format!("{} from cache", app.timings.work_cached));

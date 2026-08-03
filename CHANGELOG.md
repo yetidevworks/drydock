@@ -1,3 +1,21 @@
+# 0.1.4
+
+## 08/03/2026
+
+1. [](#bugfix)
+    * Fixed the dashboard silently stopping its periodic sweeps. A sweep that
+      failed before it started walking never reported that it had finished, and
+      the dashboard refuses to start a sweep while it believes one is running,
+      so a single failure wedged every sweep after it for the life of the
+      process. A dashboard left open for days sat on the data it started with,
+      with nothing on screen to say so. A failed sweep now always reports back,
+      and a sweep still claiming to be in flight after three minutes is
+      presumed dead so the next one runs regardless.
+
+1. [](#improved)
+    * The status bar says how long ago the last sweep was, not just how long it
+      took, so stale data is visible instead of looking exactly like fresh data.
+
 # 0.1.3
 
 ## 07/30/2026
