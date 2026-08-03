@@ -254,15 +254,33 @@ jobs:
           set -euo pipefail
           mkdir -p /tmp/artifacts
           cd /tmp/artifacts
+          # The assets API returns the odd 5xx, and this job is the last thing
+          # in the release: by the time it runs, the tag, the release and the
+          # crate have all published. A single transient failure here leaves
+          # Homebrew a version behind while everything else looks shipped, so
+          # it is worth a few retries before giving up. A genuinely missing
+          # asset still fails, just 20 seconds later.
+          fetch() {
+            for attempt in 1 2 3; do
+              if gh release download "${GITHUB_REF_NAME}" \
+                --repo "${GITHUB_REPOSITORY}" \
+                --pattern "$1" \
+                --clobber; then
+                return 0
+              fi
+              echo "::warning::$1 failed to download (attempt ${attempt}/3)"
+              sleep $(( attempt * 5 ))
+            done
+            echo "::error::$1 could not be downloaded after 3 attempts" >&2
+            return 1
+          }
+
           for f in \
             drydock-darwin-aarch64.tar.gz \
             drydock-darwin-x86_64.tar.gz \
             drydock-linux-x86_64.tar.gz \
             drydock-linux-aarch64.tar.gz; do
-            gh release download "${GITHUB_REF_NAME}" \
-              --repo "${GITHUB_REPOSITORY}" \
-              --pattern "${f}" \
-              --clobber
+            fetch "${f}"
           done
           ls -la
 
