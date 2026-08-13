@@ -115,6 +115,11 @@ pub struct StatusConfig {
     pub concurrency: Option<usize>,
     /// How many changed file paths to keep per repo for the detail pane.
     pub max_files: usize,
+    /// How long cached working-tree counts stay trusted. The cache key is HEAD
+    /// plus the index, and editing a tracked file touches neither, so without
+    /// an expiry a repo you edited but never staged reads as clean forever.
+    /// `0` rescans on every sweep; empty trusts the key indefinitely.
+    pub max_age: String,
 }
 
 impl Default for StatusConfig {
@@ -123,6 +128,7 @@ impl Default for StatusConfig {
             untracked: UntrackedMode::Normal,
             concurrency: None,
             max_files: 200,
+            max_age: "1h".into(),
         }
     }
 }
@@ -255,6 +261,16 @@ impl Config {
     /// repo and spends most of its time waiting on process startup.
     pub fn refs_concurrency(&self) -> usize {
         (self.work_concurrency() * 2).clamp(4, 32)
+    }
+
+    /// `None` means cached working-tree counts never expire on their own, which
+    /// is what an empty `max_age` asks for.
+    pub fn work_max_age(&self) -> Option<Duration> {
+        let raw = self.status.max_age.trim();
+        if raw.is_empty() {
+            return None;
+        }
+        Some(parse_duration(raw).unwrap_or(Duration::from_secs(3600)))
     }
 
     pub fn refresh_interval(&self) -> Duration {

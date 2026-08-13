@@ -219,7 +219,9 @@ async fn cmd_status(path: Option<String>, json: bool) -> Result<()> {
         name,
     };
     let cached = cache::load();
-    let status = probe::probe_one(&discovered, &cfg, cached.get(&root), Tier::Full).await;
+    // Forced: one repo asked about by name is worth the scan, and a cached
+    // "clean" for a tree the caller just edited is the wrong answer.
+    let status = probe::probe_one(&discovered, &cfg, cached.get(&root), Tier::Full, true).await;
 
     let now = git::now_unix();
     if json {

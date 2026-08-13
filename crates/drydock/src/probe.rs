@@ -115,12 +115,27 @@ async fn fill_refs(status: &mut RepoStatus, cfg: &Config, cached: Option<&RepoSt
     }
 }
 
+/// Cached counts go stale even when the key still matches: editing a tracked
+/// file touches neither HEAD nor the index, so the key alone would call an
+/// edited-but-unstaged repo clean forever. The key is what makes a sweep cheap,
+/// so keep it and put a ceiling on how long it is trusted.
+fn work_expired(prev: &RepoStatus, cfg: &Config, now: i64) -> bool {
+    match cfg.work_max_age() {
+        Some(max_age) => now.saturating_sub(prev.work_probed_at) >= max_age.as_secs() as i64,
+        None => false,
+    }
+}
+
 /// Tier 2 for one repo, reusing the cache when HEAD and the index both match.
+///
+/// `force` skips that reuse. The watcher passes it, because a filesystem event
+/// is direct evidence the working tree moved — evidence the key cannot carry.
 async fn fill_work(
     status: &mut RepoStatus,
     cfg: &Config,
     cached: Option<&RepoStatus>,
     tier: Tier,
+    force: bool,
     work_permit: &Semaphore,
 ) -> WorkOutcome {
     let head_sha = status
@@ -129,12 +144,17 @@ async fn fill_work(
         .and_then(|r| r.current_branch().map(|b| b.sha.clone()));
     let key = git::work_key(&status.root, head_sha);
 
-    if let Some(prev) = cached {
-        if prev.work.is_some() && prev.work_key.as_ref() == Some(&key) {
-            status.work = prev.work.clone();
-            status.work_key = Some(key);
-            status.work_probed_at = prev.work_probed_at;
-            return WorkOutcome::Cached;
+    if !force {
+        if let Some(prev) = cached {
+            if prev.work.is_some()
+                && prev.work_key.as_ref() == Some(&key)
+                && !work_expired(prev, cfg, git::now_unix())
+            {
+                status.work = prev.work.clone();
+                status.work_key = Some(key);
+                status.work_probed_at = prev.work_probed_at;
+                return WorkOutcome::Cached;
+            }
         }
     }
 
@@ -167,18 +187,23 @@ async fn fill_work(
 /// Probe one repo end to end. Used for `drydock status <path>` and by the
 /// watcher when a single repo changes; sweeps use the pipelined path below so
 /// tier 1 and tier 2 can run at different concurrencies.
+///
+/// Pass `force` when something already told you the working tree moved. One
+/// repo's scan costs milliseconds, so the callers that probe a single repo on
+/// purpose have no reason to accept a cached answer.
 pub async fn probe_one(
     d: &Discovered,
     cfg: &Config,
     cached: Option<&RepoStatus>,
     tier: Tier,
+    force: bool,
 ) -> RepoStatus {
     let mut status = RepoStatus::new(d.root.clone(), d.group.clone(), d.name.clone());
     if !fill_refs(&mut status, cfg, cached).await {
         return status;
     }
     let unlimited = Semaphore::new(1);
-    fill_work(&mut status, cfg, cached, tier, &unlimited).await;
+    fill_work(&mut status, cfg, cached, tier, force, &unlimited).await;
     status
 }
 
@@ -295,7 +320,7 @@ pub async fn sweep_repos(
                 return status;
             }
 
-            match fill_work(&mut status, &cfg, previous, tier, &work_sem).await {
+            match fill_work(&mut status, &cfg, previous, tier, false, &work_sem).await {
                 WorkOutcome::Scanned => {
                     scanned.fetch_add(1, Ordering::Relaxed);
                 }
@@ -343,5 +368,41 @@ pub async fn sweep_repos(
 fn emit(tx: &Option<mpsc::UnboundedSender<Event>>, event: Event) {
     if let Some(tx) = tx {
         let _ = tx.send(event);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn probed_at(when: i64) -> RepoStatus {
+        let mut status = RepoStatus::new(PathBuf::from("/tmp/repo"), "group".into(), "repo".into());
+        status.work_probed_at = when;
+        status
+    }
+
+    fn with_max_age(max_age: &str) -> Config {
+        let mut cfg = Config::default();
+        cfg.status.max_age = max_age.into();
+        cfg
+    }
+
+    #[test]
+    fn cached_work_expires_once_it_outlives_max_age() {
+        let cfg = with_max_age("1h");
+        let prev = probed_at(1_000_000);
+        assert!(!work_expired(&prev, &cfg, 1_000_000 + 3_599));
+        assert!(work_expired(&prev, &cfg, 1_000_000 + 3_600));
+    }
+
+    #[test]
+    fn an_empty_max_age_trusts_the_key_indefinitely() {
+        assert!(!work_expired(&probed_at(0), &with_max_age(""), i64::MAX));
+    }
+
+    #[test]
+    fn a_zero_max_age_rescans_every_sweep() {
+        let cfg = with_max_age("0");
+        assert!(work_expired(&probed_at(1_000_000), &cfg, 1_000_000));
     }
 }

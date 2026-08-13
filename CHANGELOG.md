@@ -1,3 +1,16 @@
+# 0.1.6
+
+## 08/13/2026
+
+1. [](#bugfix)
+    * Fixed a repo with unstaged edits showing as clean indefinitely. The
+      working-tree scan is skipped whenever HEAD and `.git/index` both match
+      the cached probe, and editing a tracked file touches neither, so a repo
+      edited but never staged kept reporting the counts from its last scan —
+      across restarts, since the cache is on disk. Repos flagged by the watcher
+      now always rescan, `drydock status` never accepts a cached answer, and
+      cached counts expire after an hour by default (`status.max_age`).
+
 # 0.1.5
 
 ## 08/03/2026

@@ -619,7 +619,9 @@ fn reprobe_paths(app: &mut App, paths: Vec<PathBuf>, tx: &mpsc::UnboundedSender<
                 group,
                 name,
             };
-            let status = probe::probe_one(&d, &cfg, cached.get(&root), Tier::Full).await;
+            // Forced: the watcher only flags a repo because a file under it
+            // changed, and the cache key would not notice an unstaged edit.
+            let status = probe::probe_one(&d, &cfg, cached.get(&root), Tier::Full, true).await;
             if tx
                 .send(Input::Probe(probe::Event::Work(Box::new(status))))
                 .is_err()
@@ -913,7 +915,7 @@ fn spawn_fetch(app: &App, tx: &mpsc::UnboundedSender<Input>, roots: Vec<PathBuf>
                     group: previous.group.clone(),
                     name: previous.name.clone(),
                 };
-                let status = probe::probe_one(&d, &cfg, Some(&previous), Tier::Refs).await;
+                let status = probe::probe_one(&d, &cfg, Some(&previous), Tier::Refs, false).await;
                 let _ = tx.send(Input::Probe(probe::Event::Refs(Box::new(status))));
             });
         }
