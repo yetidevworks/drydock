@@ -1,3 +1,10 @@
+# 0.1.7
+
+## 08/21/2026
+
+1. [](#improved)
+    * The branch column now sizes itself to the branch names in the filtered list, and the repo name column keeps the rest. Nearly every repo sits on `main` or `develop`, so the old fixed 55/45 split of the leftover space left a wide strip of empty space beside truncated repo names. Sizing is to a high percentile rather than the longest name, so a stray `codex/some-long-experiment` truncates instead of costing every row.
+
 # 0.1.6
 
 ## 08/13/2026

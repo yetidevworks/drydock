@@ -41,7 +41,7 @@ struct Columns {
 }
 
 impl Columns {
-    fn for_width(width: usize) -> Self {
+    fn for_width(width: usize, branch_want: usize) -> Self {
         // Every column but the repo name is fixed, and the name absorbs the
         // remainder. That keeps the right-hand numbers in the same place as the
         // terminal resizes, which is what makes the table scannable.
@@ -57,14 +57,16 @@ impl Columns {
         let age = 5;
         let fixed = group + state + release + changes + ahead + behind + tag + since_tag + age;
 
-        // Split the leftover between the repo name and the branch. Branch names
-        // like `codex/starvector-spike` deserve the room as much as repo names
-        // do, and one enormously wide name column just looks like a mistake.
-        // Never hand out more than there is: a floor that exceeds the budget
-        // would push the age column off the right edge.
+        // The branch column takes only what the branch names actually on
+        // screen need, and the repo name absorbs the rest. Nearly every repo
+        // sits on `main` or `develop`, so a fixed share of the leftover left a
+        // wide strip of empty space next to truncated repo names. Long branch
+        // names still get room, up to a cap, and never more than half the
+        // leftover -- and never more than there is, or the age column would be
+        // pushed off the right edge.
         let leftover = width.saturating_sub(fixed);
-        let name = (leftover * 55 / 100).clamp(8, 46).min(leftover);
-        let branch = leftover.saturating_sub(name);
+        let branch = branch_want.clamp(7, 24).min(leftover / 2);
+        let name = leftover.saturating_sub(branch);
         Self {
             group,
             name,
@@ -261,7 +263,22 @@ fn render_table(f: &mut Frame, app: &App, area: Rect) {
     if inner.height < 2 {
         return;
     }
-    let cols = Columns::for_width(inner.width as usize);
+    // Size the branch column from every row that passes the filters, not just
+    // the ones on screen, so it holds still while scrolling. Take a high
+    // percentile rather than the longest name: nearly every repo is on `main`
+    // or `develop`, and one `codex/some-experiment-branch` should truncate
+    // rather than tax all 500 rows with a column of empty space.
+    let mut branch_widths: Vec<usize> = app
+        .visible
+        .iter()
+        .map(|idx| app.repos[*idx].branch_label().chars().count() + 1)
+        .collect();
+    branch_widths.sort_unstable();
+    let branch_want = branch_widths
+        .get(branch_widths.len().saturating_sub(1) * 95 / 100)
+        .copied()
+        .unwrap_or(0);
+    let cols = Columns::for_width(inner.width as usize, branch_want);
     let mut lines = vec![header_line(&cols)];
 
     let rows = inner.height.saturating_sub(1) as usize;
