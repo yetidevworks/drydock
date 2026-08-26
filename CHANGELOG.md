@@ -1,8 +1,9 @@
-# 0.1.8
+# 1.0.0
 
 ## 08/26/2026
 
 1. [](#new)
+    * **drydock is 1.0.** The commands, the config keys and the `--json` fields are settled now, and won't change incompatibly without another major version.
     * Config and cache locations now honour `XDG_CONFIG_HOME` and `XDG_CACHE_HOME`, and on macOS an existing `~/.config/drydock` is used in preference to `~/Library/Application Support`. Nothing moves on its own: a directory nobody created is never chosen, so anyone who hasn't asked for this keeps the platform default. Config and cache resolve independently, so `~/.config/drydock` with no `~/.cache/drydock` puts the config where you want it and leaves the cache where macOS expects it.
 2. [](#improved)
     * The dashboard's columns are now configurable, and the `C` key opens a picker to set them: space toggles a column, `J`/`K` reorder, `a` resets, `esc` saves to `[ui] columns`. Turning VISIBILITY on there turns visibility checking on with it and starts a sweep, since a column that can only say "checking off" isn't what anyone was asking for. Turning it off leaves checking alone, because `--public`, `--private` and `--json` still read it. The plain `drydock list` table reads the same setting. Every column's header, alignment, width and cell renderer now live together in one place rather than in two parallel `const` arrays plus a struct of widths that had to be edited in lockstep.
