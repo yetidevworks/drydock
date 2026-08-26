@@ -526,11 +526,43 @@ struct GitConfigScan {
     bare: bool,
 }
 
+/// Whether this git directory belongs to a linked worktree rather than to the
+/// repository itself. The `commondir` pointer beside HEAD is what git leaves
+/// to say so.
+fn is_linked_worktree(git_dir: &Path) -> bool {
+    git_dir.join("commondir").is_file()
+}
+
+/// The git directory shared by every worktree of a repository, which is where
+/// `config` actually lives.
+///
+/// A linked worktree's own git dir (`.git/worktrees/<name>`) holds its HEAD,
+/// index and refs, but no `config` — that one file is shared, and reached
+/// through the `commondir` pointer. Reading config from the worktree's own
+/// directory finds nothing at all, which is why every linked worktree used to
+/// report "no remote configured" no matter what its remote was.
+fn common_git_dir(git_dir: &Path) -> PathBuf {
+    let Ok(body) = std::fs::read_to_string(git_dir.join("commondir")) else {
+        return git_dir.to_path_buf();
+    };
+    let target = PathBuf::from(body.trim());
+    if target.is_absolute() {
+        target
+    } else {
+        git_dir.join(target)
+    }
+}
+
 /// Pull the bits of `.git/config` worth having without paying for a `git
 /// config` process. `origin` wins if present, otherwise the first remote found.
 fn scan_git_config(git_dir: &Path) -> GitConfigScan {
     let mut scan = GitConfigScan::default();
-    let body = match std::fs::read_to_string(git_dir.join("config")) {
+    // `core.bare` describes the repository, but a linked worktree of a bare
+    // repo has a working tree of its own -- only the checkout that owns the
+    // git directory can be the bare one. Settled before reading anything,
+    // because the config below is the *shared* one and would say `true`.
+    let linked = is_linked_worktree(git_dir);
+    let body = match std::fs::read_to_string(common_git_dir(git_dir).join("config")) {
         Ok(b) => b,
         Err(_) => return scan,
     };
@@ -574,6 +606,9 @@ fn scan_git_config(git_dir: &Path) -> GitConfigScan {
     }
     if scan.remote_url.is_none() {
         scan.remote_url = first_remote;
+    }
+    if linked {
+        scan.bare = false;
     }
     scan
 }
@@ -830,6 +865,80 @@ fn stat_changed_files(root: &Path, info: &mut WorkInfo) {
 mod tests {
     use super::*;
     use crate::model::{ReleaseState, RepoStatus};
+
+    fn git(cwd: &Path, args: &[&str]) {
+        let out = std::process::Command::new("git")
+            .current_dir(cwd)
+            .args(args)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@e")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@e")
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {args:?}: {out:?}");
+    }
+
+    // A linked worktree's git dir holds HEAD and refs but no `config` -- that
+    // one file is shared, and reached through `commondir`. Reading it from the
+    // worktree's own directory finds nothing, which made every linked
+    // worktree report "no remote configured" whatever its remote actually was.
+    #[test]
+    fn a_linked_worktree_reads_the_remote_from_the_shared_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("main");
+        std::fs::create_dir_all(&main).unwrap();
+        git(&main, &["init", "-q", "-b", "main", "."]);
+        git(
+            &main,
+            &["remote", "add", "origin", "git@github.com:owner/repo.git"],
+        );
+        git(&main, &["commit", "-qm", "init", "--allow-empty"]);
+        git(&main, &["worktree", "add", "-q", "../side", "-b", "side"]);
+
+        let side = dir.path().join("side");
+        assert!(side.join(".git").is_file(), "expected a gitdir pointer");
+        let git_dir = resolve_git_dir(&side).unwrap();
+        assert!(
+            !git_dir.join("config").exists(),
+            "the premise: no config in the worktree's own git dir"
+        );
+        assert_eq!(
+            scan_git_config(&git_dir).remote_url.as_deref(),
+            Some("git@github.com:owner/repo.git")
+        );
+    }
+
+    // `core.bare` describes the repository, and a linked worktree of a bare
+    // repo has a working tree of its own. Reading the shared config without
+    // that caveat would call the worktree bare and skip its scan entirely.
+    #[test]
+    fn a_linked_worktree_of_a_bare_repo_is_not_itself_bare() {
+        let dir = tempfile::tempdir().unwrap();
+        let upstream = dir.path().join("upstream");
+        std::fs::create_dir_all(&upstream).unwrap();
+        git(&upstream, &["init", "-q", "-b", "main", "."]);
+        git(&upstream, &["commit", "-qm", "init", "--allow-empty"]);
+
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        git(
+            &repo,
+            &["clone", "-q", "--bare", upstream.to_str().unwrap(), ".git"],
+        );
+        git(
+            &repo,
+            &["--git-dir=.git", "worktree", "add", "-q", "trunk", "main"],
+        );
+
+        assert!(is_bare(&repo), "the bare repo itself");
+        assert!(
+            !is_bare(&repo.join("trunk")),
+            "its worktree has a working tree"
+        );
+    }
 
     #[test]
     fn track_parsing() {

@@ -275,10 +275,18 @@ async fn fill_visibility(
 
     if !cfg.visibility.enabled {
         // The remote is real and checkable -- we just haven't asked. Keep a
-        // previously known value (from before the flag was turned off)
+        // previously *known* value (from before the flag was turned off)
         // rather than overwriting it with a generic "disabled".
+        //
+        // Only a known one, for the same reason `visibility_still_trusted`
+        // and `visibility_fallback` insist on one: every other variant is a
+        // record of not having an answer, and those go stale in a way a real
+        // answer doesn't. A cached `no remote configured` from before the
+        // remote could be read would otherwise outlive the thing it described
+        // and keep being reported as fact.
         status.visibility = cached
             .and_then(|p| p.visibility.clone())
+            .filter(|prev| matches!(prev.status, VisibilityStatus::Known(_)))
             .or(Some(VisibilityInfo {
                 status: VisibilityStatus::CheckingDisabled,
                 checked_at: git::now_unix(),

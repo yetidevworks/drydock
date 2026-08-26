@@ -260,6 +260,12 @@ Leave it unset and you get the defaults, which are every column except
 VISIBILITY, and VISIBILITY as well when `visibility.enabled` is on. Set it and
 you get exactly what you list, in the order you list it.
 
+Turning VISIBILITY on in the picker turns `visibility.enabled` on with it and
+kicks off a sweep — otherwise the column could only ever say "checking off".
+Turning it back off leaves checking on, since `--public`, `--private` and
+`--json` still read it; set `visibility.enabled = false` yourself to stop the
+API traffic.
+
 ## Configuration
 
 `drydock config init` writes the defaults to

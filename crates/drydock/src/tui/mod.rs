@@ -256,14 +256,17 @@ impl App {
 
     /// Turn the column under the picker cursor on or off, keeping the cursor
     /// on that same column as it moves between the two sections.
-    pub fn toggle_selected_column(&mut self) {
+    ///
+    /// Returns whether this also turned visibility checking on, which the
+    /// caller uses to kick off a sweep — the values can't arrive without one.
+    pub fn toggle_selected_column(&mut self) -> bool {
         let rows = self.picker_rows();
         let Some((column, shown)) = rows.get(self.column_cursor).copied() else {
-            return;
+            return false;
         };
         if !column.toggleable() {
             self.notify(format!("{} can't be hidden", column.header(false)));
-            return;
+            return false;
         }
 
         if shown {
@@ -282,6 +285,23 @@ impl App {
             self.columns.insert(at, column);
         }
         self.follow_column(column);
+
+        // Asking for the VISIBILITY column is asking for visibility, so turn
+        // the checking on with it. Leaving it off would give a column that can
+        // only ever say "checking off" -- the exact thing that made this
+        // column worth making configurable in the first place.
+        //
+        // Not symmetrical on the way out: hiding the column doesn't turn
+        // checking off, because `--public`, `--private` and `--json` still use
+        // it, and silently disabling those isn't implied by tidying a table.
+        let turned_on = self.columns.contains(&column);
+        if column == Column::Visibility && turned_on && !self.cfg.visibility.enabled {
+            let mut cfg = (*self.cfg).clone();
+            cfg.visibility.enabled = true;
+            self.cfg = Arc::new(cfg);
+            return true;
+        }
+        false
     }
 
     /// Move the column under the cursor one place left or right. Only has any
@@ -834,7 +854,16 @@ fn handle_key(app: &mut App, key: KeyEvent, tx: &mpsc::UnboundedSender<Input>) {
             }
             KeyCode::Char('j') | KeyCode::Down => app.move_column_cursor(1),
             KeyCode::Char('k') | KeyCode::Up => app.move_column_cursor(-1),
-            KeyCode::Char(' ') => app.toggle_selected_column(),
+            KeyCode::Char(' ') => {
+                if app.toggle_selected_column() {
+                    // Persisted straight away rather than at esc: this changed
+                    // more than the table, and the sweep below is about to act
+                    // on it.
+                    app.save_columns();
+                    start_sweep(app, tx, Tier::Refs);
+                    app.notify("Visibility checking on. Asking gh now.");
+                }
+            }
             KeyCode::Char('J') => app.move_selected_column(1),
             KeyCode::Char('K') => app.move_selected_column(-1),
             KeyCode::Char('a') => app.reset_columns(),
@@ -1348,6 +1377,57 @@ mod tests {
         app.toggle_selected_column();
         assert!(app.columns.contains(&Column::Tag));
         assert_eq!(cursor_on(&app), Column::Tag);
+    }
+
+    // Asking for the column is asking for the values. Leaving checking off
+    // would give a column that can only ever read "checking off".
+    #[test]
+    fn showing_the_visibility_column_turns_checking_on_with_it() {
+        let mut app = picker_app();
+        assert!(!app.cfg.visibility.enabled);
+        let at = app
+            .picker_rows()
+            .iter()
+            .position(|(c, _)| *c == Column::Visibility)
+            .unwrap();
+        app.column_cursor = at;
+        assert!(app.toggle_selected_column(), "should report the change");
+        assert!(app.cfg.visibility.enabled);
+    }
+
+    // Not symmetrical: --public, --private and --json still read visibility,
+    // so tidying the table mustn't silently disable them.
+    #[test]
+    fn hiding_the_visibility_column_leaves_checking_alone() {
+        let mut app = picker_app();
+        let at = app
+            .picker_rows()
+            .iter()
+            .position(|(c, _)| *c == Column::Visibility)
+            .unwrap();
+        app.column_cursor = at;
+        app.toggle_selected_column();
+        assert!(app.cfg.visibility.enabled);
+        assert!(
+            !app.toggle_selected_column(),
+            "hiding is not a config change"
+        );
+        assert!(app.columns.iter().all(|c| *c != Column::Visibility));
+        assert!(app.cfg.visibility.enabled, "checking should have survived");
+    }
+
+    // Only VISIBILITY carries a config change; nothing else should touch it.
+    #[test]
+    fn toggling_any_other_column_changes_no_config() {
+        let mut app = picker_app();
+        for at in 0..app.picker_rows().len() {
+            if app.picker_rows()[at].0 == Column::Visibility {
+                continue;
+            }
+            app.column_cursor = at;
+            assert!(!app.toggle_selected_column(), "row {at} reported a change");
+        }
+        assert!(!app.cfg.visibility.enabled);
     }
 
     #[test]
