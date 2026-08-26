@@ -356,6 +356,11 @@ pub enum VisibilityStatus {
     /// No remote at all, so there's nothing any provider could ever check.
     /// Also free to determine.
     NoRemote,
+    /// The repo itself couldn't be read, so whether it even has a remote is
+    /// unknown. Distinct from [`NoRemote`](VisibilityStatus::NoRemote), which
+    /// is a fact established about a repo that *was* read — claiming it here
+    /// would state something nothing checked.
+    Unknown,
     /// The remote is checkable -- a provider recognises it -- but
     /// `visibility.enabled` is off, so nothing has actually asked.
     CheckingDisabled,
@@ -375,6 +380,7 @@ impl VisibilityStatus {
             VisibilityStatus::Known(v) => v.label(),
             VisibilityStatus::Unsupported => "unsupported",
             VisibilityStatus::NoRemote => "no remote configured",
+            VisibilityStatus::Unknown => "unknown",
             VisibilityStatus::CheckingDisabled => "checking disabled",
             VisibilityStatus::CheckFailed(_) => "check failed",
         }

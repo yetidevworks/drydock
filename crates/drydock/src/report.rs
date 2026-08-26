@@ -211,6 +211,7 @@ pub fn detail(repo: &RepoStatus, now: i64) -> String {
             // URL or the config, so there's no "checked ... ago" to report.
             VisibilityStatus::Unsupported
             | VisibilityStatus::NoRemote
+            | VisibilityStatus::Unknown
             | VisibilityStatus::CheckingDisabled => {
                 out.push_str(&format!("  visibility   {}\n", v.status.label()));
             }

@@ -247,7 +247,18 @@ async fn fill_visibility(
 ) {
     use crate::model::VisibilityStatus;
 
-    let Some(remote_url) = status.refs.as_ref().and_then(|r| r.remote_url.as_ref()) else {
+    // "No remote" is a fact about a repo that was read. A repo that couldn't
+    // be read at all hasn't established that or anything else, and saying it
+    // has would be a claim nothing checked -- the same mistake this whole
+    // column is built to avoid.
+    let Some(refs) = status.refs.as_ref() else {
+        status.visibility = Some(VisibilityInfo {
+            status: VisibilityStatus::Unknown,
+            checked_at: git::now_unix(),
+        });
+        return;
+    };
+    let Some(remote_url) = refs.remote_url.as_ref() else {
         status.visibility = Some(VisibilityInfo {
             status: VisibilityStatus::NoRemote,
             checked_at: git::now_unix(),
@@ -324,11 +335,13 @@ pub async fn probe_one(
     force: bool,
 ) -> RepoStatus {
     let mut status = RepoStatus::new(d.root.clone(), d.group.clone(), d.name.clone());
-    if !fill_refs(&mut status, cfg, cached).await {
-        return status;
-    }
     let unlimited = Semaphore::new(1);
-    fill_work(&mut status, cfg, cached, tier, force, &unlimited).await;
+    if fill_refs(&mut status, cfg, cached).await {
+        fill_work(&mut status, cfg, cached, tier, force, &unlimited).await;
+    }
+    // Runs even when the refs probe failed, so the column reports `unknown`
+    // rather than staying unset and rendering as a bare `-`. Carrying a
+    // cached value forward is [`fill_visibility`]'s own business.
     fill_visibility(&mut status, cfg, cached, &unlimited).await;
     status
 }
@@ -444,18 +457,20 @@ pub async fn sweep_repos(
             };
             refs_ms.fetch_max(started.elapsed().as_millis() as u64, Ordering::Relaxed);
             emit(&tx, Event::Refs(Box::new(status.clone())));
-            if !ok {
-                return status;
-            }
 
-            match fill_work(&mut status, &cfg, previous, tier, false, &work_sem).await {
-                WorkOutcome::Scanned => {
-                    scanned.fetch_add(1, Ordering::Relaxed);
+            // A repo whose refs couldn't be read has no working tree worth
+            // scanning, but it still gets a visibility verdict -- `unknown`,
+            // or whatever was cached -- rather than an unset column.
+            if ok {
+                match fill_work(&mut status, &cfg, previous, tier, false, &work_sem).await {
+                    WorkOutcome::Scanned => {
+                        scanned.fetch_add(1, Ordering::Relaxed);
+                    }
+                    WorkOutcome::Cached => {
+                        from_cache.fetch_add(1, Ordering::Relaxed);
+                    }
+                    WorkOutcome::Skipped => {}
                 }
-                WorkOutcome::Cached => {
-                    from_cache.fetch_add(1, Ordering::Relaxed);
-                }
-                WorkOutcome::Skipped => {}
             }
             fill_visibility(&mut status, &cfg, previous, &visibility_sem).await;
             emit(&tx, Event::Work(Box::new(status.clone())));
@@ -715,6 +730,41 @@ mod tests {
                 Some(crate::model::VisibilityStatus::NoRemote)
             );
         }
+    }
+
+    // A repo whose refs probe failed with nothing cached has established
+    // nothing -- least of all that it has no remote. Reporting "no remote
+    // configured" there is a claim nothing checked, which is exactly what
+    // this column exists not to do.
+    #[tokio::test]
+    async fn a_repo_that_could_not_be_read_is_unknown_rather_than_remoteless() {
+        for enabled in [false, true] {
+            let cfg = enabled_visibility_cfg(enabled);
+            let mut status =
+                RepoStatus::new(PathBuf::from("/tmp/repo"), "group".into(), "repo".into());
+            status.error = Some("could not read the repo".into());
+            assert!(status.refs.is_none());
+            let permit = Semaphore::new(1);
+            fill_visibility(&mut status, &cfg, None, &permit).await;
+            assert_eq!(
+                status.visibility.map(|v| v.status),
+                Some(crate::model::VisibilityStatus::Unknown)
+            );
+        }
+    }
+
+    // The other half of that distinction: a repo that *was* read and genuinely
+    // has no remote still says so.
+    #[tokio::test]
+    async fn a_readable_repo_with_no_remote_still_says_no_remote() {
+        let cfg = enabled_visibility_cfg(true);
+        let mut status = status_with_remote(None);
+        let permit = Semaphore::new(1);
+        fill_visibility(&mut status, &cfg, None, &permit).await;
+        assert_eq!(
+            status.visibility.map(|v| v.status),
+            Some(crate::model::VisibilityStatus::NoRemote)
+        );
     }
 
     #[tokio::test]

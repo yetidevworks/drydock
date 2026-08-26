@@ -401,6 +401,7 @@ fn repo_line(repo: &RepoStatus, layout: &TableLayout, now: i64, selected: bool) 
                         | Some(VisibilityStatus::Known(Visibility::Internal))
                         | Some(VisibilityStatus::Unsupported)
                         | Some(VisibilityStatus::NoRemote)
+                        | Some(VisibilityStatus::Unknown)
                         | Some(VisibilityStatus::CheckingDisabled)
                         | Some(VisibilityStatus::CheckFailed(_))
                         | None => base.fg(DIM),
@@ -483,6 +484,7 @@ fn visibility_cell(repo: &RepoStatus) -> String {
         Some(VisibilityStatus::Known(Visibility::Internal)) => "⊘ internal".into(),
         Some(VisibilityStatus::Unsupported) => "· unsupported".into(),
         Some(VisibilityStatus::NoRemote) => "· no remote".into(),
+        Some(VisibilityStatus::Unknown) => "· unknown".into(),
         Some(VisibilityStatus::CheckingDisabled) => "· checking off".into(),
         Some(VisibilityStatus::CheckFailed(_)) => "· check failed".into(),
         None => "-".into(),
@@ -781,6 +783,7 @@ fn render_detail(f: &mut Frame, app: &App, area: Rect) {
                     | VisibilityStatus::Known(Visibility::Internal)
                     | VisibilityStatus::Unsupported
                     | VisibilityStatus::NoRemote
+                    | VisibilityStatus::Unknown
                     | VisibilityStatus::CheckingDisabled
                     | VisibilityStatus::CheckFailed(_) => DIM,
                 }),
@@ -808,6 +811,7 @@ fn render_detail(f: &mut Frame, app: &App, area: Rect) {
             // call, so there's nothing that was actually "checked".
             VisibilityStatus::Unsupported
             | VisibilityStatus::NoRemote
+            | VisibilityStatus::Unknown
             | VisibilityStatus::CheckingDisabled => {}
         }
         lines.push(Line::from(spans));
