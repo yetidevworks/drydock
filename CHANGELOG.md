@@ -1,3 +1,10 @@
+# 0.1.8
+
+## 08/26/2026
+
+1. [](#new)
+    * Config and cache locations now honour `XDG_CONFIG_HOME` and `XDG_CACHE_HOME`, and on macOS an existing `~/.config/drydock` is used in preference to `~/Library/Application Support`. Nothing moves on its own: a directory nobody created is never chosen, so anyone who hasn't asked for this keeps the platform default. Config and cache resolve independently, so `~/.config/drydock` with no `~/.cache/drydock` puts the config where you want it and leaves the cache where macOS expects it.
+
 # 0.1.7
 
 ## 08/21/2026

@@ -190,7 +190,14 @@ have it happen on a timer.
 `drydock config init` writes the defaults to
 `~/Library/Application Support/drydock/config.toml` on macOS, or
 `~/.config/drydock/config.toml` on Linux. The cache lives under
-`~/Library/Caches/drydock` or `~/.cache/drydock`.
+`~/Library/Caches/drydock` or `~/.cache/drydock`. `drydock config path`
+prints both, whatever they resolved to.
+
+If you keep every tool's config in `~/.config` and sync it between machines,
+you can have that on macOS too. Either set `XDG_CONFIG_HOME` (and
+`XDG_CACHE_HOME`) explicitly, or just create `~/.config/drydock` — drydock
+uses it if it's already there. Neither moves an existing config, so doing
+nothing keeps the platform default.
 
 ```toml
 roots = ["~/Projects"]       # each immediate subdirectory becomes a "group"
