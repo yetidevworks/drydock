@@ -20,7 +20,8 @@ use crate::cache;
 use crate::config::Config;
 use crate::discover::{self, Discovered};
 use crate::git;
-use crate::model::RepoStatus;
+use crate::model::{RepoStatus, VisibilityInfo};
+use crate::provider;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Tier {
@@ -191,13 +192,130 @@ async fn fill_work(
     }
 }
 
+/// True when a cached visibility check has outlived `visibility.interval` and
+/// is worth repeating.
+fn visibility_expired(info: &crate::model::VisibilityInfo, cfg: &Config, now: i64) -> bool {
+    now.saturating_sub(info.checked_at) >= cfg.visibility_interval().as_secs() as i64
+}
+
+/// True when a cached visibility entry is still worth trusting as-is, so a
+/// fresh check can be skipped. Only a real answer qualifies:
+/// `CheckingDisabled` and `CheckFailed` are records of *not* having one, and
+/// trusting those the same way a `Known` value is trusted would mean
+/// re-enabling this feature -- or a transient failure clearing up -- doesn't
+/// actually get retried until the interval runs out.
+fn visibility_still_trusted(info: &crate::model::VisibilityInfo, cfg: &Config, now: i64) -> bool {
+    matches!(info.status, crate::model::VisibilityStatus::Known(_))
+        && !visibility_expired(info, cfg, now)
+}
+
+/// What to report after a provider call fails. Prefers a previously known
+/// value over the fresh failure -- but, same reasoning as
+/// [`visibility_still_trusted`], only a real one. Falling back to a cached
+/// `CheckingDisabled` or `CheckFailed` here would hide a fresh, specific
+/// failure reason behind a stale, less specific one.
+fn visibility_fallback(
+    cached: Option<&crate::model::VisibilityInfo>,
+    reason: &str,
+    now: i64,
+) -> crate::model::VisibilityInfo {
+    match cached.filter(|prev| matches!(prev.status, crate::model::VisibilityStatus::Known(_))) {
+        Some(prev) => prev.clone(),
+        None => crate::model::VisibilityInfo {
+            status: crate::model::VisibilityStatus::CheckFailed(
+                reason.lines().next().unwrap_or(reason).to_string(),
+            ),
+            checked_at: now,
+        },
+    }
+}
+
+/// Check a repo's visibility via whichever hosting provider its remote
+/// belongs to (see [`crate::provider`]), reusing a cached value that's still
+/// within `visibility.interval`. Always sets `status.visibility` to `Some` --
+/// see [`VisibilityStatus`] for what each outcome means. Two of those
+/// outcomes are free and computed regardless of `visibility.enabled`: no
+/// remote at all, and a remote on a host nothing recognises. Both are facts
+/// about the remote URL, not something that costs a network call to know, so
+/// there's no reason to gate them behind the same flag that gates actual
+/// provider calls.
+async fn fill_visibility(
+    status: &mut RepoStatus,
+    cfg: &Config,
+    cached: Option<&RepoStatus>,
+    permit: &Semaphore,
+) {
+    use crate::model::VisibilityStatus;
+
+    let Some(remote_url) = status.refs.as_ref().and_then(|r| r.remote_url.as_ref()) else {
+        status.visibility = Some(VisibilityInfo {
+            status: VisibilityStatus::NoRemote,
+            checked_at: git::now_unix(),
+        });
+        return;
+    };
+    let Some((provider, slug)) = provider::detect(remote_url) else {
+        status.visibility = Some(VisibilityInfo {
+            status: VisibilityStatus::Unsupported,
+            checked_at: git::now_unix(),
+        });
+        return;
+    };
+
+    if !cfg.visibility.enabled {
+        // The remote is real and checkable -- we just haven't asked. Keep a
+        // previously known value (from before the flag was turned off)
+        // rather than overwriting it with a generic "disabled".
+        status.visibility = cached
+            .and_then(|p| p.visibility.clone())
+            .or(Some(VisibilityInfo {
+                status: VisibilityStatus::CheckingDisabled,
+                checked_at: git::now_unix(),
+            }));
+        return;
+    }
+
+    let now = git::now_unix();
+    if let Some(prev) = cached.and_then(|p| p.visibility.as_ref()) {
+        if visibility_still_trusted(prev, cfg, now) {
+            status.visibility = Some(prev.clone());
+            return;
+        }
+    }
+
+    let _permit = permit.acquire().await;
+    match provider::check(provider, &slug, cfg.visibility_timeout()).await {
+        Ok(value) => {
+            status.visibility = Some(VisibilityInfo {
+                status: VisibilityStatus::Known(value),
+                checked_at: git::now_unix(),
+            });
+        }
+        Err(err) => {
+            let reason = format!("{err:#}");
+            tracing::debug!(
+                repo = %status.root.display(),
+                error = %reason,
+                "visibility check failed"
+            );
+            status.visibility = Some(visibility_fallback(
+                cached.and_then(|p| p.visibility.as_ref()),
+                &reason,
+                git::now_unix(),
+            ));
+        }
+    }
+}
+
 /// Probe one repo end to end. Used for `drydock status <path>` and by the
 /// watcher when a single repo changes; sweeps use the pipelined path below so
 /// tier 1 and tier 2 can run at different concurrencies.
 ///
 /// Pass `force` when something already told you the working tree moved. One
 /// repo's scan costs milliseconds, so the callers that probe a single repo on
-/// purpose have no reason to accept a cached answer.
+/// purpose have no reason to accept a cached answer. Visibility is exempt
+/// from that: it has its own interval, checked separately below, since it
+/// costs a real network round trip rather than a syscall.
 pub async fn probe_one(
     d: &Discovered,
     cfg: &Config,
@@ -211,6 +329,7 @@ pub async fn probe_one(
     }
     let unlimited = Semaphore::new(1);
     fill_work(&mut status, cfg, cached, tier, force, &unlimited).await;
+    fill_visibility(&mut status, cfg, cached, &unlimited).await;
     status
 }
 
@@ -297,6 +416,7 @@ pub async fn sweep_repos(
 
     let refs_sem = Arc::new(Semaphore::new(cfg.refs_concurrency()));
     let work_sem = Arc::new(Semaphore::new(cfg.work_concurrency()));
+    let visibility_sem = Arc::new(Semaphore::new(cfg.visibility.concurrency.max(1)));
     let refs_ms = Arc::new(AtomicU64::new(0));
     let scanned = Arc::new(AtomicUsize::new(0));
     let from_cache = Arc::new(AtomicUsize::new(0));
@@ -308,6 +428,7 @@ pub async fn sweep_repos(
         let cached = cached.clone();
         let refs_sem = refs_sem.clone();
         let work_sem = work_sem.clone();
+        let visibility_sem = visibility_sem.clone();
         let refs_ms = refs_ms.clone();
         let scanned = scanned.clone();
         let from_cache = from_cache.clone();
@@ -336,6 +457,7 @@ pub async fn sweep_repos(
                 }
                 WorkOutcome::Skipped => {}
             }
+            fill_visibility(&mut status, &cfg, previous, &visibility_sem).await;
             emit(&tx, Event::Work(Box::new(status.clone())));
             status
         });
@@ -461,5 +583,182 @@ mod tests {
     fn a_zero_max_age_rescans_every_sweep() {
         let cfg = with_max_age("0");
         assert!(work_expired(&probed_at(1_000_000), &cfg, 1_000_000));
+    }
+
+    fn visibility_info(status: crate::model::VisibilityStatus, checked_at: i64) -> VisibilityInfo {
+        VisibilityInfo { status, checked_at }
+    }
+
+    #[test]
+    fn a_known_value_within_the_interval_is_trusted() {
+        let cfg = Config::default(); // 24h interval
+        let info = visibility_info(
+            crate::model::VisibilityStatus::Known(crate::model::Visibility::Public),
+            1_000_000,
+        );
+        assert!(visibility_still_trusted(&info, &cfg, 1_000_000 + 3_600));
+    }
+
+    #[test]
+    fn a_known_value_past_the_interval_is_not_trusted() {
+        let cfg = Config::default(); // 24h interval
+        let info = visibility_info(
+            crate::model::VisibilityStatus::Known(crate::model::Visibility::Public),
+            1_000_000,
+        );
+        assert!(!visibility_still_trusted(&info, &cfg, 1_000_000 + 86_400));
+    }
+
+    // The bug this guards against: a repo probed while checking was off (or
+    // mid-failure) gets a cache entry that is *not itself an answer*. Without
+    // this, turning checking back on -- or a transient failure clearing up --
+    // wouldn't actually trigger a fresh check until the interval ran out,
+    // because the interval logic alone can't tell "we know this" from "we
+    // don't, yet" apart.
+    #[test]
+    fn checking_disabled_is_never_trusted_no_matter_how_fresh() {
+        let cfg = Config::default();
+        let info = visibility_info(crate::model::VisibilityStatus::CheckingDisabled, 1_000_000);
+        assert!(!visibility_still_trusted(&info, &cfg, 1_000_000));
+    }
+
+    #[test]
+    fn a_check_failure_is_never_trusted_no_matter_how_fresh() {
+        let cfg = Config::default();
+        let info = visibility_info(
+            crate::model::VisibilityStatus::CheckFailed("timed out".into()),
+            1_000_000,
+        );
+        assert!(!visibility_still_trusted(&info, &cfg, 1_000_000));
+    }
+
+    #[test]
+    fn a_failed_check_falls_back_to_a_real_previous_value() {
+        let known = visibility_info(
+            crate::model::VisibilityStatus::Known(crate::model::Visibility::Private),
+            1_000,
+        );
+        let out = visibility_fallback(Some(&known), "rate limited", 2_000);
+        assert_eq!(out.status, known.status);
+        // The fallback is a value worth trusting again, not the moment of
+        // this failure -- so its timestamp is untouched, not bumped to now.
+        assert_eq!(out.checked_at, 1_000);
+    }
+
+    #[test]
+    fn a_failed_check_does_not_fall_back_to_a_placeholder() {
+        for placeholder in [
+            crate::model::VisibilityStatus::CheckingDisabled,
+            crate::model::VisibilityStatus::CheckFailed("previous failure".into()),
+        ] {
+            let cached = visibility_info(placeholder, 1_000);
+            let out = visibility_fallback(Some(&cached), "rate limited", 2_000);
+            assert_eq!(
+                out.status,
+                crate::model::VisibilityStatus::CheckFailed("rate limited".into())
+            );
+            assert_eq!(out.checked_at, 2_000);
+        }
+    }
+
+    #[test]
+    fn a_failed_check_with_nothing_cached_reports_itself() {
+        let out = visibility_fallback(None, "gh: not authenticated\nrun gh auth login", 2_000);
+        assert_eq!(
+            out.status,
+            crate::model::VisibilityStatus::CheckFailed("gh: not authenticated".into())
+        );
+        assert_eq!(out.checked_at, 2_000);
+    }
+
+    fn status_with_remote(remote_url: Option<&str>) -> RepoStatus {
+        let mut status = RepoStatus::new(PathBuf::from("/tmp/repo"), "group".into(), "repo".into());
+        status.refs = Some(crate::model::RefsInfo {
+            head: crate::model::Head::Branch("main".into()),
+            branches: Vec::new(),
+            last_commit: None,
+            stashes: 0,
+            operation: None,
+            newest_tag: None,
+            described_tag: None,
+            commits_since_tag: None,
+            since_tag_subjects: Vec::new(),
+            tags_orphaned: false,
+            index_mtime: None,
+            remote_url: remote_url.map(String::from),
+            changelog: None,
+            is_bare: false,
+            is_shallow: false,
+        });
+        status
+    }
+
+    fn enabled_visibility_cfg(enabled: bool) -> Config {
+        let mut cfg = Config::default();
+        cfg.visibility.enabled = enabled;
+        cfg
+    }
+
+    // These two are free -- determined from the remote URL alone, no `gh`
+    // call involved -- so they're expected to hold regardless of
+    // `visibility.enabled`, unlike everything else `fill_visibility` does.
+
+    #[tokio::test]
+    async fn no_remote_is_known_for_free_either_way() {
+        for enabled in [false, true] {
+            let cfg = enabled_visibility_cfg(enabled);
+            let mut status = status_with_remote(None);
+            let permit = Semaphore::new(1);
+            fill_visibility(&mut status, &cfg, None, &permit).await;
+            assert_eq!(
+                status.visibility.map(|v| v.status),
+                Some(crate::model::VisibilityStatus::NoRemote)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unrecognised_host_is_known_for_free_either_way() {
+        for enabled in [false, true] {
+            let cfg = enabled_visibility_cfg(enabled);
+            let mut status = status_with_remote(Some("git@gitlab.com:owner/repo.git"));
+            let permit = Semaphore::new(1);
+            fill_visibility(&mut status, &cfg, None, &permit).await;
+            assert_eq!(
+                status.visibility.map(|v| v.status),
+                Some(crate::model::VisibilityStatus::Unsupported)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_checkable_remote_says_so_plainly_when_checking_is_off() {
+        let cfg = enabled_visibility_cfg(false);
+        let mut status = status_with_remote(Some("git@github.com:owner/repo.git"));
+        let permit = Semaphore::new(1);
+        fill_visibility(&mut status, &cfg, None, &permit).await;
+        assert_eq!(
+            status.visibility.map(|v| v.status),
+            Some(crate::model::VisibilityStatus::CheckingDisabled)
+        );
+    }
+
+    #[tokio::test]
+    async fn turning_checking_off_does_not_erase_a_previously_known_value() {
+        let cfg = enabled_visibility_cfg(false);
+        let mut status = status_with_remote(Some("git@github.com:owner/repo.git"));
+        let mut cached = status_with_remote(Some("git@github.com:owner/repo.git"));
+        cached.visibility = Some(crate::model::VisibilityInfo {
+            status: crate::model::VisibilityStatus::Known(crate::model::Visibility::Public),
+            checked_at: 1_000,
+        });
+        let permit = Semaphore::new(1);
+        fill_visibility(&mut status, &cfg, Some(&cached), &permit).await;
+        assert_eq!(
+            status.visibility.map(|v| v.status),
+            Some(crate::model::VisibilityStatus::Known(
+                crate::model::Visibility::Public
+            ))
+        );
     }
 }
