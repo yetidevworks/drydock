@@ -482,10 +482,24 @@ impl RepoStatus {
             "dirty"
         } else if f.unpushed {
             "unpushed"
+        } else if self.is_bare() {
+            // Checked after `unpushed`, because a bare repo holding branches
+            // its remote hasn't seen is still worth saying so about. But it
+            // has no working tree to be dirty and never runs tier 2, so the
+            // "not scanned yet" ellipsis below would be permanent here.
+            "bare"
         } else if self.work.is_none() {
             "…"
         } else {
             "clean"
         }
+    }
+
+    /// Whether this is a bare repo — no working tree, so nothing to scan for
+    /// uncommitted changes and nothing `git status` can be asked about. Most
+    /// often the container of a bare-plus-worktrees layout, whose worktrees
+    /// are discovered as repos in their own right.
+    pub fn is_bare(&self) -> bool {
+        self.refs.as_ref().map(|r| r.is_bare).unwrap_or(false)
     }
 }

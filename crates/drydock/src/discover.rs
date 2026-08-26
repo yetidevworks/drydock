@@ -3,7 +3,9 @@
 //! A hand-rolled walk rather than a generic recursive iterator, because the
 //! central rule is "stop descending the moment you find a repo". That single
 //! rule is what keeps submodules, vendored checkouts, and test fixture repos
-//! out of the list without needing to enumerate them.
+//! out of the list without needing to enumerate them. Bare repos are the one
+//! exception: having no working tree, they can't contain a nested checkout in
+//! the first place, and what they usually do contain is their own worktrees.
 
 use anyhow::{Context, Result};
 use globset::{Glob, GlobSet, GlobSetBuilder};
@@ -11,6 +13,7 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use crate::config::Config;
+use crate::git;
 
 #[derive(Clone, Debug)]
 pub struct Discovered {
@@ -147,7 +150,12 @@ fn walk_root(
                     name,
                 });
             }
-            if !cfg.follow_nested_repos {
+            // A bare repo has no working tree, so nothing can be nested
+            // *inside* one — which is the only thing `follow_nested_repos`
+            // guards against. Its subdirectories are almost always its
+            // worktrees, which is the entire point of the bare-plus-worktrees
+            // layout, so descend regardless of the setting.
+            if !cfg.follow_nested_repos && !git::is_bare(&dir) {
                 continue;
             }
         }
@@ -220,6 +228,100 @@ mod tests {
         assert_eq!(
             split_slug(root, Path::new("/p/a/b/c")),
             ("a".to_string(), "b/c".to_string())
+        );
+    }
+
+    /// The layout from issue #4: a bare repo whose worktrees live beside it.
+    /// Returns the scan root.
+    fn bare_repo_with_worktrees() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        let upstream = root.join("upstream");
+        std::fs::create_dir_all(&upstream).unwrap();
+        let git = |cwd: &Path, args: &[&str]| {
+            let ok = std::process::Command::new("git")
+                .current_dir(cwd)
+                .args(args)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_SYSTEM", "/dev/null")
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@e")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@e")
+                .output()
+                .unwrap();
+            assert!(ok.status.success(), "git {args:?}: {ok:?}");
+        };
+        git(&upstream, &["init", "-q", "-b", "main", "."]);
+        std::fs::write(upstream.join("a.txt"), "hi").unwrap();
+        git(&upstream, &["add", "-A"]);
+        git(&upstream, &["commit", "-qm", "init"]);
+
+        let repo = root.join("dev").join("myrepo");
+        std::fs::create_dir_all(&repo).unwrap();
+        git(
+            &repo,
+            &["clone", "-q", "--bare", upstream.to_str().unwrap(), ".git"],
+        );
+        git(
+            &repo,
+            &["--git-dir=.git", "worktree", "add", "-q", "trunk", "main"],
+        );
+        dir
+    }
+
+    /// `group/name` for everything discovered, sorted, so assertions read the
+    /// way the table does.
+    fn slugs_found(root: &Path, follow_nested: bool) -> Vec<String> {
+        let cfg = Config {
+            roots: vec![root.to_string_lossy().to_string()],
+            follow_nested_repos: follow_nested,
+            ..Config::default()
+        };
+        let (found, _) = discover(&cfg).unwrap();
+        let mut slugs: Vec<String> = found
+            .iter()
+            .map(|d| {
+                if d.group.is_empty() {
+                    d.name.clone()
+                } else {
+                    format!("{}/{}", d.group, d.name)
+                }
+            })
+            .collect();
+        slugs.sort();
+        slugs
+    }
+
+    // Issue #4: the bare repo is what discovery finds first, and pruning at
+    // that point hides the worktrees -- which are the only things in the
+    // layout with a working tree to report on.
+    #[test]
+    fn a_bare_repos_worktrees_are_found_without_following_nested_repos() {
+        let dir = bare_repo_with_worktrees();
+        let slugs = slugs_found(&dir.path().join("dev"), false);
+        assert!(
+            slugs.contains(&"myrepo/trunk".to_string()),
+            "worktree missing from {slugs:?}"
+        );
+        assert!(
+            slugs.contains(&"myrepo".to_string()),
+            "bare repo itself missing from {slugs:?}"
+        );
+    }
+
+    // The rule bare repos are an exception to still has to hold for everyone
+    // else: a checkout nested inside a normal working tree stays pruned.
+    #[test]
+    fn a_repo_nested_in_a_working_tree_is_still_pruned() {
+        let dir = bare_repo_with_worktrees();
+        let nested = dir.path().join("dev").join("myrepo").join("trunk");
+        std::fs::create_dir_all(nested.join("vendored").join(".git")).unwrap();
+        let slugs = slugs_found(&dir.path().join("dev"), false);
+        assert!(
+            !slugs.iter().any(|n| n.contains("vendored")),
+            "vendored checkout should have been pruned, got {slugs:?}"
         );
     }
 

@@ -138,6 +138,13 @@ async fn fill_work(
     force: bool,
     work_permit: &Semaphore,
 ) -> WorkOutcome {
+    // A bare repo has no working tree, so `git status` can only ever fail
+    // here. Bail before running it rather than recording an error against a
+    // repo that is behaving exactly as intended.
+    if status.is_bare() {
+        return WorkOutcome::Skipped;
+    }
+
     let head_sha = status
         .refs
         .as_ref()
@@ -374,6 +381,56 @@ fn emit(tx: &Option<mpsc::UnboundedSender<Event>>, event: Event) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn bare_status(is_bare: bool) -> RepoStatus {
+        let mut status = RepoStatus::new(PathBuf::from("/nonexistent"), "g".into(), "r".into());
+        status.refs = Some(crate::model::RefsInfo {
+            head: crate::model::Head::Branch("main".into()),
+            branches: Vec::new(),
+            last_commit: None,
+            stashes: 0,
+            operation: None,
+            newest_tag: None,
+            described_tag: None,
+            commits_since_tag: None,
+            since_tag_subjects: Vec::new(),
+            tags_orphaned: false,
+            index_mtime: None,
+            remote_url: None,
+            changelog: None,
+            is_bare,
+            is_shallow: false,
+        });
+        status
+    }
+
+    // Issue #4: `git status` in a bare repo can only ever fail ("this
+    // operation must be run in a work tree"), and recording that failure made
+    // a perfectly healthy repo render as `error`. The scan is skipped
+    // outright now, so there is nothing left to fail.
+    #[tokio::test]
+    async fn a_bare_repo_is_never_scanned_for_a_working_tree() {
+        let cfg = Config::default();
+        let mut status = bare_status(true);
+        let permit = Semaphore::new(1);
+        let outcome = fill_work(&mut status, &cfg, None, Tier::Full, true, &permit).await;
+        assert_eq!(outcome, WorkOutcome::Skipped);
+        assert!(status.work.is_none());
+        assert_eq!(status.error, None, "a bare repo is not an error");
+        assert_eq!(status.state_label(), "bare");
+    }
+
+    // That skip is guarded on `is_bare` alone, so a non-bare repo still has to
+    // reach the scan. Here it fails, because the root does not exist -- and
+    // that failure is exactly what should still be recorded.
+    #[tokio::test]
+    async fn a_normal_repo_still_reaches_the_working_tree_scan() {
+        let cfg = Config::default();
+        let mut status = bare_status(false);
+        let permit = Semaphore::new(1);
+        fill_work(&mut status, &cfg, None, Tier::Full, true, &permit).await;
+        assert!(status.error.is_some(), "the failed scan should be recorded");
+    }
 
     fn probed_at(when: i64) -> RepoStatus {
         let mut status = RepoStatus::new(PathBuf::from("/tmp/repo"), "group".into(), "repo".into());

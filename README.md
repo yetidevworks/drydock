@@ -185,6 +185,19 @@ own and a remote that wants credentials can hang. Press `f` to fetch the
 selected repo, `F` for everything on screen, or set `remote.fetch = true` to
 have it happen on a timer.
 
+### Worktrees
+
+A bare repo with its worktrees beside it — `.git/` next to `trunk/` and
+`branch/` — is listed as you'd expect: each worktree is a repo in its own
+right, grouped under the bare repo's name, and the bare repo itself gets a
+`bare` state rather than being scanned for a working tree it doesn't have.
+
+This works with `follow_nested_repos` left off. That setting exists to keep
+submodules and vendored checkouts from being listed separately from the repo
+containing them, and a bare repo has no working tree for anything to be
+contained *in* — so it's descended into regardless. A checkout genuinely
+nested inside a working tree is still pruned.
+
 ## Configuration
 
 `drydock config init` writes the defaults to
@@ -203,6 +216,7 @@ nothing keeps the platform default.
 roots = ["~/Projects"]       # each immediate subdirectory becomes a "group"
 max_depth = 4
 follow_nested_repos = false  # keeps submodules and vendored checkouts out
+                             # (bare repos always descend — see "Worktrees")
 follow_symlinks = false      # so a symlinked tree can't be counted twice
 exclude = ["fixtures/**"]    # globs, relative to a root
 prune = []                   # extra directory names to skip

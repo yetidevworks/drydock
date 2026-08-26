@@ -367,7 +367,14 @@ fn repo_line(repo: &RepoStatus, cols: &Columns, now: i64, selected: bool) -> Lin
         .work
         .as_ref()
         .map(|w| fmt::changes(w.staged, w.unstaged, w.untracked, w.conflicts))
-        .unwrap_or_else(|| "…".into());
+        // `…` means "still scanning". A bare repo has nothing to scan.
+        .unwrap_or_else(|| {
+            if repo.is_bare() {
+                "·".into()
+            } else {
+                "…".into()
+            }
+        });
 
     let tag = repo.tag_label();
     let mut spans = vec![

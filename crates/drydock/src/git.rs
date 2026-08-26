@@ -105,6 +105,18 @@ pub fn resolve_git_dir(root: &Path) -> Result<PathBuf> {
     })
 }
 
+/// Whether a checkout is a bare repository, read straight from its config.
+///
+/// Discovery needs this answer before any probing has happened, so it pays for
+/// its own small read rather than waiting on [`RefsInfo::is_bare`]. That costs
+/// one `config` read per repo found, and only where the answer changes what
+/// discovery does next.
+pub fn is_bare(root: &Path) -> bool {
+    resolve_git_dir(root)
+        .map(|git_dir| scan_git_config(&git_dir).bare)
+        .unwrap_or(false)
+}
+
 fn mtime_secs(path: &Path) -> Option<i64> {
     std::fs::metadata(path)
         .ok()?

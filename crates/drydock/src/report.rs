@@ -80,9 +80,12 @@ pub fn list_table(repos: &[&RepoStatus], now: i64, show_paths: bool) -> String {
         .iter()
         .map(|r| {
             let work = r.work.as_ref();
+            // `?` means "not scanned yet". A bare repo has nothing to scan,
+            // which is a different thing and reads as `·` like every other
+            // known-nothing in this table.
             let changes = work
                 .map(|w| fmt::changes(w.staged, w.unstaged, w.untracked, w.conflicts))
-                .unwrap_or_else(|| "?".into());
+                .unwrap_or_else(|| if r.is_bare() { "·".into() } else { "?".into() });
             let repo_cell = if show_paths {
                 paths::contract(&r.root)
             } else {
@@ -365,6 +368,8 @@ pub fn detail(repo: &RepoStatus, now: i64) -> String {
                 out.push_str("    … more\n");
             }
         }
+    } else if repo.is_bare() {
+        out.push_str("\n  changes      (bare repo, no working tree)\n");
     } else {
         out.push_str("\n  changes      (working tree not scanned)\n");
     }
