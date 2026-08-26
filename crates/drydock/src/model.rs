@@ -300,6 +300,97 @@ impl Flags {
     }
 }
 
+/// A repo's visibility on its hosting service (GitHub, for now), as last
+/// observed via `gh`. This is not a `git` concept at all — nothing under
+/// `.git` records whether a remote is public or private, so unlike every
+/// other field here it can only come from asking the host.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub enum Visibility {
+    Public,
+    Private,
+    /// GitHub Enterprise's "visible to the whole org, but not the world"
+    /// tier. Kept distinct rather than folded into `Private` because that
+    /// would misreport it to anyone scanning for truly private repos.
+    Internal,
+}
+
+impl Visibility {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Visibility::Public => "public",
+            Visibility::Private => "private",
+            Visibility::Internal => "internal",
+        }
+    }
+}
+
+impl std::str::FromStr for Visibility {
+    type Err = ();
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_ascii_uppercase().as_str() {
+            "PUBLIC" => Ok(Visibility::Public),
+            "PRIVATE" => Ok(Visibility::Private),
+            "INTERNAL" => Ok(Visibility::Internal),
+            _ => Err(()),
+        }
+    }
+}
+
+/// What's known about a repo's visibility, or the specific reason nothing is.
+/// Every variant but [`Known`](VisibilityStatus::Known) is a real, distinct
+/// fact rather than a catch-all -- the point of having this many variants
+/// instead of a plain `Option<Visibility>` is that "we don't know" always has
+/// a specific cause worth saying.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub enum VisibilityStatus {
+    /// A value a hosting provider actually reported (see [`crate::provider`]).
+    Known(Visibility),
+    /// This repo's remote isn't on any host [`crate::provider::detect`]
+    /// recognises -- a different host than the ones supported, or a URL that
+    /// doesn't parse into `owner/repo` at all. Determined from the remote URL
+    /// alone, no network call involved, so unlike
+    /// [`Known`](VisibilityStatus::Known) it's never stale and never costs a
+    /// CLI invocation to say.
+    Unsupported,
+    /// No remote at all, so there's nothing any provider could ever check.
+    /// Also free to determine.
+    NoRemote,
+    /// The remote is checkable -- a provider recognises it -- but
+    /// `visibility.enabled` is off, so nothing has actually asked.
+    CheckingDisabled,
+    /// A provider check was attempted and failed (rate limited, not
+    /// authenticated, timed out), and there was no previously cached value to
+    /// fall back to. The reason is kept, but only surfaced in `status`,
+    /// `--json`, and the TUI detail view -- never in a table, where one long
+    /// message would widen the column for every row.
+    CheckFailed(String),
+}
+
+impl VisibilityStatus {
+    /// Short label for tables and the common case. `CheckFailed` deliberately
+    /// does not include its reason here -- see the variant's own docs.
+    pub fn label(&self) -> &'static str {
+        match self {
+            VisibilityStatus::Known(v) => v.label(),
+            VisibilityStatus::Unsupported => "unsupported",
+            VisibilityStatus::NoRemote => "no remote configured",
+            VisibilityStatus::CheckingDisabled => "checking disabled",
+            VisibilityStatus::CheckFailed(_) => "check failed",
+        }
+    }
+}
+
+/// Visibility as last checked, plus when. Kept separate from [`RefsInfo`]
+/// because it comes from a different tool (`gh`, not `git`), costs real
+/// network and API time, and goes stale on its own clock rather than whenever
+/// HEAD or the index moves.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct VisibilityInfo {
+    pub status: VisibilityStatus,
+    pub checked_at: i64,
+}
+
 /// One repo, as most recently observed.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RepoStatus {
@@ -316,6 +407,15 @@ pub struct RepoStatus {
     pub refs_probed_at: i64,
     pub work_probed_at: i64,
     pub work_key: Option<WorkKey>,
+
+    /// `probe::fill_visibility` always sets this to `Some` once it has run --
+    /// even "no remote" and "checking is off" are real, stored facts (see
+    /// [`VisibilityStatus`]), not just an absence. `None` only means it
+    /// hasn't run at all: a fresh [`RepoStatus`], or a cache entry from
+    /// before this field existed (which deserializes to `None` here too, the
+    /// same "hasn't run yet" state, so no cache version bump was needed).
+    #[serde(default)]
+    pub visibility: Option<VisibilityInfo>,
 }
 
 impl RepoStatus {
@@ -330,7 +430,18 @@ impl RepoStatus {
             refs_probed_at: 0,
             work_probed_at: 0,
             work_key: None,
+            visibility: None,
         }
+    }
+
+    /// Short label for the VISIBILITY column. See [`VisibilityStatus::label`]
+    /// for the possible values; `-` only appears before the repo has been
+    /// probed at all, which a rendered row should never actually show.
+    pub fn visibility_label(&self) -> &'static str {
+        self.visibility
+            .as_ref()
+            .map(|v| v.status.label())
+            .unwrap_or("-")
     }
 
     /// `group/name`, or just `name` for repos sitting directly in a root.

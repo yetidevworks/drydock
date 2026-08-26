@@ -4,10 +4,12 @@ mod config;
 mod discover;
 mod filter;
 mod fmt;
+mod gh;
 mod git;
 mod model;
 mod paths;
 mod probe;
+mod provider;
 mod report;
 mod tui;
 mod watch;
@@ -145,6 +147,8 @@ fn build_query(args: &ListArgs) -> Result<Query> {
         (args.stashed, Filter::Stashed),
         (args.clean, Filter::Clean),
         (args.errored, Filter::Error),
+        (args.public, Filter::Public),
+        (args.private, Filter::Private),
     ] {
         if on {
             query.filters.push(filter);

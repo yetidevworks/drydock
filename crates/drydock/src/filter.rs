@@ -8,7 +8,7 @@ use std::str::FromStr;
 use std::time::Duration;
 
 use crate::config::parse_duration;
-use crate::model::{ReleaseState, RepoStatus};
+use crate::model::{ReleaseState, RepoStatus, Visibility, VisibilityStatus};
 
 /// A state a repo can be in. Toggling these is the main way to narrow the list.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -30,6 +30,10 @@ pub enum Filter {
     Stashed,
     Clean,
     Error,
+    /// Checked and public. Only ever true when `visibility.enabled` is on.
+    Public,
+    /// Checked and private or internal.
+    Private,
 }
 
 impl Filter {
@@ -50,6 +54,15 @@ impl Filter {
             Filter::Stashed => f.stashed,
             Filter::Clean => f.clean(),
             Filter::Error => f.error,
+            Filter::Public => matches!(
+                repo.visibility.as_ref().map(|v| &v.status),
+                Some(VisibilityStatus::Known(Visibility::Public))
+            ),
+            Filter::Private => matches!(
+                repo.visibility.as_ref().map(|v| &v.status),
+                Some(VisibilityStatus::Known(Visibility::Private))
+                    | Some(VisibilityStatus::Known(Visibility::Internal))
+            ),
         }
     }
 
@@ -69,6 +82,8 @@ impl Filter {
             Filter::Stashed => "stashed",
             Filter::Clean => "clean",
             Filter::Error => "error",
+            Filter::Public => "public",
+            Filter::Private => "private",
         }
     }
 
@@ -88,6 +103,8 @@ impl Filter {
             Filter::Stashed,
             Filter::Clean,
             Filter::Error,
+            Filter::Public,
+            Filter::Private,
         ]
     }
 }

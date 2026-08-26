@@ -53,6 +53,7 @@ pub struct Config {
     pub refresh: RefreshConfig,
     pub status: StatusConfig,
     pub remote: RemoteConfig,
+    pub visibility: VisibilityConfig,
     pub release: ReleaseConfig,
     pub ui: UiConfig,
 }
@@ -75,6 +76,7 @@ impl Default for Config {
             refresh: RefreshConfig::default(),
             status: StatusConfig::default(),
             remote: RemoteConfig::default(),
+            visibility: VisibilityConfig::default(),
             release: ReleaseConfig::default(),
             ui: UiConfig::default(),
         }
@@ -170,6 +172,34 @@ impl Default for RemoteConfig {
             interval: "1h".into(),
             concurrency: 4,
             timeout: "20s".into(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct VisibilityConfig {
+    /// Check each repo's public/private status via `gh repo view`. Off by
+    /// default, for the same reason `remote.fetch` is: real network traffic
+    /// against every remote you own, and it depends on `gh` being installed
+    /// and authenticated rather than anything `drydock` controls itself.
+    pub enabled: bool,
+    /// How long a checked visibility is trusted before it's worth asking
+    /// again. Visibility changes rarely if ever, so this can be generous —
+    /// unlike `remote.interval`, there's no "behind" count quietly going
+    /// stale in the meantime.
+    pub interval: String,
+    pub concurrency: usize,
+    pub timeout: String,
+}
+
+impl Default for VisibilityConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            interval: "24h".into(),
+            concurrency: 4,
+            timeout: "10s".into(),
         }
     }
 }
@@ -287,6 +317,14 @@ impl Config {
 
     pub fn remote_timeout(&self) -> Duration {
         parse_duration(&self.remote.timeout).unwrap_or(Duration::from_secs(20))
+    }
+
+    pub fn visibility_interval(&self) -> Duration {
+        parse_duration(&self.visibility.interval).unwrap_or(Duration::from_secs(86_400))
+    }
+
+    pub fn visibility_timeout(&self) -> Duration {
+        parse_duration(&self.visibility.timeout).unwrap_or(Duration::from_secs(10))
     }
 }
 

@@ -14,7 +14,7 @@ use ratatui::{
 
 use super::{App, Mode};
 use crate::fmt;
-use crate::model::{ChangeKind, ReleaseState, RepoStatus};
+use crate::model::{ChangeKind, ReleaseState, RepoStatus, Visibility, VisibilityStatus};
 use crate::paths;
 
 const ACCENT: Color = Color::Cyan;
@@ -32,6 +32,7 @@ struct Columns {
     branch: usize,
     state: usize,
     release: usize,
+    visibility: usize,
     changes: usize,
     ahead: usize,
     behind: usize,
@@ -49,13 +50,18 @@ impl Columns {
         let state = 12;
         // "◆ needs release" is 15 wide, plus a space before the next column.
         let release = 16;
+        // "· checking off" / "· check failed" (14) are the widest cells now,
+        // wider than the header, so 15 is needed to leave a gap before
+        // CHANGES.
+        let visibility = 15;
         let changes = 12;
         let ahead = 6;
         let behind = 7;
         let tag = 14;
         let since_tag = 5;
         let age = 5;
-        let fixed = group + state + release + changes + ahead + behind + tag + since_tag + age;
+        let fixed =
+            group + state + release + visibility + changes + ahead + behind + tag + since_tag + age;
 
         // The branch column takes only what the branch names actually on
         // screen need, and the repo name absorbs the rest. Nearly every repo
@@ -73,6 +79,7 @@ impl Columns {
             branch,
             state,
             release,
+            visibility,
             changes,
             ahead,
             behind,
@@ -324,6 +331,7 @@ fn header_line(cols: &Columns) -> Line<'static> {
         Span::styled(pad("BRANCH", cols.branch), style),
         Span::styled(pad("STATE", cols.state), style),
         Span::styled(pad("RELEASE", cols.release), style),
+        Span::styled(pad("VISIBILITY", cols.visibility), style),
         Span::styled(pad("CHANGES", cols.changes), style),
         Span::styled(rpad("AHEAD", cols.ahead), style),
         Span::styled(rpad("BEHIND", cols.behind), style),
@@ -403,6 +411,23 @@ fn repo_line(repo: &RepoStatus, cols: &Columns, now: i64, selected: bool) -> Lin
             },
         ),
         Span::styled(
+            pad(&visibility_cell(repo), cols.visibility),
+            match repo.visibility.as_ref().map(|v| &v.status) {
+                // Green for "open to the world", same reading as GitHub's own
+                // badge. Private isn't a warning state -- it's the default
+                // most repos should be in -- so it gets the same dim treatment
+                // as everything else that isn't a confirmed public repo.
+                Some(VisibilityStatus::Known(Visibility::Public)) => base.fg(CLEAN),
+                Some(VisibilityStatus::Known(Visibility::Private))
+                | Some(VisibilityStatus::Known(Visibility::Internal))
+                | Some(VisibilityStatus::Unsupported)
+                | Some(VisibilityStatus::NoRemote)
+                | Some(VisibilityStatus::CheckingDisabled)
+                | Some(VisibilityStatus::CheckFailed(_))
+                | None => base.fg(DIM),
+            },
+        ),
+        Span::styled(
             pad(
                 &fmt::truncate(&changes, cols.changes.saturating_sub(1)),
                 cols.changes,
@@ -447,6 +472,30 @@ fn repo_line(repo: &RepoStatus, cols: &Columns, now: i64, selected: bool) -> Lin
         }
     }
     Line::from(spans)
+}
+
+/// The visibility cell, with a marker so the column scans without reading
+/// words. Filled means "exposed", same reading as the dirty and needs-release
+/// markers elsewhere in this table: `●` for public, since that's the repo
+/// with something out in the open. Private and internal get `⊘` (circled
+/// division slash) -- the same "no entry" stroke as a prohibited sign, which
+/// reads as "access denied" more directly than a plain hollow circle would.
+/// Everything else that isn't a confirmed value gets a `·` and a short form
+/// of its [`VisibilityStatus`] label -- shortened only because the table is
+/// fixed-width; `status`, `--json`, and the TUI detail view all show the
+/// full label (and, for a real check failure, the reason too). `-` only
+/// appears before the repo has been probed at all.
+fn visibility_cell(repo: &RepoStatus) -> String {
+    match repo.visibility.as_ref().map(|v| &v.status) {
+        Some(VisibilityStatus::Known(Visibility::Public)) => "● public".into(),
+        Some(VisibilityStatus::Known(Visibility::Private)) => "⊘ private".into(),
+        Some(VisibilityStatus::Known(Visibility::Internal)) => "⊘ internal".into(),
+        Some(VisibilityStatus::Unsupported) => "· unsupported".into(),
+        Some(VisibilityStatus::NoRemote) => "· no remote".into(),
+        Some(VisibilityStatus::CheckingDisabled) => "· checking off".into(),
+        Some(VisibilityStatus::CheckFailed(_)) => "· check failed".into(),
+        None => "-".into(),
+    }
 }
 
 /// The release cell, with a marker so the column scans without reading words.
@@ -659,6 +708,49 @@ fn render_detail(f: &mut Frame, app: &App, area: Rect) {
             Style::default().add_modifier(Modifier::BOLD),
         ),
     ]));
+
+    if let Some(v) = &repo.visibility {
+        let mut spans = vec![
+            label("visibility"),
+            Span::styled(
+                v.status.label().to_string(),
+                Style::default().fg(match &v.status {
+                    VisibilityStatus::Known(Visibility::Public) => CLEAN,
+                    VisibilityStatus::Known(Visibility::Private)
+                    | VisibilityStatus::Known(Visibility::Internal)
+                    | VisibilityStatus::Unsupported
+                    | VisibilityStatus::NoRemote
+                    | VisibilityStatus::CheckingDisabled
+                    | VisibilityStatus::CheckFailed(_) => DIM,
+                }),
+            ),
+        ];
+        match &v.status {
+            // A real provider call happened for both of these, so there's a
+            // real "checked ... ago" to report. CheckFailed also gets its
+            // reason spelled out here, unlike the table cell -- this is the
+            // one place with room for it.
+            VisibilityStatus::Known(_) => {
+                spans.push(Span::styled(
+                    format!("  (checked {} ago)", fmt::age(v.checked_at, app.now)),
+                    Style::default().fg(DIM),
+                ));
+            }
+            VisibilityStatus::CheckFailed(reason) => {
+                spans.push(Span::styled(
+                    format!("  ({} ago): {reason}", fmt::age(v.checked_at, app.now)),
+                    Style::default().fg(DIM),
+                ));
+            }
+            // Unsupported, NoRemote and CheckingDisabled all come from
+            // reading the remote URL or the config, not a real provider
+            // call, so there's nothing that was actually "checked".
+            VisibilityStatus::Unsupported
+            | VisibilityStatus::NoRemote
+            | VisibilityStatus::CheckingDisabled => {}
+        }
+        lines.push(Line::from(spans));
+    }
 
     let (at, source) = repo.activity();
     lines.push(Line::from(vec![

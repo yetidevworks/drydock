@@ -57,11 +57,22 @@ pub fn table(headers: &[&str], aligns: &[Align], rows: &[Vec<String>]) -> String
 }
 
 const LIST_HEADERS: &[&str] = &[
-    "GROUP", "REPO", "BRANCH", "STATE", "RELEASE", "CHANGES", "AHEAD", "BEHIND", "TAG", "+TAG",
+    "GROUP",
+    "REPO",
+    "BRANCH",
+    "STATE",
+    "RELEASE",
+    "VISIBILITY",
+    "CHANGES",
+    "AHEAD",
+    "BEHIND",
+    "TAG",
+    "+TAG",
     "AGE",
 ];
 
 const LIST_ALIGNS: &[Align] = &[
+    Align::Left,
     Align::Left,
     Align::Left,
     Align::Left,
@@ -98,6 +109,7 @@ pub fn list_table(repos: &[&RepoStatus], now: i64, show_paths: bool) -> String {
                 fmt::truncate(&r.branch_label(), 24),
                 r.state_label().to_string(),
                 r.release_state().label().to_string(),
+                r.visibility_label().to_string(),
                 changes,
                 fmt::count(r.unpushed_total()),
                 fmt::count(r.behind_total()),
@@ -236,6 +248,34 @@ pub fn detail(repo: &RepoStatus, now: i64) -> String {
         "  release      {}\n",
         repo.release_state().label()
     ));
+    if let Some(v) = &repo.visibility {
+        use crate::model::VisibilityStatus;
+        match &v.status {
+            VisibilityStatus::Known(_) => {
+                out.push_str(&format!(
+                    "  visibility   {} (checked {} ago)\n",
+                    v.status.label(),
+                    fmt::age(v.checked_at, now)
+                ));
+            }
+            // A check really was attempted here, unlike the other non-Known
+            // cases below, so this is the one place the reason gets spelled
+            // out -- never in a table, only here and in --json.
+            VisibilityStatus::CheckFailed(reason) => {
+                out.push_str(&format!(
+                    "  visibility   check failed {} ago: {reason}\n",
+                    fmt::age(v.checked_at, now)
+                ));
+            }
+            // Not a real check against a provider, just a read of the remote
+            // URL or the config, so there's no "checked ... ago" to report.
+            VisibilityStatus::Unsupported
+            | VisibilityStatus::NoRemote
+            | VisibilityStatus::CheckingDisabled => {
+                out.push_str(&format!("  visibility   {}\n", v.status.label()));
+            }
+        }
+    }
     out.push_str(&format!(
         "  activity     {} ago ({})\n",
         fmt::age(activity_at, now),
@@ -402,6 +442,13 @@ pub struct RepoView<'a> {
     pub slug: String,
     pub state: &'a str,
     pub release_state: &'static str,
+    /// `"public"`, `"private"`, `"internal"`, `"unsupported"` (a remote on a
+    /// host nothing recognises), `"no remote configured"`, `"checking
+    /// disabled"`, `"check failed"`, or `null` before the repo has been
+    /// probed at all.
+    pub visibility: Option<&'static str>,
+    /// The reason, only present when `visibility` is `"check failed"`.
+    pub visibility_error: Option<&'a str>,
     pub branch: String,
     pub upstream: Option<String>,
     pub ahead: u32,
@@ -460,6 +507,11 @@ pub fn view<'a>(repo: &'a RepoStatus, now: i64) -> RepoView<'a> {
         slug: repo.slug(),
         state: repo.state_label(),
         release_state: repo.release_state().key(),
+        visibility: repo.visibility.as_ref().map(|v| v.status.label()),
+        visibility_error: repo.visibility.as_ref().and_then(|v| match &v.status {
+            crate::model::VisibilityStatus::CheckFailed(reason) => Some(reason.as_str()),
+            _ => None,
+        }),
         branch: repo.branch_label(),
         upstream: refs
             .and_then(|r| r.current_branch())

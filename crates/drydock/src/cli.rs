@@ -133,6 +133,12 @@ pub struct ListArgs {
     /// Repos that could not be probed.
     #[arg(long)]
     pub errored: bool,
+    /// Repos checked and found public. Only meaningful with visibility.enabled.
+    #[arg(long)]
+    pub public: bool,
+    /// Repos checked and found private or internal.
+    #[arg(long)]
+    pub private: bool,
 
     /// Add a filter by name, repeatable.
     #[arg(long = "filter", value_name = "NAME")]

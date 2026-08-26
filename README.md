@@ -185,6 +185,38 @@ own and a remote that wants credentials can hang. Press `f` to fetch the
 selected repo, `F` for everything on screen, or set `remote.fetch = true` to
 have it happen on a timer.
 
+### Visibility
+
+The VISIBILITY column shows whether each repo is public, private, or (on
+GitHub Enterprise) internal. This isn't a `git` concept — nothing under
+`.git` records it — so it's the one column that asks the *hosting provider*
+directly, rather than reading anything local. Right now the only provider
+supported is GitHub, via [`gh`](https://cli.github.com). (GitLab is the
+natural next provider to add, since `glab` mirrors `gh` closely; Bitbucket
+has no equivalent first-party CLI, so supporting it would mean handling API
+tokens directly rather than riding on a CLI you've already authenticated.)
+
+It's off by default (`visibility.enabled = false`), for the same reason
+fetching is: it's real API traffic, and it depends on `gh` being installed
+and already authenticated (`gh auth status`). Set `visibility.enabled = true`
+to turn it on; a checked value is cached and trusted for `visibility.interval`
+(a day, by default — visibility changes rarely) so repeat runs stay cheap.
+Filter with `--public` or `--private` on `list`.
+
+Every non-value in this column says specifically why, rather than a bare `-`:
+
+| Cell | Meaning |
+|---|---|
+| `no remote configured` | Nothing to ever check. Free to know, shown even with checking off. |
+| `unsupported` | The remote is on a host nothing recognises. Also free. |
+| `checking disabled` | The remote *is* checkable, but `visibility.enabled` is off. |
+| `check failed` | A check was attempted and failed (rate limited, not authenticated, timed out), with nothing cached to fall back to. The actual reason is never shown in a table — one long message would widen the column for every row — but it's always available via `status <repo>` or `--json` (`visibility_error`).|
+
+A GitHub wiki's clone URL (`<repo>.wiki.git`) isn't a repository the API can
+look up on its own, so it's resolved to its parent repo instead: a wiki's
+VISIBILITY cell shows the parent repo's actual visibility, not
+`unsupported`.
+
 ## Configuration
 
 `drydock config init` writes the defaults to
@@ -218,6 +250,10 @@ read_changelog = true
 [remote]
 fetch = false                # see "Ahead, behind, and the network"
 interval = "1h"
+
+[visibility]
+enabled = false               # see "Visibility"; requires `gh`
+interval = "24h"
 
 [ui]
 default_filters = []         # e.g. ["dirty", "unpushed"]
