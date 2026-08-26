@@ -89,6 +89,7 @@ current directory, so it behaves the same wherever you invoke it.
 | `j` `k` `↑` `↓` | move · `ctrl-d` / `ctrl-u` half a page · `home` / `end` ends |
 | mouse | click a row to select it · wheel moves the selection |
 | `⏎` | detail view: branches, commits since the last tag, changed files |
+| mouse | wheel scrolls the help and detail panes, and moves the column picker |
 | `d` `u` `b` | filter to dirty, unpushed, behind |
 | `r` `N` | filter to needs-release, never-released |
 | `c` `i` `x` `e` | conflicts, operation in progress, detached HEAD, probe errors |

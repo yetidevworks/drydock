@@ -108,6 +108,10 @@ pub struct App {
     pub columns: Vec<Column>,
     /// Row the column picker is sitting on, indexing [`App::picker_rows`].
     pub column_cursor: usize,
+    /// How far the overlay on screen can scroll before it's showing only
+    /// empty space, measured by the last frame that drew it. Zero when there
+    /// is no overlay, or when it fits.
+    pub overlay_max_scroll: u16,
     pub should_quit: bool,
 }
 
@@ -142,6 +146,7 @@ impl App {
             detail_scroll: 0,
             columns,
             column_cursor: 0,
+            overlay_max_scroll: 0,
             mode: Mode::Normal,
             search_input: String::new(),
             message: None,
@@ -329,6 +334,14 @@ impl App {
         if let Some(at) = self.picker_rows().iter().position(|(c, _)| *c == column) {
             self.column_cursor = at;
         }
+    }
+
+    /// Scroll the overlay, stopping at the end of its content rather than
+    /// running on into blank space — which a wheel reaches far faster than
+    /// j/k ever did.
+    pub fn scroll_overlay(&mut self, delta: i32) {
+        let next = self.detail_scroll as i32 + delta;
+        self.detail_scroll = next.clamp(0, self.overlay_max_scroll as i32) as u16;
     }
 
     pub fn move_column_cursor(&mut self, delta: isize) {
@@ -651,7 +664,7 @@ fn draw(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) -> Res
     app.now = git::now_unix();
     terminal.draw(|f| {
         app.rows_on_screen = ui::table_rows(f.area());
-        ui::render(f, app);
+        app.overlay_max_scroll = ui::render(f, app);
     })?;
     Ok(())
 }
@@ -777,17 +790,26 @@ fn handle_mouse(app: &mut App, ev: MouseEvent, size: Option<Size>) {
     // The detail and help panes cover the table, so a click there has nothing
     // to hit and the wheel belongs to the pane.
     match app.mode {
-        Mode::Detail => {
+        // Both panes scroll on the same state, and the wheel is what people
+        // reach for before they find j/k.
+        Mode::Detail | Mode::Help => {
             match ev.kind {
-                MouseEventKind::ScrollDown => {
-                    app.detail_scroll = app.detail_scroll.saturating_add(1)
-                }
-                MouseEventKind::ScrollUp => app.detail_scroll = app.detail_scroll.saturating_sub(1),
+                MouseEventKind::ScrollDown => app.scroll_overlay(1),
+                MouseEventKind::ScrollUp => app.scroll_overlay(-1),
                 _ => {}
             }
             return;
         }
-        Mode::Help | Mode::Columns => return,
+        // The picker doesn't scroll -- it's short enough to fit -- so the
+        // wheel moves the cursor, which is the equivalent gesture.
+        Mode::Columns => {
+            match ev.kind {
+                MouseEventKind::ScrollDown => app.move_column_cursor(1),
+                MouseEventKind::ScrollUp => app.move_column_cursor(-1),
+                _ => {}
+            }
+            return;
+        }
         _ => {}
     }
 
@@ -838,12 +860,8 @@ fn handle_key(app: &mut App, key: KeyEvent, tx: &mpsc::UnboundedSender<Input>) {
                 app.mode = Mode::Normal;
                 app.detail_scroll = 0;
             }
-            KeyCode::Char('j') | KeyCode::Down => {
-                app.detail_scroll = app.detail_scroll.saturating_add(1)
-            }
-            KeyCode::Char('k') | KeyCode::Up => {
-                app.detail_scroll = app.detail_scroll.saturating_sub(1)
-            }
+            KeyCode::Char('j') | KeyCode::Down => app.scroll_overlay(1),
+            KeyCode::Char('k') | KeyCode::Up => app.scroll_overlay(-1),
             _ => {}
         },
         Mode::Columns => match key.code {
@@ -875,12 +893,8 @@ fn handle_key(app: &mut App, key: KeyEvent, tx: &mpsc::UnboundedSender<Input>) {
                 app.mode = Mode::Normal;
                 app.detail_scroll = 0;
             }
-            KeyCode::Char('j') | KeyCode::Down => {
-                app.detail_scroll = app.detail_scroll.saturating_add(1)
-            }
-            KeyCode::Char('k') | KeyCode::Up => {
-                app.detail_scroll = app.detail_scroll.saturating_sub(1)
-            }
+            KeyCode::Char('j') | KeyCode::Down => app.scroll_overlay(1),
+            KeyCode::Char('k') | KeyCode::Up => app.scroll_overlay(-1),
             KeyCode::PageDown => app.detail_scroll = app.detail_scroll.saturating_add(10),
             KeyCode::PageUp => app.detail_scroll = app.detail_scroll.saturating_sub(10),
             KeyCode::Char('o') => open_editor(app),
@@ -1277,7 +1291,9 @@ pub async fn snapshot(width: u16, height: u16, view: &str) -> Result<String> {
 fn render_once(app: &App, width: u16, height: u16) -> Result<String> {
     let backend = ratatui::backend::TestBackend::new(width, height);
     let mut terminal = Terminal::new(backend)?;
-    terminal.draw(|f| ui::render(f, app))?;
+    terminal.draw(|f| {
+        ui::render(f, app);
+    })?;
 
     let buffer = terminal.backend().buffer();
     let mut out = String::new();
@@ -1385,6 +1401,49 @@ mod tests {
 
     // Asking for the column is asking for the values. Leaving checking off
     // would give a column that can only ever read "checking off".
+    // The legend only earns its space when one of the visibility columns is
+    // actually on screen, and it has to appear for either form.
+    // A wheel reaches the end of a pane far faster than j/k, so an unclamped
+    // scroll leaves you staring at blank space with no clue which way is back.
+    #[test]
+    fn an_overlay_scroll_stops_at_the_end_of_its_content() {
+        let mut app = app_with(1);
+        app.overlay_max_scroll = 4;
+        app.scroll_overlay(100);
+        assert_eq!(app.detail_scroll, 4);
+        app.scroll_overlay(1);
+        assert_eq!(app.detail_scroll, 4, "should not have gone past the end");
+        app.scroll_overlay(-100);
+        assert_eq!(app.detail_scroll, 0);
+        app.scroll_overlay(-1);
+        assert_eq!(app.detail_scroll, 0, "should not have gone above the top");
+    }
+
+    // A pane that fits needs no scrolling at all, and the wheel shouldn't
+    // pretend otherwise.
+    #[test]
+    fn an_overlay_that_fits_does_not_scroll() {
+        let mut app = app_with(1);
+        app.overlay_max_scroll = 0;
+        app.scroll_overlay(3);
+        assert_eq!(app.detail_scroll, 0);
+    }
+
+    #[test]
+    fn the_help_legend_follows_the_visibility_columns() {
+        let mut app = picker_app();
+        assert!(!ui::help_shows_visibility_legend(&app));
+        for form in [Column::Visibility, Column::VisibilityShort] {
+            app.columns = Column::defaults(false);
+            app.columns.push(form);
+            assert!(
+                ui::help_shows_visibility_legend(&app),
+                "legend missing with {}",
+                form.key()
+            );
+        }
+    }
+
     #[test]
     fn showing_the_visibility_column_turns_checking_on_with_it() {
         let mut app = picker_app();

@@ -94,7 +94,12 @@ pub fn table_first_row(area: Rect) -> u16 {
     area.y + 4
 }
 
-pub fn render(f: &mut Frame, app: &App) {
+/// Draws one frame and reports how far the overlay on top of it — if any —
+/// can usefully be scrolled. Measured here because it's the only place that
+/// knows both how many lines the pane came to and how many of them fit; the
+/// input handlers clamp against it so the wheel can't spin off into blank
+/// space below the content.
+pub fn render(f: &mut Frame, app: &App) -> u16 {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -115,9 +120,19 @@ pub fn render(f: &mut Frame, app: &App) {
     match app.mode {
         Mode::Help => render_help(f, app, f.area()),
         Mode::Detail => render_detail(f, app, f.area()),
-        Mode::Columns => render_columns(f, app, f.area()),
-        _ => {}
+        Mode::Columns => {
+            render_columns(f, app, f.area());
+            0
+        }
+        _ => 0,
     }
+}
+
+/// How far a pane of `lines` can scroll inside `area` before it's showing
+/// nothing but empty space. Two rows of that area are its own borders.
+fn max_scroll(lines: usize, area: Rect) -> u16 {
+    let visible = area.height.saturating_sub(2) as usize;
+    lines.saturating_sub(visible).try_into().unwrap_or(u16::MAX)
 }
 
 /// The scan roots as displayed, e.g. `~/Projects`.
@@ -597,7 +612,15 @@ fn centred(area: Rect, width_pct: u16, height_pct: u16) -> Rect {
     }
 }
 
-fn render_help(f: &mut Frame, app: &App, area: Rect) {
+/// Whether the help overlay should carry the visibility marker legend: only
+/// when one of the two forms of that column is actually on screen.
+pub fn help_shows_visibility_legend(app: &App) -> bool {
+    app.columns
+        .iter()
+        .any(|c| matches!(c, Column::Visibility | Column::VisibilityShort))
+}
+
+fn render_help(f: &mut Frame, app: &App, area: Rect) -> u16 {
     let area = centred(area, 72, 92);
     f.render_widget(Clear, area);
 
@@ -665,6 +688,29 @@ fn render_help(f: &mut Frame, app: &App, area: Rect) {
         }
         lines.push(Line::from(""));
     }
+    // Only worth the space when one of the visibility columns is actually on
+    // screen -- and drawn in the real colours, since a legend printed in white
+    // would teach half of what the column says.
+    if help_shows_visibility_legend(app) {
+        lines.push(Line::from(Span::styled(
+            " Visibility markers",
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        )));
+        for (marker, colour, what) in [
+            ("●", CLEAN, "public"),
+            ("⊘", PRIVATE, "private"),
+            ("◐", INTERNAL, "internal, on GitHub Enterprise"),
+            ("!", DIM, "a check failed — press ⏎ for the reason"),
+            ("·", DIM, "no answer: not checked, no remote, unknown host"),
+        ] {
+            lines.push(Line::from(vec![
+                Span::styled(format!("   {marker:<16}"), Style::default().fg(colour)),
+                Span::styled(what.to_string(), Style::default().fg(DIM)),
+            ]));
+        }
+        lines.push(Line::from(""));
+    }
+
     lines.push(Line::from(Span::styled(
         " Ahead and behind counts come from refs you have already fetched, so",
         Style::default().fg(DIM),
@@ -679,12 +725,14 @@ fn render_help(f: &mut Frame, app: &App, area: Rect) {
         .border_style(Style::default().fg(ACCENT))
         .title(" keys · j/k to scroll · esc to close ")
         .title_alignment(Alignment::Center);
+    let scrollable = max_scroll(lines.len(), area);
     f.render_widget(
         Paragraph::new(lines)
             .block(block)
-            .scroll((app.detail_scroll, 0)),
+            .scroll((app.detail_scroll.min(scrollable), 0)),
         area,
     );
+    scrollable
 }
 
 /// The column picker. Shows every column, the ones on screen first in the
@@ -756,8 +804,8 @@ fn render_columns(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(Paragraph::new(lines).block(block), area);
 }
 
-fn render_detail(f: &mut Frame, app: &App, area: Rect) {
-    let Some(repo) = app.current() else { return };
+fn render_detail(f: &mut Frame, app: &App, area: Rect) -> u16 {
+    let Some(repo) = app.current() else { return 0 };
     let area = centred(area, 84, 86);
     f.render_widget(Clear, area);
 
@@ -1008,12 +1056,14 @@ fn render_detail(f: &mut Frame, app: &App, area: Rect) {
         .title(format!(" {} ", repo.slug()))
         .title_alignment(Alignment::Center);
 
+    let scrollable = max_scroll(lines.len(), area);
     f.render_widget(
         Paragraph::new(lines)
             .block(block)
-            .scroll((app.detail_scroll, 0)),
+            .scroll((app.detail_scroll.min(scrollable), 0)),
         area,
     );
+    scrollable
 }
 
 // ---------------------------------------------------------------------------
