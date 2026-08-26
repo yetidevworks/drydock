@@ -4,7 +4,10 @@
 
 1. [](#new)
     * Config and cache locations now honour `XDG_CONFIG_HOME` and `XDG_CACHE_HOME`, and on macOS an existing `~/.config/drydock` is used in preference to `~/Library/Application Support`. Nothing moves on its own: a directory nobody created is never chosen, so anyone who hasn't asked for this keeps the platform default. Config and cache resolve independently, so `~/.config/drydock` with no `~/.cache/drydock` puts the config where you want it and leaves the cache where macOS expects it.
-2. [](#bugfix)
+2. [](#improved)
+    * The dashboard's columns are now configurable, and the `C` key opens a picker to set them: space toggles a column, `J`/`K` reorder, `a` resets, `esc` saves to `[ui] columns`. The plain `drydock list` table reads the same setting. Every column's header, alignment, width and cell renderer now live together in one place rather than in two parallel `const` arrays plus a struct of widths that had to be edited in lockstep.
+    * The VISIBILITY column is now shown only when `visibility.enabled` is on. It was unconditional, which cost fifteen fixed characters of table width on every row whether or not checking was happening — enough to cut repo names to four characters at 120 columns — while every cell read "checking off".
+3. [](#bugfix)
     * Bare repos no longer report as errored. `git status` in a bare repo can only ever fail — "this operation must be run in a work tree" — and recording that failure made a repo behaving exactly as intended render as `error` on every sweep. The working-tree scan is skipped outright for bare repos now, and they report a `bare` state instead.
     * A bare repo's worktrees are now found without turning on `follow_nested_repos`. In the common bare-plus-worktrees layout the bare repo is what discovery hits first, and pruning there hid the worktrees — the only things in the layout with a working tree to report on. A bare repo has no working tree, so nothing can be nested inside one, which is the only case that setting is guarding against.
 

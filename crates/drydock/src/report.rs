@@ -3,6 +3,7 @@
 use anyhow::Result;
 use serde::Serialize;
 
+use crate::column::Column;
 use crate::fmt;
 use crate::model::{ChangeKind, ReleaseState, RepoStatus};
 use crate::paths;
@@ -56,81 +57,17 @@ pub fn table(headers: &[&str], aligns: &[Align], rows: &[Vec<String>]) -> String
     out
 }
 
-const LIST_HEADERS: &[&str] = &[
-    "GROUP",
-    "REPO",
-    "BRANCH",
-    "STATE",
-    "RELEASE",
-    "VISIBILITY",
-    "CHANGES",
-    "AHEAD",
-    "BEHIND",
-    "TAG",
-    "+TAG",
-    "AGE",
-];
-
-const LIST_ALIGNS: &[Align] = &[
-    Align::Left,
-    Align::Left,
-    Align::Left,
-    Align::Left,
-    Align::Left,
-    Align::Left,
-    Align::Left,
-    Align::Right,
-    Align::Right,
-    Align::Left,
-    Align::Right,
-    Align::Right,
-];
-
-pub fn list_table(repos: &[&RepoStatus], now: i64, show_paths: bool) -> String {
+pub fn list_table(repos: &[&RepoStatus], now: i64, show_paths: bool, columns: &[Column]) -> String {
     let rows: Vec<Vec<String>> = repos
         .iter()
-        .map(|r| {
-            let work = r.work.as_ref();
-            // `?` means "not scanned yet". A bare repo has nothing to scan,
-            // which is a different thing and reads as `·` like every other
-            // known-nothing in this table.
-            let changes = work
-                .map(|w| fmt::changes(w.staged, w.unstaged, w.untracked, w.conflicts))
-                .unwrap_or_else(|| if r.is_bare() { "·".into() } else { "?".into() });
-            let repo_cell = if show_paths {
-                paths::contract(&r.root)
-            } else {
-                r.name.clone()
-            };
-            vec![
-                if r.group.is_empty() {
-                    "·".into()
-                } else {
-                    r.group.clone()
-                },
-                repo_cell,
-                fmt::truncate(&r.branch_label(), 24),
-                r.state_label().to_string(),
-                r.release_state().label().to_string(),
-                r.visibility_label().to_string(),
-                changes,
-                fmt::count(r.unpushed_total()),
-                fmt::count(r.behind_total()),
-                fmt::truncate(&r.tag_label(), 18),
-                fmt::count(r.commits_since_tag()),
-                fmt::age(r.activity_at(), now),
-            ]
-        })
+        .map(|r| columns.iter().map(|c| c.cell(r, now, show_paths)).collect())
         .collect();
 
-    let mut headers: Vec<&str> = LIST_HEADERS.to_vec();
-    if show_paths {
-        headers[1] = "PATH";
-    }
-    table(&headers, LIST_ALIGNS, &rows)
+    let headers: Vec<&str> = columns.iter().map(|c| c.header(show_paths)).collect();
+    let aligns: Vec<Align> = columns.iter().map(|c| c.align()).collect();
+    table(&headers, &aligns, &rows)
 }
 
-/// The one-line summary printed under a table or in the dashboard header.
 pub fn summary(repos: &[RepoStatus], timings: Option<&Timings>) -> String {
     let dirty = repos.iter().filter(|r| r.flags().dirty).count();
     let unpushed = repos.iter().filter(|r| r.flags().unpushed).count();

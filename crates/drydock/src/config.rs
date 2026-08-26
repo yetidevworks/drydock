@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::time::Duration;
 
+use crate::column::Column;
 use crate::paths;
 
 /// Directory names never worth descending into. These hold vendored code with
@@ -250,6 +251,11 @@ pub struct UiConfig {
     pub git_client_command: Vec<String>,
     /// Command used by the `T` key.
     pub terminal_command: Vec<String>,
+    /// Columns to show, left to right. Unset means the defaults, which
+    /// include VISIBILITY only when `visibility.enabled` is on. Set it and
+    /// you get exactly what you list, in that order — the `c` key in the
+    /// dashboard writes this.
+    pub columns: Option<Vec<Column>>,
 }
 
 impl Default for UiConfig {
@@ -266,6 +272,7 @@ impl Default for UiConfig {
                 "Terminal".into(),
                 "{path}".into(),
             ],
+            columns: None,
         }
     }
 }
@@ -321,6 +328,16 @@ impl Config {
 
     pub fn visibility_interval(&self) -> Duration {
         parse_duration(&self.visibility.interval).unwrap_or(Duration::from_secs(86_400))
+    }
+
+    /// The columns to render, resolved from `[ui] columns` or the defaults.
+    /// A configured list is honoured as written — order included — beyond
+    /// dropping repeats and putting REPO back if it was left out.
+    pub fn columns(&self) -> Vec<Column> {
+        match &self.ui.columns {
+            Some(list) => crate::column::sanitise(list.clone()),
+            None => Column::defaults(self.visibility.enabled),
+        }
     }
 
     pub fn visibility_timeout(&self) -> Duration {
@@ -402,6 +419,37 @@ mod tests {
         assert_eq!(parse_duration("90"), Some(Duration::from_secs(90)));
         assert_eq!(parse_duration(""), None);
         assert_eq!(parse_duration("nope"), None);
+    }
+
+    // What the column picker writes has to be readable again on the next
+    // start, or the panel silently forgets everything on quit.
+    #[test]
+    fn a_saved_column_list_round_trips() {
+        let cfg = Config {
+            ui: UiConfig {
+                columns: Some(vec![Column::Repo, Column::State, Column::SinceTag]),
+                ..UiConfig::default()
+            },
+            ..Config::default()
+        };
+        let body = toml::to_string_pretty(&cfg).unwrap();
+        let back: Config = toml::from_str(&body).unwrap();
+        assert_eq!(back.ui.columns, cfg.ui.columns);
+        assert_eq!(
+            back.columns(),
+            vec![Column::Repo, Column::State, Column::SinceTag]
+        );
+    }
+
+    // Unset has to stay unset through a save, or `config init` would bake
+    // today's defaults in and the list would stop tracking visibility.enabled.
+    #[test]
+    fn an_unset_column_list_stays_unset() {
+        let body = toml::to_string_pretty(&Config::default()).unwrap();
+        assert!(!body.contains("columns"), "{body}");
+        let back: Config = toml::from_str(&body).unwrap();
+        assert_eq!(back.ui.columns, None);
+        assert_eq!(back.columns(), Column::defaults(false));
     }
 
     #[test]

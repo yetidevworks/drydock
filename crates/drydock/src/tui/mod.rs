@@ -28,6 +28,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
 use crate::cache;
+use crate::column::Column;
 use crate::config::Config;
 use crate::filter::{Filter, MatchMode, Query, Sort};
 use crate::git;
@@ -57,6 +58,8 @@ pub enum Mode {
     Search,
     Detail,
     Help,
+    /// The column picker: toggle columns on and off, and reorder them.
+    Columns,
 }
 
 /// The `since` presets, cycled with the number keys.
@@ -100,6 +103,11 @@ pub struct App {
     pub spinner: usize,
     pub now: i64,
     pub rows_on_screen: usize,
+    /// Columns on screen, left to right. Resolved from the config at startup
+    /// and edited live by the column picker, which writes it back.
+    pub columns: Vec<Column>,
+    /// Row the column picker is sitting on, indexing [`App::picker_rows`].
+    pub column_cursor: usize,
     pub should_quit: bool,
 }
 
@@ -119,6 +127,9 @@ impl App {
         }
         let _ = query.set_since(&cfg.ui.default_since);
 
+        // Resolved before `cfg` moves into the struct.
+        let columns = cfg.columns();
+
         let mut app = Self {
             cfg,
             repos,
@@ -129,6 +140,8 @@ impl App {
             selected_root: None,
             scroll: 0,
             detail_scroll: 0,
+            columns,
+            column_cursor: 0,
             mode: Mode::Normal,
             search_input: String::new(),
             message: None,
@@ -227,6 +240,106 @@ impl App {
         } else {
             format!("scanning {done}/{total} repos")
         })
+    }
+
+    /// Every column, in picker order: the ones on screen first in the order
+    /// they're rendered, then the hidden ones. `true` means it's on screen.
+    pub fn picker_rows(&self) -> Vec<(Column, bool)> {
+        let mut rows: Vec<(Column, bool)> = self.columns.iter().map(|c| (*c, true)).collect();
+        for column in Column::all() {
+            if !self.columns.contains(column) {
+                rows.push((*column, false));
+            }
+        }
+        rows
+    }
+
+    /// Turn the column under the picker cursor on or off, keeping the cursor
+    /// on that same column as it moves between the two sections.
+    pub fn toggle_selected_column(&mut self) {
+        let rows = self.picker_rows();
+        let Some((column, shown)) = rows.get(self.column_cursor).copied() else {
+            return;
+        };
+        if !column.toggleable() {
+            self.notify(format!("{} can't be hidden", column.header(false)));
+            return;
+        }
+
+        if shown {
+            self.columns.retain(|c| *c != column);
+        } else {
+            // Put it back where it belongs rather than on the end, so turning
+            // VISIBILITY on lands it between RELEASE and CHANGES the way the
+            // defaults have it.
+            let canonical = Column::all();
+            let rank = |c: &Column| canonical.iter().position(|x| x == c).unwrap_or(usize::MAX);
+            let at = self
+                .columns
+                .iter()
+                .position(|c| rank(c) > rank(&column))
+                .unwrap_or(self.columns.len());
+            self.columns.insert(at, column);
+        }
+        self.follow_column(column);
+    }
+
+    /// Move the column under the cursor one place left or right. Only has any
+    /// meaning for a column that's on screen, since the hidden ones are just a
+    /// list to pick from.
+    pub fn move_selected_column(&mut self, delta: isize) {
+        let rows = self.picker_rows();
+        let Some((column, true)) = rows.get(self.column_cursor).copied() else {
+            return;
+        };
+        let Some(from) = self.columns.iter().position(|c| *c == column) else {
+            return;
+        };
+        let to = from as isize + delta;
+        if to < 0 || to as usize >= self.columns.len() {
+            return;
+        }
+        self.columns.swap(from, to as usize);
+        self.follow_column(column);
+    }
+
+    /// Put the picker cursor back on `column` wherever it ended up.
+    fn follow_column(&mut self, column: Column) {
+        if let Some(at) = self.picker_rows().iter().position(|(c, _)| *c == column) {
+            self.column_cursor = at;
+        }
+    }
+
+    pub fn move_column_cursor(&mut self, delta: isize) {
+        let len = self.picker_rows().len();
+        if len == 0 {
+            return;
+        }
+        let next = (self.column_cursor as isize + delta).clamp(0, len as isize - 1);
+        self.column_cursor = next as usize;
+    }
+
+    /// Write the current column list back to the config, so it survives a
+    /// restart. Everything else in the file is round-tripped untouched.
+    pub fn save_columns(&mut self) {
+        let mut cfg = (*self.cfg).clone();
+        cfg.ui.columns = Some(self.columns.clone());
+        match crate::config::save(&cfg) {
+            Ok(path) => {
+                self.cfg = Arc::new(cfg);
+                self.notify(format!(
+                    "columns saved to {}",
+                    crate::paths::contract(&path)
+                ));
+            }
+            Err(err) => self.notify(format!("could not save columns: {err:#}")),
+        }
+    }
+
+    /// Drop the configured list and go back to what the defaults would show.
+    pub fn reset_columns(&mut self) {
+        self.columns = Column::defaults(self.cfg.visibility.enabled);
+        self.column_cursor = 0;
     }
 
     pub fn notify(&mut self, message: impl Into<String>) {
@@ -653,7 +766,7 @@ fn handle_mouse(app: &mut App, ev: MouseEvent, size: Option<Size>) {
             }
             return;
         }
-        Mode::Help => return,
+        Mode::Help | Mode::Columns => return,
         _ => {}
     }
 
@@ -712,6 +825,21 @@ fn handle_key(app: &mut App, key: KeyEvent, tx: &mpsc::UnboundedSender<Input>) {
             }
             _ => {}
         },
+        Mode::Columns => match key.code {
+            // Closing is what commits the change: the table has been redrawing
+            // live the whole time, so this is a confirmation, not an apply.
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter | KeyCode::Char('C') => {
+                app.save_columns();
+                app.mode = Mode::Normal;
+            }
+            KeyCode::Char('j') | KeyCode::Down => app.move_column_cursor(1),
+            KeyCode::Char('k') | KeyCode::Up => app.move_column_cursor(-1),
+            KeyCode::Char(' ') => app.toggle_selected_column(),
+            KeyCode::Char('J') => app.move_selected_column(1),
+            KeyCode::Char('K') => app.move_selected_column(-1),
+            KeyCode::Char('a') => app.reset_columns(),
+            _ => {}
+        },
         Mode::Detail => match key.code {
             KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter => {
                 app.mode = Mode::Normal;
@@ -760,6 +888,10 @@ fn handle_search_key(app: &mut App, key: KeyEvent) {
 fn handle_normal_key(app: &mut App, key: KeyEvent, tx: &mpsc::UnboundedSender<Input>) {
     match key.code {
         KeyCode::Char('q') | KeyCode::Esc => app.should_quit = true,
+        KeyCode::Char('C') => {
+            app.column_cursor = 0;
+            app.mode = Mode::Columns;
+        }
         KeyCode::Char('?') => {
             app.mode = Mode::Help;
             app.detail_scroll = 0;
@@ -1094,6 +1226,7 @@ pub async fn snapshot(width: u16, height: u16, view: &str) -> Result<String> {
     match view {
         "help" => app.mode = Mode::Help,
         "detail" => app.mode = Mode::Detail,
+        "columns" => app.mode = Mode::Columns,
         "search" => {
             app.mode = Mode::Search;
             app.search_input = "grav-plugin".into();
@@ -1151,6 +1284,130 @@ mod tests {
         app.recompute();
         app.visible = (0..rows).collect();
         app
+    }
+
+    fn picker_app() -> App {
+        let mut app = app_with(1);
+        app.columns = Column::defaults(false);
+        app.column_cursor = 0;
+        app
+    }
+
+    fn cursor_on(app: &App) -> Column {
+        app.picker_rows()[app.column_cursor].0
+    }
+
+    /// The list is "on screen, in render order" then "not on screen", so the
+    /// panel reads as the table does rather than as an alphabet.
+    #[test]
+    fn the_picker_lists_shown_columns_first_then_hidden_ones() {
+        let app = picker_app();
+        let rows = app.picker_rows();
+        assert_eq!(rows.len(), Column::all().len(), "every column is listed");
+        let shown: Vec<Column> = rows.iter().filter(|(_, on)| *on).map(|(c, _)| *c).collect();
+        assert_eq!(shown, app.columns);
+        assert_eq!(
+            rows.last().map(|(c, on)| (*c, *on)),
+            Some((Column::Visibility, false))
+        );
+    }
+
+    // Turning a column back on should put it where the defaults have it, not
+    // on the far right -- otherwise enabling VISIBILITY lands it past AGE.
+    #[test]
+    fn a_column_turned_back_on_returns_to_its_canonical_place() {
+        let mut app = picker_app();
+        let at = app
+            .picker_rows()
+            .iter()
+            .position(|(c, _)| *c == Column::Visibility)
+            .unwrap();
+        app.column_cursor = at;
+        app.toggle_selected_column();
+        assert_eq!(
+            app.columns,
+            Column::defaults(true),
+            "enabling VISIBILITY should reproduce the enabled defaults exactly"
+        );
+    }
+
+    /// The cursor tracks the column, not the row index, so a toggle doesn't
+    /// leave it pointing at whatever slid into that slot.
+    #[test]
+    fn the_cursor_follows_the_column_it_was_on_across_a_toggle() {
+        let mut app = picker_app();
+        let at = app
+            .picker_rows()
+            .iter()
+            .position(|(c, _)| *c == Column::Tag)
+            .unwrap();
+        app.column_cursor = at;
+        app.toggle_selected_column();
+        assert!(!app.columns.contains(&Column::Tag));
+        assert_eq!(cursor_on(&app), Column::Tag, "cursor drifted off TAG");
+        app.toggle_selected_column();
+        assert!(app.columns.contains(&Column::Tag));
+        assert_eq!(cursor_on(&app), Column::Tag);
+    }
+
+    #[test]
+    fn reordering_moves_the_column_and_keeps_the_cursor_on_it() {
+        let mut app = picker_app();
+        app.column_cursor = 0;
+        let first = cursor_on(&app);
+        app.move_selected_column(1);
+        assert_eq!(app.columns[1], first);
+        assert_eq!(cursor_on(&app), first);
+        assert_eq!(app.column_cursor, 1);
+    }
+
+    #[test]
+    fn reordering_stops_at_the_ends_rather_than_wrapping() {
+        let mut app = picker_app();
+        let before = app.columns.clone();
+        app.column_cursor = 0;
+        app.move_selected_column(-1);
+        assert_eq!(app.columns, before);
+        app.column_cursor = before.len() - 1;
+        app.move_selected_column(1);
+        assert_eq!(app.columns, before);
+    }
+
+    // A table of rows you can't tell apart isn't worth rendering, so space on
+    // REPO says so instead of quietly doing nothing.
+    #[test]
+    fn repo_cannot_be_toggled_off() {
+        let mut app = picker_app();
+        let at = app
+            .picker_rows()
+            .iter()
+            .position(|(c, _)| *c == Column::Repo)
+            .unwrap();
+        app.column_cursor = at;
+        app.toggle_selected_column();
+        assert!(app.columns.contains(&Column::Repo));
+        assert!(app.message.is_some(), "should have said why");
+    }
+
+    // Hidden columns aren't in a meaningful order, so J/K on one is a no-op
+    // rather than a silent reorder of a list nobody sees.
+    #[test]
+    fn a_hidden_column_cannot_be_reordered() {
+        let mut app = picker_app();
+        let before = app.columns.clone();
+        app.column_cursor = app.picker_rows().len() - 1;
+        assert!(!app.picker_rows()[app.column_cursor].1);
+        app.move_selected_column(-1);
+        assert_eq!(app.columns, before);
+    }
+
+    #[test]
+    fn the_cursor_cannot_leave_the_list() {
+        let mut app = picker_app();
+        app.move_column_cursor(-5);
+        assert_eq!(app.column_cursor, 0);
+        app.move_column_cursor(500);
+        assert_eq!(app.column_cursor, app.picker_rows().len() - 1);
     }
 
     /// The click-to-row arithmetic has to agree with what actually gets drawn.

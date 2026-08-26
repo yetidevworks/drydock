@@ -69,7 +69,7 @@ pub enum Commands {
         width: u16,
         #[arg(long, default_value_t = 40)]
         height: u16,
-        /// Which overlay to render: none, help, or detail.
+        /// Which overlay to render: none, help, detail, or columns.
         #[arg(long, default_value = "none")]
         view: String,
     },

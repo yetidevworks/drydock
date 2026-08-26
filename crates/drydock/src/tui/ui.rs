@@ -13,9 +13,11 @@ use ratatui::{
 };
 
 use super::{App, Mode};
+use crate::column::{Column, Width};
 use crate::fmt;
 use crate::model::{ChangeKind, ReleaseState, RepoStatus, Visibility, VisibilityStatus};
 use crate::paths;
+use crate::report::Align;
 
 const ACCENT: Color = Color::Cyan;
 const DIM: Color = Color::DarkGray;
@@ -25,68 +27,52 @@ const UNRELEASED: Color = Color::Magenta;
 const TROUBLE: Color = Color::Red;
 const CLEAN: Color = Color::Green;
 
-/// Column widths, left to right. The repo name column absorbs whatever is left.
-struct Columns {
-    group: usize,
-    name: usize,
-    branch: usize,
-    state: usize,
-    release: usize,
-    visibility: usize,
-    changes: usize,
-    ahead: usize,
-    behind: usize,
-    tag: usize,
-    since_tag: usize,
-    age: usize,
+/// The columns on screen, left to right, with the width each one resolved to
+/// for this terminal. Which columns are in here comes from the config (see
+/// [`crate::column`]); only the widths are worked out here.
+struct TableLayout {
+    columns: Vec<(Column, usize)>,
 }
 
-impl Columns {
-    fn for_width(width: usize, branch_want: usize) -> Self {
-        // Every column but the repo name is fixed, and the name absorbs the
-        // remainder. That keeps the right-hand numbers in the same place as the
+impl TableLayout {
+    fn for_width(width: usize, branch_want: usize, columns: &[Column]) -> Self {
+        // Every fixed column takes what it takes, the branch column takes only
+        // what the branch names on screen need, and the repo name absorbs the
+        // rest. That keeps the right-hand numbers in the same place as the
         // terminal resizes, which is what makes the table scannable.
-        let group = 14;
-        let state = 12;
-        // "◆ needs release" is 15 wide, plus a space before the next column.
-        let release = 16;
-        // "· checking off" / "· check failed" (14) are the widest cells now,
-        // wider than the header, so 15 is needed to leave a gap before
-        // CHANGES.
-        let visibility = 15;
-        let changes = 12;
-        let ahead = 6;
-        let behind = 7;
-        let tag = 14;
-        let since_tag = 5;
-        let age = 5;
-        let fixed =
-            group + state + release + visibility + changes + ahead + behind + tag + since_tag + age;
-
-        // The branch column takes only what the branch names actually on
-        // screen need, and the repo name absorbs the rest. Nearly every repo
-        // sits on `main` or `develop`, so a fixed share of the leftover left a
-        // wide strip of empty space next to truncated repo names. Long branch
-        // names still get room, up to a cap, and never more than half the
-        // leftover -- and never more than there is, or the age column would be
-        // pushed off the right edge.
+        let fixed: usize = columns
+            .iter()
+            .filter_map(|c| match c.width() {
+                Width::Fixed(w) => Some(w),
+                _ => None,
+            })
+            .sum();
         let leftover = width.saturating_sub(fixed);
-        let branch = branch_want.clamp(7, 24).min(leftover / 2);
-        let name = leftover.saturating_sub(branch);
-        Self {
-            group,
-            name,
-            branch,
-            state,
-            release,
-            visibility,
-            changes,
-            ahead,
-            behind,
-            tag,
-            since_tag,
-            age,
-        }
+
+        // Nearly every repo sits on `main` or `develop`, so a fixed share of
+        // the leftover left a wide strip of empty space next to truncated repo
+        // names. Long branch names still get room, up to a cap, and never more
+        // than half the leftover -- and never more than there is, or the age
+        // column would be pushed off the right edge.
+        let branch = if columns.contains(&Column::Branch) {
+            branch_want.clamp(7, 24).min(leftover / 2)
+        } else {
+            0
+        };
+        let fill = leftover.saturating_sub(branch);
+
+        let columns = columns
+            .iter()
+            .map(|c| {
+                let w = match c.width() {
+                    Width::Fixed(w) => w,
+                    Width::Branch => branch,
+                    Width::Fill => fill,
+                };
+                (*c, w)
+            })
+            .collect();
+        Self { columns }
     }
 }
 
@@ -124,6 +110,7 @@ pub fn render(f: &mut Frame, app: &App) {
     match app.mode {
         Mode::Help => render_help(f, app, f.area()),
         Mode::Detail => render_detail(f, app, f.area()),
+        Mode::Columns => render_columns(f, app, f.area()),
         _ => {}
     }
 }
@@ -285,8 +272,8 @@ fn render_table(f: &mut Frame, app: &App, area: Rect) {
         .get(branch_widths.len().saturating_sub(1) * 95 / 100)
         .copied()
         .unwrap_or(0);
-    let cols = Columns::for_width(inner.width as usize, branch_want);
-    let mut lines = vec![header_line(&cols)];
+    let layout = TableLayout::for_width(inner.width as usize, branch_want, &app.columns);
+    let mut lines = vec![header_line(&layout)];
 
     let rows = inner.height.saturating_sub(1) as usize;
     let end = (app.scroll + rows).min(app.visible.len());
@@ -295,7 +282,7 @@ fn render_table(f: &mut Frame, app: &App, area: Rect) {
         .enumerate()
     {
         let selected = app.scroll + offset == app.selected;
-        lines.push(repo_line(&app.repos[*idx], &cols, app.now, selected));
+        lines.push(repo_line(&app.repos[*idx], &layout, app.now, selected));
     }
 
     if app.visible.is_empty() {
@@ -323,25 +310,24 @@ fn render_table(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(Paragraph::new(lines), inner);
 }
 
-fn header_line(cols: &Columns) -> Line<'static> {
+fn header_line(layout: &TableLayout) -> Line<'static> {
     let style = Style::default().fg(DIM).add_modifier(Modifier::BOLD);
-    Line::from(vec![
-        Span::styled(pad("GROUP", cols.group), style),
-        Span::styled(pad("REPO", cols.name), style),
-        Span::styled(pad("BRANCH", cols.branch), style),
-        Span::styled(pad("STATE", cols.state), style),
-        Span::styled(pad("RELEASE", cols.release), style),
-        Span::styled(pad("VISIBILITY", cols.visibility), style),
-        Span::styled(pad("CHANGES", cols.changes), style),
-        Span::styled(rpad("AHEAD", cols.ahead), style),
-        Span::styled(rpad("BEHIND", cols.behind), style),
-        Span::styled(pad("TAG", cols.tag), style),
-        Span::styled(rpad("+TAG", cols.since_tag), style),
-        Span::styled(rpad("AGE", cols.age), style),
-    ])
+    let spans: Vec<Span<'static>> = layout
+        .columns
+        .iter()
+        .map(|(col, w)| {
+            let text = col.header(false);
+            let cell = match col.align() {
+                Align::Right => rpad(text, *w),
+                Align::Left => pad(text, *w),
+            };
+            Span::styled(cell, style)
+        })
+        .collect();
+    Line::from(spans)
 }
 
-fn repo_line(repo: &RepoStatus, cols: &Columns, now: i64, selected: bool) -> Line<'static> {
+fn repo_line(repo: &RepoStatus, layout: &TableLayout, now: i64, selected: bool) -> Line<'static> {
     let flags = repo.flags();
     let state_colour = if flags.error || flags.conflicted || flags.in_progress {
         TROUBLE
@@ -371,105 +357,103 @@ fn repo_line(repo: &RepoStatus, cols: &Columns, now: i64, selected: bool) -> Lin
         "✓"
     };
 
-    let changes = repo
-        .work
-        .as_ref()
-        .map(|w| fmt::changes(w.staged, w.unstaged, w.untracked, w.conflicts))
-        // `…` means "still scanning". A bare repo has nothing to scan.
-        .unwrap_or_else(|| {
-            if repo.is_bare() {
-                "·".into()
-            } else {
-                "…".into()
+    let mut spans: Vec<Span<'static>> = layout
+        .columns
+        .iter()
+        .map(|(col, w)| {
+            let w = *w;
+            match col {
+                Column::Group => Span::styled(pad(&repo.group, w), base.fg(DIM)),
+                Column::Repo => Span::styled(
+                    pad(&fmt::truncate(&repo.name, w.saturating_sub(1)), w),
+                    if flags.clean() {
+                        base
+                    } else {
+                        base.add_modifier(Modifier::BOLD)
+                    },
+                ),
+                Column::Branch => Span::styled(
+                    pad(&fmt::truncate(&repo.branch_label(), w.saturating_sub(1)), w),
+                    base.fg(if flags.detached { TROUBLE } else { Color::Blue }),
+                ),
+                Column::State => Span::styled(
+                    pad(&format!("{marker} {}", repo.state_label()), w),
+                    Style::default().fg(state_colour),
+                ),
+                Column::Release => Span::styled(
+                    pad(&release_cell(repo), w),
+                    match repo.release_state() {
+                        ReleaseState::NeedsRelease => Style::default().fg(UNRELEASED),
+                        ReleaseState::Unreleased => base.fg(DIM),
+                        ReleaseState::Released => base.fg(CLEAN),
+                    },
+                ),
+                Column::Visibility => Span::styled(
+                    pad(&visibility_cell(repo), w),
+                    match repo.visibility.as_ref().map(|v| &v.status) {
+                        // Green for "open to the world", same reading as
+                        // GitHub's own badge. Private isn't a warning state --
+                        // it's the default most repos should be in -- so it
+                        // gets the same dim treatment as everything else that
+                        // isn't a confirmed public repo.
+                        Some(VisibilityStatus::Known(Visibility::Public)) => base.fg(CLEAN),
+                        Some(VisibilityStatus::Known(Visibility::Private))
+                        | Some(VisibilityStatus::Known(Visibility::Internal))
+                        | Some(VisibilityStatus::Unsupported)
+                        | Some(VisibilityStatus::NoRemote)
+                        | Some(VisibilityStatus::CheckingDisabled)
+                        | Some(VisibilityStatus::CheckFailed(_))
+                        | None => base.fg(DIM),
+                    },
+                ),
+                Column::Changes => {
+                    let changes = repo
+                        .work
+                        .as_ref()
+                        .map(|wk| fmt::changes(wk.staged, wk.unstaged, wk.untracked, wk.conflicts))
+                        // `…` means "still scanning". A bare repo has nothing
+                        // to scan, which is a different thing.
+                        .unwrap_or_else(|| {
+                            if repo.is_bare() {
+                                "·".into()
+                            } else {
+                                "…".into()
+                            }
+                        });
+                    Span::styled(
+                        pad(&fmt::truncate(&changes, w.saturating_sub(1)), w),
+                        base.fg(if flags.dirty { DIRTY } else { DIM }),
+                    )
+                }
+                Column::Ahead => Span::styled(
+                    rpad(&fmt::count(repo.unpushed_total()), w),
+                    base.fg(if repo.unpushed_total() > 0 {
+                        UNPUSHED
+                    } else {
+                        DIM
+                    }),
+                ),
+                Column::Behind => {
+                    Span::styled(rpad(&fmt::count(repo.behind_total()), w), base.fg(DIM))
+                }
+                Column::Tag => Span::styled(
+                    pad(&fmt::truncate(&repo.tag_label(), w.saturating_sub(1)), w),
+                    base.fg(DIM),
+                ),
+                Column::SinceTag => Span::styled(
+                    rpad(&fmt::count(repo.commits_since_tag()), w),
+                    base.fg(if repo.commits_since_tag() > 0 {
+                        UNRELEASED
+                    } else {
+                        DIM
+                    }),
+                ),
+                Column::Age => {
+                    Span::styled(rpad(&fmt::age(repo.activity_at(), now), w), base.fg(DIM))
+                }
             }
-        });
-
-    let tag = repo.tag_label();
-    let mut spans = vec![
-        Span::styled(pad(&repo.group, cols.group), base.fg(DIM)),
-        Span::styled(
-            pad(
-                &fmt::truncate(&repo.name, cols.name.saturating_sub(1)),
-                cols.name,
-            ),
-            if flags.clean() {
-                base
-            } else {
-                base.add_modifier(Modifier::BOLD)
-            },
-        ),
-        Span::styled(
-            pad(
-                &fmt::truncate(&repo.branch_label(), cols.branch.saturating_sub(1)),
-                cols.branch,
-            ),
-            base.fg(if flags.detached { TROUBLE } else { Color::Blue }),
-        ),
-        Span::styled(
-            pad(&format!("{marker} {}", repo.state_label()), cols.state),
-            Style::default().fg(state_colour),
-        ),
-        Span::styled(
-            pad(&release_cell(repo), cols.release),
-            match repo.release_state() {
-                ReleaseState::NeedsRelease => Style::default().fg(UNRELEASED),
-                ReleaseState::Unreleased => base.fg(DIM),
-                ReleaseState::Released => base.fg(CLEAN),
-            },
-        ),
-        Span::styled(
-            pad(&visibility_cell(repo), cols.visibility),
-            match repo.visibility.as_ref().map(|v| &v.status) {
-                // Green for "open to the world", same reading as GitHub's own
-                // badge. Private isn't a warning state -- it's the default
-                // most repos should be in -- so it gets the same dim treatment
-                // as everything else that isn't a confirmed public repo.
-                Some(VisibilityStatus::Known(Visibility::Public)) => base.fg(CLEAN),
-                Some(VisibilityStatus::Known(Visibility::Private))
-                | Some(VisibilityStatus::Known(Visibility::Internal))
-                | Some(VisibilityStatus::Unsupported)
-                | Some(VisibilityStatus::NoRemote)
-                | Some(VisibilityStatus::CheckingDisabled)
-                | Some(VisibilityStatus::CheckFailed(_))
-                | None => base.fg(DIM),
-            },
-        ),
-        Span::styled(
-            pad(
-                &fmt::truncate(&changes, cols.changes.saturating_sub(1)),
-                cols.changes,
-            ),
-            base.fg(if flags.dirty { DIRTY } else { DIM }),
-        ),
-        Span::styled(
-            rpad(&fmt::count(repo.unpushed_total()), cols.ahead),
-            base.fg(if repo.unpushed_total() > 0 {
-                UNPUSHED
-            } else {
-                DIM
-            }),
-        ),
-        Span::styled(
-            rpad(&fmt::count(repo.behind_total()), cols.behind),
-            base.fg(DIM),
-        ),
-        Span::styled(
-            pad(&fmt::truncate(&tag, cols.tag.saturating_sub(1)), cols.tag),
-            base.fg(DIM),
-        ),
-        Span::styled(
-            rpad(&fmt::count(repo.commits_since_tag()), cols.since_tag),
-            base.fg(if repo.commits_since_tag() > 0 {
-                UNRELEASED
-            } else {
-                DIM
-            }),
-        ),
-        Span::styled(
-            rpad(&fmt::age(repo.activity_at(), now), cols.age),
-            base.fg(DIM),
-        ),
-    ];
+        })
+        .collect();
 
     if selected {
         // Reverse the whole row rather than recolour it, so the state colours
@@ -656,6 +640,7 @@ fn render_help(f: &mut Frame, app: &App, area: Rect) {
                 ("w", "open the remote in a browser"),
                 ("y", "copy the path"),
                 ("R / ctrl-r", "rescan now"),
+                ("C", "choose which columns to show"),
             ],
         ),
     ];
@@ -694,6 +679,75 @@ fn render_help(f: &mut Frame, app: &App, area: Rect) {
             .scroll((app.detail_scroll, 0)),
         area,
     );
+}
+
+/// The column picker. Shows every column, the ones on screen first in the
+/// order they're drawn, then the ones that aren't. The table behind keeps
+/// redrawing as this changes, so the effect of every toggle is visible before
+/// it's committed.
+fn render_columns(f: &mut Frame, app: &App, area: Rect) {
+    let area = centred(area, 72, 80);
+    f.render_widget(Clear, area);
+
+    let rows = app.picker_rows();
+    let shown = app.columns.len();
+    let mut lines: Vec<Line> = Vec::new();
+
+    for (i, (column, on)) in rows.iter().enumerate() {
+        // The one divider in the list: everything above it is on screen, in
+        // render order, and everything below is not.
+        if i == shown && shown < rows.len() {
+            lines.push(Line::from(Span::styled(
+                "   ── not shown ──",
+                Style::default().fg(DIM),
+            )));
+        }
+
+        let selected = i == app.column_cursor;
+        let box_glyph = if *on { "◉" } else { "○" };
+        let mut style = if *on {
+            Style::default().fg(Color::White)
+        } else {
+            Style::default().fg(DIM)
+        };
+        if selected {
+            style = style.add_modifier(Modifier::REVERSED);
+        }
+        // REPO can't be turned off, so say why rather than letting someone
+        // press space at it and wonder.
+        let note = if column.toggleable() {
+            column.describe()
+        } else {
+            "always shown"
+        };
+        lines.push(Line::from(vec![
+            Span::styled(format!("  {box_glyph} {:<12}", column.header(false)), style),
+            Span::styled(format!("  {note}"), Style::default().fg(DIM)),
+        ]));
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        " Order is the order they're drawn, left to right.",
+        Style::default().fg(DIM),
+    )));
+    if !app.cfg.visibility.enabled {
+        lines.push(Line::from(Span::styled(
+            " VISIBILITY needs visibility.enabled in the config to hold a value;",
+            Style::default().fg(DIM),
+        )));
+        lines.push(Line::from(Span::styled(
+            " showing it with checking off gives a column of \"checking off\".",
+            Style::default().fg(DIM),
+        )));
+    }
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(ACCENT))
+        .title(" columns · space toggles · J/K reorders · a resets · esc saves ")
+        .title_alignment(Alignment::Center);
+    f.render_widget(Paragraph::new(lines).block(block), area);
 }
 
 fn render_detail(f: &mut Frame, app: &App, area: Rect) {

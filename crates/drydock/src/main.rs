@@ -1,5 +1,6 @@
 mod cache;
 mod cli;
+mod column;
 mod config;
 mod discover;
 mod filter;
@@ -168,6 +169,8 @@ fn build_query(args: &ListArgs) -> Result<Query> {
 async fn cmd_list(args: ListArgs) -> Result<()> {
     let cfg = load_config();
     let query = build_query(&args)?;
+    // Resolved before `cfg` is handed to the sweep, which takes ownership.
+    let columns = cfg.columns();
 
     let repos: Vec<RepoStatus> = if args.cached {
         let mut repos: Vec<RepoStatus> = cache::load().into_values().collect();
@@ -195,7 +198,10 @@ async fn cmd_list(args: ListArgs) -> Result<()> {
     if selected.is_empty() {
         println!("Nothing matched.");
     } else {
-        print!("{}", report::list_table(&selected, now, args.paths));
+        print!(
+            "{}",
+            report::list_table(&selected, now, args.paths, &columns)
+        );
     }
     let shown = selected.len();
     println!();

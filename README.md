@@ -102,6 +102,7 @@ current directory, so it behaves the same wherever you invoke it.
 | `o` `t` `T` | open in your editor, git client, or a terminal |
 | `w` `y` | open the remote in a browser · copy the path |
 | `f` `F` | fetch the selected repo · everything on screen |
+| `C` | choose which columns to show |
 | `R` | rescan now · `?` help · `q` quit |
 
 ### Commands
@@ -212,7 +213,9 @@ tokens directly rather than riding on a CLI you've already authenticated.)
 It's off by default (`visibility.enabled = false`), for the same reason
 fetching is: it's real API traffic, and it depends on `gh` being installed
 and already authenticated (`gh auth status`). Set `visibility.enabled = true`
-to turn it on; a checked value is cached and trusted for `visibility.interval`
+to turn it on — the column appears with it, since a VISIBILITY column with
+checking off would just read "checking off" on every row while still costing
+the width. A checked value is cached and trusted for `visibility.interval`
 (a day, by default — visibility changes rarely) so repeat runs stay cheap.
 Filter with `--public` or `--private` on `list`.
 
@@ -229,6 +232,26 @@ A GitHub wiki's clone URL (`<repo>.wiki.git`) isn't a repository the API can
 look up on its own, so it's resolved to its parent repo instead: a wiki's
 VISIBILITY cell shows the parent repo's actual visibility, not
 `unsupported`.
+
+### Columns
+
+Press `C` in the dashboard to choose which columns to show. Space toggles the
+one under the cursor, `J` and `K` move it left and right, `a` goes back to the
+defaults, and `esc` saves. The table behind the panel redraws as you go, so
+you can see what each change costs before committing to it. Only REPO can't be
+turned off.
+
+Closing the panel writes the list to `[ui] columns` in your config, which the
+plain `drydock list` table reads too:
+
+```toml
+[ui]
+columns = ["group", "repo", "branch", "state", "changes", "age"]
+```
+
+Leave it unset and you get the defaults, which are every column except
+VISIBILITY, and VISIBILITY as well when `visibility.enabled` is on. Set it and
+you get exactly what you list, in the order you list it.
 
 ## Configuration
 
@@ -277,6 +300,7 @@ enabled = false               # see "Visibility"; requires `gh`
 interval = "24h"
 
 [ui]
+# columns = [...]            # unset = the defaults; the `C` key writes this
 default_filters = []         # e.g. ["dirty", "unpushed"]
 default_sort = "activity"
 default_since = ""           # e.g. "1w"
