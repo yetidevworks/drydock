@@ -450,6 +450,28 @@ impl RepoStatus {
             .unwrap_or("-")
     }
 
+    /// The marker for the VISIBILITY column — on its own in the short form,
+    /// and in front of the label in the long one, so the two can't drift.
+    ///
+    /// Filled means "out in the open". `⊘` (circled division slash) is the
+    /// same stroke as a prohibited sign and reads as "access denied" more
+    /// directly than a hollow circle would; `◐` says internal is half of
+    /// each. A check that was attempted and *failed* is worth telling apart
+    /// from one that was never made, since it's the only one you can act on.
+    pub fn visibility_marker(&self) -> &'static str {
+        match self.visibility.as_ref().map(|v| &v.status) {
+            Some(VisibilityStatus::Known(Visibility::Public)) => "●",
+            Some(VisibilityStatus::Known(Visibility::Private)) => "⊘",
+            Some(VisibilityStatus::Known(Visibility::Internal)) => "◐",
+            Some(VisibilityStatus::CheckFailed(_)) => "!",
+            Some(VisibilityStatus::Unsupported)
+            | Some(VisibilityStatus::NoRemote)
+            | Some(VisibilityStatus::Unknown)
+            | Some(VisibilityStatus::CheckingDisabled) => "·",
+            None => "-",
+        }
+    }
+
     /// `group/name`, or just `name` for repos sitting directly in a root.
     pub fn slug(&self) -> String {
         if self.group.is_empty() {

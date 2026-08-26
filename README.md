@@ -225,7 +225,7 @@ Every non-value in this column says specifically why, rather than a bare `-`:
 |---|---|
 | `no remote configured` | Nothing to ever check. Free to know, shown even with checking off. |
 | `unsupported` | The remote is on a host nothing recognises. Also free. |
-| `checking disabled` | The remote *is* checkable, but `visibility.enabled` is off. |
+| `checking disabled` | The remote *is* checkable, but `visibility.enabled` is off. Shown in the table as `not checked`. |
 | `unknown` | The repo itself couldn't be read, so whether it even has a remote isn't established. |
 | `check failed` | A check was attempted and failed (rate limited, not authenticated, timed out), with nothing cached to fall back to. The actual reason is never shown in a table — one long message would widen the column for every row — but it's always available via `status <repo>` or `--json` (`visibility_error`).|
 
@@ -233,6 +233,19 @@ A GitHub wiki's clone URL (`<repo>.wiki.git`) isn't a repository the API can
 look up on its own, so it's resolved to its parent repo instead: a wiki's
 VISIBILITY cell shows the parent repo's actual visibility, not
 `unsupported`.
+
+Markers, so the column scans without reading the words: `●` public, `⊘`
+private, `◐` internal, `!` a check that was attempted and failed, `·` a cell
+with no answer for one of the reasons above. Public is green and private is
+blue — private isn't a warning state, it's the one most repos should be in —
+and grey is kept for the cells that hold no answer at all.
+
+If you know the markers the words are redundant, so there's a **`VIS`**
+column that's just the marker. It's four characters instead of fifteen, which
+at 120 columns is the difference between `drydock` and `dryd…` in the repo
+name. Pick it in the `C` picker, or use `"visibility_short"` in `[ui]
+columns`. The two forms are the same value, so asking for both gives you
+whichever you listed first.
 
 Remote URLs are parsed rather than prefix-matched, so the awkward-but-real
 shapes are recognised too: `ssh.github.com` on port 443 (what you end up with

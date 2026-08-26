@@ -24,6 +24,10 @@ pub enum Column {
     State,
     Release,
     Visibility,
+    /// The same value as [`Visibility`](Column::Visibility), rendered as just
+    /// its marker. Once you know the glyphs the words are redundant, and this
+    /// buys back ten characters of every row for the repo name.
+    VisibilityShort,
     Changes,
     Ahead,
     Behind,
@@ -54,6 +58,7 @@ impl Column {
             Column::State,
             Column::Release,
             Column::Visibility,
+            Column::VisibilityShort,
             Column::Changes,
             Column::Ahead,
             Column::Behind,
@@ -71,6 +76,9 @@ impl Column {
         Column::all()
             .iter()
             .copied()
+            // The short form is opt-in: someone has to have learnt the
+            // glyphs before a column of bare glyphs is an improvement.
+            .filter(|c| *c != Column::VisibilityShort)
             .filter(|c| *c != Column::Visibility || visibility_enabled)
             .collect()
     }
@@ -84,6 +92,7 @@ impl Column {
             Column::State => "state",
             Column::Release => "release",
             Column::Visibility => "visibility",
+            Column::VisibilityShort => "visibility_short",
             Column::Changes => "changes",
             Column::Ahead => "ahead",
             Column::Behind => "behind",
@@ -108,6 +117,7 @@ impl Column {
             Column::State => "STATE",
             Column::Release => "RELEASE",
             Column::Visibility => "VISIBILITY",
+            Column::VisibilityShort => "VIS",
             Column::Changes => "CHANGES",
             Column::Ahead => "AHEAD",
             Column::Behind => "BEHIND",
@@ -126,6 +136,7 @@ impl Column {
             Column::State => "dirty, unpushed, conflict, bare, clean",
             Column::Release => "whether there's work past the newest tag",
             Column::Visibility => "public or private, asked of the host via `gh`",
+            Column::VisibilityShort => "the same, as just its marker: ● public, ⊘ private",
             Column::Changes => "staged, unstaged and untracked counts",
             Column::Ahead => "commits not pushed to the upstream",
             Column::Behind => "commits on the upstream and not here",
@@ -152,9 +163,12 @@ impl Column {
             Column::State => Width::Fixed(12),
             // "◆ needs release" is 15 wide, plus a space before the next.
             Column::Release => Width::Fixed(16),
-            // "· checking off" and "· check failed" are 14, wider than the
-            // header, so 15 leaves a gap before CHANGES.
+            // "· check failed" is 14, wider than the header, so 15 leaves a
+            // gap before CHANGES.
             Column::Visibility => Width::Fixed(15),
+            // Just the header's own width plus a single-space gutter: the
+            // marker underneath is one character.
+            Column::VisibilityShort => Width::Fixed(4),
             Column::Changes => Width::Fixed(12),
             Column::Ahead => Width::Fixed(6),
             Column::Behind => Width::Fixed(7),
@@ -192,6 +206,7 @@ impl Column {
             Column::State => repo.state_label().to_string(),
             Column::Release => repo.release_state().label().to_string(),
             Column::Visibility => repo.visibility_label().to_string(),
+            Column::VisibilityShort => repo.visibility_marker().to_string(),
             Column::Changes => repo
                 .work
                 .as_ref()
@@ -237,13 +252,19 @@ impl std::str::FromStr for Column {
     }
 }
 
-/// Clean up a configured list: drop anything listed twice, and put REPO back
-/// if it's missing. A list is someone's explicit choice, so it's honoured as
+/// Clean up a configured list: drop anything listed twice, collapse the two
+/// visibility forms to one, and put REPO back if it's missing. A list is someone's explicit choice, so it's honoured as
 /// written otherwise — including the order, and including leaving out columns
 /// the defaults would have shown.
 pub fn sanitise(mut columns: Vec<Column>) -> Vec<Column> {
     let mut seen = std::collections::HashSet::new();
     columns.retain(|c| seen.insert(*c));
+    // The two visibility forms are the same column twice. Whichever was asked
+    // for first wins; showing both would render the value beside itself.
+    let is_visibility = |c: &Column| matches!(c, Column::Visibility | Column::VisibilityShort);
+    if let Some(first) = columns.iter().copied().find(is_visibility) {
+        columns.retain(|c| !is_visibility(c) || *c == first);
+    }
     if !columns.contains(&Column::Repo) {
         // Restore it in its canonical position rather than at the front, so a
         // list that simply forgot it still reads the way it was meant to.
@@ -294,12 +315,48 @@ mod tests {
         for enabled in [false, true] {
             let shown = Column::defaults(enabled);
             for column in Column::all() {
-                if *column == Column::Visibility {
+                // Both visibility forms are conditional: the long one on the
+                // flag, the short one on being asked for.
+                if matches!(column, Column::Visibility | Column::VisibilityShort) {
                     continue;
                 }
                 assert!(shown.contains(column), "{} missing", column.key());
             }
         }
+    }
+
+    // The short form is a column of bare glyphs -- worth having, but only
+    // once you've chosen it.
+    #[test]
+    fn the_short_visibility_form_is_never_a_default() {
+        for enabled in [false, true] {
+            assert!(!Column::defaults(enabled).contains(&Column::VisibilityShort));
+        }
+    }
+
+    // They're the same value twice; showing both would render it beside
+    // itself. Whichever was asked for first wins.
+    #[test]
+    fn the_two_visibility_forms_collapse_to_one() {
+        let cleaned = sanitise(vec![
+            Column::Repo,
+            Column::Visibility,
+            Column::VisibilityShort,
+        ]);
+        assert_eq!(cleaned, vec![Column::Repo, Column::Visibility]);
+        let cleaned = sanitise(vec![
+            Column::Repo,
+            Column::VisibilityShort,
+            Column::Visibility,
+        ]);
+        assert_eq!(cleaned, vec![Column::Repo, Column::VisibilityShort]);
+    }
+
+    #[test]
+    fn the_short_form_is_narrower_than_its_own_header_allows_for() {
+        assert_eq!(Column::VisibilityShort.header(false), "VIS");
+        assert_eq!(Column::VisibilityShort.width(), Width::Fixed(4));
+        assert_eq!(Column::Visibility.width(), Width::Fixed(15));
     }
 
     #[test]

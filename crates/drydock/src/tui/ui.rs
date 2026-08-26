@@ -26,6 +26,11 @@ const UNPUSHED: Color = Color::Cyan;
 const UNRELEASED: Color = Color::Magenta;
 const TROUBLE: Color = Color::Red;
 const CLEAN: Color = Color::Green;
+// Private isn't a warning state -- it's the one most repos should be in -- so
+// it gets a colour of its own rather than the grey reserved for cells that
+// hold no answer at all. Internal is half of each, and reads as such.
+const PRIVATE: Color = Color::Blue;
+const INTERNAL: Color = Color::Cyan;
 
 /// The columns on screen, left to right, with the width each one resolved to
 /// for this terminal. Which columns are in here comes from the config (see
@@ -388,24 +393,12 @@ fn repo_line(repo: &RepoStatus, layout: &TableLayout, now: i64, selected: bool) 
                         ReleaseState::Released => base.fg(CLEAN),
                     },
                 ),
-                Column::Visibility => Span::styled(
-                    pad(&visibility_cell(repo), w),
-                    match repo.visibility.as_ref().map(|v| &v.status) {
-                        // Green for "open to the world", same reading as
-                        // GitHub's own badge. Private isn't a warning state --
-                        // it's the default most repos should be in -- so it
-                        // gets the same dim treatment as everything else that
-                        // isn't a confirmed public repo.
-                        Some(VisibilityStatus::Known(Visibility::Public)) => base.fg(CLEAN),
-                        Some(VisibilityStatus::Known(Visibility::Private))
-                        | Some(VisibilityStatus::Known(Visibility::Internal))
-                        | Some(VisibilityStatus::Unsupported)
-                        | Some(VisibilityStatus::NoRemote)
-                        | Some(VisibilityStatus::Unknown)
-                        | Some(VisibilityStatus::CheckingDisabled)
-                        | Some(VisibilityStatus::CheckFailed(_))
-                        | None => base.fg(DIM),
-                    },
+                Column::Visibility => {
+                    Span::styled(pad(&visibility_cell(repo), w), visibility_style(repo, base))
+                }
+                Column::VisibilityShort => Span::styled(
+                    pad(repo.visibility_marker(), w),
+                    visibility_style(repo, base),
                 ),
                 Column::Changes => {
                     let changes = repo
@@ -466,29 +459,40 @@ fn repo_line(repo: &RepoStatus, layout: &TableLayout, now: i64, selected: bool) 
     Line::from(spans)
 }
 
-/// The visibility cell, with a marker so the column scans without reading
-/// words. Filled means "exposed", same reading as the dirty and needs-release
-/// markers elsewhere in this table: `●` for public, since that's the repo
-/// with something out in the open. Private and internal get `⊘` (circled
-/// division slash) -- the same "no entry" stroke as a prohibited sign, which
-/// reads as "access denied" more directly than a plain hollow circle would.
-/// Everything else that isn't a confirmed value gets a `·` and a short form
-/// of its [`VisibilityStatus`] label -- shortened only because the table is
-/// fixed-width; `status`, `--json`, and the TUI detail view all show the
-/// full label (and, for a real check failure, the reason too). `-` only
-/// appears before the repo has been probed at all.
-fn visibility_cell(repo: &RepoStatus) -> String {
+/// Green for "out in the open", the same reading as GitHub's own badge. Blue
+/// for private, because it isn't a warning state — it's the one most repos
+/// should be in, and greying it lumped it in with the cells that hold no
+/// answer at all. Grey is kept for exactly those: not checked, no remote,
+/// unsupported, unknown, failed.
+fn visibility_style(repo: &RepoStatus, base: Style) -> Style {
     match repo.visibility.as_ref().map(|v| &v.status) {
-        Some(VisibilityStatus::Known(Visibility::Public)) => "● public".into(),
-        Some(VisibilityStatus::Known(Visibility::Private)) => "⊘ private".into(),
-        Some(VisibilityStatus::Known(Visibility::Internal)) => "⊘ internal".into(),
-        Some(VisibilityStatus::Unsupported) => "· unsupported".into(),
-        Some(VisibilityStatus::NoRemote) => "· no remote".into(),
-        Some(VisibilityStatus::Unknown) => "· unknown".into(),
-        Some(VisibilityStatus::CheckingDisabled) => "· checking off".into(),
-        Some(VisibilityStatus::CheckFailed(_)) => "· check failed".into(),
-        None => "-".into(),
+        Some(VisibilityStatus::Known(Visibility::Public)) => base.fg(CLEAN),
+        Some(VisibilityStatus::Known(Visibility::Private)) => base.fg(PRIVATE),
+        Some(VisibilityStatus::Known(Visibility::Internal)) => base.fg(INTERNAL),
+        Some(VisibilityStatus::Unsupported)
+        | Some(VisibilityStatus::NoRemote)
+        | Some(VisibilityStatus::Unknown)
+        | Some(VisibilityStatus::CheckingDisabled)
+        | Some(VisibilityStatus::CheckFailed(_))
+        | None => base.fg(DIM),
     }
+}
+
+/// The long visibility cell: the shared marker, then a short form of the
+/// label. Shortened only because the table is fixed-width — `status`,
+/// `--json` and the detail view all show the full label, and for a real
+/// failure the reason too. The VIS column drops the words entirely.
+fn visibility_cell(repo: &RepoStatus) -> String {
+    let label = match repo.visibility.as_ref().map(|v| &v.status) {
+        Some(VisibilityStatus::Known(v)) => v.label(),
+        Some(VisibilityStatus::Unsupported) => "unsupported",
+        Some(VisibilityStatus::NoRemote) => "no remote",
+        Some(VisibilityStatus::Unknown) => "unknown",
+        Some(VisibilityStatus::CheckingDisabled) => "not checked",
+        Some(VisibilityStatus::CheckFailed(_)) => "check failed",
+        None => return "-".into(),
+    };
+    format!("{} {label}", repo.visibility_marker())
 }
 
 /// The release cell, with a marker so the column scans without reading words.
@@ -777,16 +781,7 @@ fn render_detail(f: &mut Frame, app: &App, area: Rect) {
             label("visibility"),
             Span::styled(
                 v.status.label().to_string(),
-                Style::default().fg(match &v.status {
-                    VisibilityStatus::Known(Visibility::Public) => CLEAN,
-                    VisibilityStatus::Known(Visibility::Private)
-                    | VisibilityStatus::Known(Visibility::Internal)
-                    | VisibilityStatus::Unsupported
-                    | VisibilityStatus::NoRemote
-                    | VisibilityStatus::Unknown
-                    | VisibilityStatus::CheckingDisabled
-                    | VisibilityStatus::CheckFailed(_) => DIM,
-                }),
+                visibility_style(repo, Style::default()),
             ),
         ];
         match &v.status {

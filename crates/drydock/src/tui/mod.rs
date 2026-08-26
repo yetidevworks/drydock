@@ -295,7 +295,8 @@ impl App {
         // checking off, because `--public`, `--private` and `--json` still use
         // it, and silently disabling those isn't implied by tidying a table.
         let turned_on = self.columns.contains(&column);
-        if column == Column::Visibility && turned_on && !self.cfg.visibility.enabled {
+        let wants_checking = matches!(column, Column::Visibility | Column::VisibilityShort);
+        if wants_checking && turned_on && !self.cfg.visibility.enabled {
             let mut cfg = (*self.cfg).clone();
             cfg.visibility.enabled = true;
             self.cfg = Arc::new(cfg);
@@ -1335,10 +1336,13 @@ mod tests {
         assert_eq!(rows.len(), Column::all().len(), "every column is listed");
         let shown: Vec<Column> = rows.iter().filter(|(_, on)| *on).map(|(c, _)| *c).collect();
         assert_eq!(shown, app.columns);
-        assert_eq!(
-            rows.last().map(|(c, on)| (*c, *on)),
-            Some((Column::Visibility, false))
-        );
+        // Both visibility forms sit in the hidden section by default.
+        let hidden: Vec<Column> = rows
+            .iter()
+            .filter(|(_, on)| !*on)
+            .map(|(c, _)| *c)
+            .collect();
+        assert_eq!(hidden, vec![Column::Visibility, Column::VisibilityShort]);
     }
 
     // Turning a column back on should put it where the defaults have it, not
@@ -1395,6 +1399,21 @@ mod tests {
         assert!(app.cfg.visibility.enabled);
     }
 
+    // The short form is the same data, so it needs checking on just as much.
+    #[test]
+    fn showing_the_short_visibility_column_also_turns_checking_on() {
+        let mut app = picker_app();
+        assert!(!app.cfg.visibility.enabled);
+        let at = app
+            .picker_rows()
+            .iter()
+            .position(|(c, _)| *c == Column::VisibilityShort)
+            .unwrap();
+        app.column_cursor = at;
+        assert!(app.toggle_selected_column());
+        assert!(app.cfg.visibility.enabled);
+    }
+
     // Not symmetrical: --public, --private and --json still read visibility,
     // so tidying the table mustn't silently disable them.
     #[test]
@@ -1420,12 +1439,24 @@ mod tests {
     #[test]
     fn toggling_any_other_column_changes_no_config() {
         let mut app = picker_app();
-        for at in 0..app.picker_rows().len() {
-            if app.picker_rows()[at].0 == Column::Visibility {
+        // Found by identity each time rather than by a fixed index: toggling
+        // moves a column between the two sections, so the row order shifts
+        // underneath a plain counting loop.
+        for column in Column::all() {
+            if matches!(column, Column::Visibility | Column::VisibilityShort) {
                 continue;
             }
+            let at = app
+                .picker_rows()
+                .iter()
+                .position(|(c, _)| c == column)
+                .unwrap();
             app.column_cursor = at;
-            assert!(!app.toggle_selected_column(), "row {at} reported a change");
+            assert!(
+                !app.toggle_selected_column(),
+                "{} reported a config change",
+                column.key()
+            );
         }
         assert!(!app.cfg.visibility.enabled);
     }
