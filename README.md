@@ -104,7 +104,7 @@ current directory, so it behaves the same wherever you invoke it.
 | `w` `y` | open the remote in a browser · copy the path |
 | `f` `F` | fetch the selected repo · everything on screen |
 | `C` | choose which columns to show |
-| `R` | rescan now · `?` help · `q` quit |
+| `R` | rescan now · `?` help, with a legend for every marker on screen · `q` quit |
 
 ### Commands
 

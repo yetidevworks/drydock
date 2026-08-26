@@ -612,12 +612,72 @@ fn centred(area: Rect, width_pct: u16, height_pct: u16) -> Rect {
     }
 }
 
-/// Whether the help overlay should carry the visibility marker legend: only
-/// when one of the two forms of that column is actually on screen.
-pub fn help_shows_visibility_legend(app: &App) -> bool {
-    app.columns
-        .iter()
-        .any(|c| matches!(c, Column::Visibility | Column::VisibilityShort))
+/// One legend row: the glyph, the colour the table draws it in, and what it
+/// means in that column.
+type Marker = (&'static str, Color, &'static str);
+/// One column's worth of legend: its header, then its markers.
+type MarkerGroup = (&'static str, Vec<Marker>);
+
+/// The marker legend for `?`, grouped by the column each glyph belongs to and
+/// limited to the columns actually on screen — a legend for a column you've
+/// turned off is dead weight.
+///
+/// The same glyph means different things in different columns (`●` is dirty
+/// in STATE and public in VISIBILITY, `·` is "nothing" nearly everywhere), so
+/// grouping is what makes it readable rather than a flat list of collisions.
+/// Colours are the table's own: printed in plain white this would teach half
+/// of what a cell says.
+pub fn marker_legend(app: &App) -> Vec<MarkerGroup> {
+    let mut groups: Vec<MarkerGroup> = Vec::new();
+    let shown = |c: Column| app.columns.contains(&c);
+
+    if shown(Column::State) {
+        groups.push((
+            "STATE",
+            vec![
+                ("⚠", TROUBLE, "conflict, operation in progress, or error"),
+                ("●", DIRTY, "uncommitted changes"),
+                ("↑", UNPUSHED, "commits not pushed to the upstream"),
+                ("✓", CLEAN, "nothing outstanding"),
+                ("·", DIM, "not scanned yet, or a bare repo"),
+            ],
+        ));
+    }
+    if shown(Column::Release) {
+        groups.push((
+            "RELEASE",
+            vec![
+                ("◆", UNRELEASED, "commits or changes past the newest tag"),
+                ("✓", CLEAN, "tagged, with nothing since"),
+                ("·", DIM, "no tags at all"),
+            ],
+        ));
+    }
+    if shown(Column::Changes) {
+        groups.push((
+            "CHANGES",
+            vec![
+                ("!", DIRTY, "conflicted files"),
+                ("+", DIRTY, "staged"),
+                ("~", DIRTY, "unstaged"),
+                ("?", DIRTY, "untracked"),
+                ("·", DIM, "a clean working tree"),
+            ],
+        ));
+    }
+    if shown(Column::Visibility) || shown(Column::VisibilityShort) {
+        groups.push((
+            "VISIBILITY",
+            vec![
+                ("●", CLEAN, "public"),
+                ("⊘", PRIVATE, "private"),
+                ("◐", INTERNAL, "internal, on GitHub Enterprise"),
+                ("!", DIM, "a check failed — press ⏎ for the reason"),
+                ("·", DIM, "no answer: not checked, no remote, unknown host"),
+            ],
+        ));
+    }
+    groups
 }
 
 fn render_help(f: &mut Frame, app: &App, area: Rect) -> u16 {
@@ -688,25 +748,26 @@ fn render_help(f: &mut Frame, app: &App, area: Rect) -> u16 {
         }
         lines.push(Line::from(""));
     }
-    // Only worth the space when one of the visibility columns is actually on
-    // screen -- and drawn in the real colours, since a legend printed in white
-    // would teach half of what the column says.
-    if help_shows_visibility_legend(app) {
+    let legend = marker_legend(app);
+    if !legend.is_empty() {
         lines.push(Line::from(Span::styled(
-            " Visibility markers",
+            " Markers",
             Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
         )));
-        for (marker, colour, what) in [
-            ("●", CLEAN, "public"),
-            ("⊘", PRIVATE, "private"),
-            ("◐", INTERNAL, "internal, on GitHub Enterprise"),
-            ("!", DIM, "a check failed — press ⏎ for the reason"),
-            ("·", DIM, "no answer: not checked, no remote, unknown host"),
-        ] {
-            lines.push(Line::from(vec![
-                Span::styled(format!("   {marker:<16}"), Style::default().fg(colour)),
-                Span::styled(what.to_string(), Style::default().fg(DIM)),
-            ]));
+        for (i, (column, entries)) in legend.into_iter().enumerate() {
+            if i > 0 {
+                lines.push(Line::from(""));
+            }
+            lines.push(Line::from(Span::styled(
+                format!("   {column}"),
+                Style::default().fg(Color::White),
+            )));
+            for (marker, colour, what) in entries {
+                lines.push(Line::from(vec![
+                    Span::styled(format!("     {marker:<14}"), Style::default().fg(colour)),
+                    Span::styled(what.to_string(), Style::default().fg(DIM)),
+                ]));
+            }
         }
         lines.push(Line::from(""));
     }

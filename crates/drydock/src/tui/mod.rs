@@ -1430,18 +1430,28 @@ mod tests {
     }
 
     #[test]
-    fn the_help_legend_follows_the_visibility_columns() {
+    fn the_help_legend_follows_the_columns_on_screen() {
+        let titles = |app: &App| -> Vec<&'static str> {
+            ui::marker_legend(app).into_iter().map(|(t, _)| t).collect()
+        };
         let mut app = picker_app();
-        assert!(!ui::help_shows_visibility_legend(&app));
+        assert!(!titles(&app).contains(&"VISIBILITY"));
         for form in [Column::Visibility, Column::VisibilityShort] {
             app.columns = Column::defaults(false);
             app.columns.push(form);
             assert!(
-                ui::help_shows_visibility_legend(&app),
+                titles(&app).contains(&"VISIBILITY"),
                 "legend missing with {}",
                 form.key()
             );
         }
+
+        // Every group follows its own column, so a legend never explains
+        // glyphs that aren't on screen.
+        app.columns = Column::defaults(false);
+        assert_eq!(titles(&app), vec!["STATE", "RELEASE", "CHANGES"]);
+        app.columns = vec![Column::Repo];
+        assert!(titles(&app).is_empty(), "nothing to explain, no legend");
     }
 
     #[test]
