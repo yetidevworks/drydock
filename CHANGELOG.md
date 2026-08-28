@@ -1,3 +1,10 @@
+# 1.1.0
+
+## 08/28/2026
+
+1. [](#new)
+    * A `visibility` sort key that groups the table by what each repo's visibility check found — a failed check first, then the private repos, then the public ones, then everything with no checked answer — which the `s` key only stops on once visibility checking is turned on, while `--sort visibility` and `default_sort = "visibility"` are honoured either way.
+
 # 1.0.0
 
 ## 08/26/2026
