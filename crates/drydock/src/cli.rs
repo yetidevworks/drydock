@@ -161,7 +161,7 @@ pub struct ListArgs {
     pub search: Option<String>,
 
     /// Sort key: activity, name, group, changes, unpushed, behind, since-tag,
-    /// state.
+    /// state, visibility.
     #[arg(long, default_value = "activity")]
     pub sort: String,
 
