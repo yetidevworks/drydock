@@ -171,6 +171,7 @@ pub enum Sort {
     Behind,
     SinceTag,
     State,
+    Visibility,
 }
 
 impl Sort {
@@ -184,6 +185,7 @@ impl Sort {
             Sort::Behind => "behind",
             Sort::SinceTag => "since-tag",
             Sort::State => "state",
+            Sort::Visibility => "visibility",
         }
     }
 
@@ -197,13 +199,34 @@ impl Sort {
             Sort::Behind,
             Sort::SinceTag,
             Sort::State,
+            Sort::Visibility,
         ]
     }
 
-    pub fn next(&self) -> Sort {
+    /// Step to the next sort key in the `s`-cycle.
+    ///
+    /// `visibility_enabled` skips `Sort::Visibility` in that cycle when
+    /// false, the same gate `Column::defaults` already applies to the
+    /// VISIBILITY column. This is the ambient, no-argument-needed path
+    /// through the sort keys, so it's the one place that matters most:
+    /// someone who has never turned visibility checking on shouldn't find
+    /// an extra stop added to the key they already press, offering a sort
+    /// that can only ever tie. Explicit requests -- `--sort visibility`,
+    /// `default_sort = "visibility"` -- go through `FromStr` instead and
+    /// are always honoured, the same way `--public`/`--private` already
+    /// work regardless of the flag: asking by name is always answered,
+    /// only the ambient default stays out of the way until asked for.
+    pub fn next(&self, visibility_enabled: bool) -> Sort {
         let all = Sort::all();
         let idx = all.iter().position(|s| s == self).unwrap_or(0);
-        all[(idx + 1) % all.len()]
+        let mut i = idx;
+        loop {
+            i = (i + 1) % all.len();
+            let candidate = all[i];
+            if visibility_enabled || candidate != Sort::Visibility || i == idx {
+                return candidate;
+            }
+        }
     }
 
     /// Most of these read better biggest-first; names read better A to Z.
@@ -360,6 +383,7 @@ pub fn sort_repos(repos: &mut [&RepoStatus], sort: Sort, reverse: bool) {
             Sort::Behind => a.behind_total().cmp(&b.behind_total()),
             Sort::SinceTag => a.commits_since_tag().cmp(&b.commits_since_tag()),
             Sort::State => state_rank(a).cmp(&state_rank(b)),
+            Sort::Visibility => visibility_rank(a).cmp(&visibility_rank(b)),
         };
         // Ties fall back to activity, then path, so the order is stable across
         // repaints.
@@ -394,6 +418,52 @@ fn state_rank(repo: &RepoStatus) -> u8 {
         1
     } else {
         0
+    }
+}
+
+/// Ranking for visibility sort: a failed check first, then public, then
+/// private. Everything else -- internal, no remote, an unsupported host, a
+/// repo that couldn't be read, checking turned off, or never probed at all
+/// -- ties in one bottom tier rather than being split out into tiers of its
+/// own.
+///
+/// This follows the original developer's own stated reasoning in #2 rather
+/// than an assumption about what this column is "for":
+///   - CheckFailed ranks highest because #2 already singled it out as
+///     the one non-answer worth acting on -- "the only non-answer you can
+///     act on" is the exact phrase used to justify giving it its own `!`
+///     marker instead of a plain dot.
+///   - Public outranks Private, not the other way around, because #2 is
+///     explicit that "private isn't a warning state -- it's the one most
+///     repos should be in." Every other sort in this tool surfaces the
+///     exceptional case over the expected one (`state` puts errors above
+///     clean, `release` puts needs-release above released); putting the
+///     normal, default state at the top of a visibility sort would be the
+///     one sort that inverts that pattern. Public -- a repo that's out in
+///     the open, whether by design or by accident -- is the state actually
+///     worth a second look.
+///
+/// The bottom tier being one tier, not several, is unrelated to that
+/// question and just as deliberate as before: `NoRemote` and `Unsupported`
+/// are "free" facts, computed straight from the remote URL whether or not
+/// `visibility.enabled` is on, and giving them their own tiers would mean
+/// choosing this sort key still reshuffles the list even for someone who
+/// has never turned visibility checking on at all. With only CheckFailed,
+/// Public and Private able to earn a distinct rank, a repo can't move until
+/// it's actually been checked -- so with checking off, this sort is a true
+/// no-op, identical to the activity/path tie-break every other sort already
+/// falls back to.
+fn visibility_rank(repo: &RepoStatus) -> u8 {
+    match repo.visibility.as_ref().map(|v| &v.status) {
+        Some(VisibilityStatus::CheckFailed(_)) => 3,
+        Some(VisibilityStatus::Known(Visibility::Public)) => 2,
+        Some(VisibilityStatus::Known(Visibility::Private)) => 1,
+        Some(VisibilityStatus::Known(Visibility::Internal))
+        | Some(VisibilityStatus::Unsupported)
+        | Some(VisibilityStatus::NoRemote)
+        | Some(VisibilityStatus::Unknown)
+        | Some(VisibilityStatus::CheckingDisabled)
+        | None => 0,
     }
 }
 
@@ -437,7 +507,7 @@ fn is_subsequence(needle: &str, haystack: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{BranchInfo, Head, RefsInfo, WorkInfo};
+    use crate::model::{BranchInfo, Head, RefsInfo, VisibilityInfo, WorkInfo};
     use std::path::PathBuf;
 
     fn repo(group: &str, name: &str, ahead: u32, dirty: u32, since_tag: u32) -> RepoStatus {
@@ -539,6 +609,277 @@ mod tests {
             out.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(),
             vec!["high", "mid", "low"]
         );
+    }
+
+    #[test]
+    fn sort_visibility_puts_failed_first_then_public_then_private() {
+        // Internal doesn't get a tier of its own -- only CheckFailed, Public
+        // and Private do. CheckFailed leads because #2 already called it
+        // "the only non-answer you can act on"; Public outranks Private
+        // because #2 is equally explicit that private "isn't a warning
+        // state -- it's the one most repos should be in," so it's the
+        // expected case, not the one worth surfacing first. Distinct
+        // activity on the two untiered repos (internal, never-probed) proves
+        // they're genuinely tied on visibility_rank and only separated by
+        // the usual activity fallback, not by some hidden ordering.
+        // `activity_at()` is the max of the newest commit and the working
+        // tree's newest mtime, and `repo()` fixes the latter at 2_000 --
+        // higher than any committed_at worth setting here -- so it's the
+        // mtime that has to move for these to actually differ.
+        let mut failed_repo = repo("a", "flaky-repo", 0, 0, 0);
+        failed_repo.visibility = Some(VisibilityInfo {
+            status: VisibilityStatus::CheckFailed("rate limited".into()),
+            checked_at: 0,
+        });
+
+        let mut public_repo = repo("b", "public-repo", 0, 0, 0);
+        public_repo.visibility = Some(VisibilityInfo {
+            status: VisibilityStatus::Known(Visibility::Public),
+            checked_at: 0,
+        });
+
+        let mut private_repo = repo("c", "private-repo", 0, 0, 0);
+        private_repo.visibility = Some(VisibilityInfo {
+            status: VisibilityStatus::Known(Visibility::Private),
+            checked_at: 0,
+        });
+
+        let mut internal_repo = repo("d", "internal-repo", 0, 0, 0);
+        internal_repo.visibility = Some(VisibilityInfo {
+            status: VisibilityStatus::Known(Visibility::Internal),
+            checked_at: 0,
+        });
+        internal_repo.work.as_mut().unwrap().newest_mtime = Some(3_000);
+
+        let mut never_probed = repo("e", "never-probed", 0, 0, 0);
+        never_probed.work.as_mut().unwrap().newest_mtime = Some(1_500);
+
+        let repos = vec![
+            failed_repo,
+            public_repo,
+            private_repo,
+            internal_repo,
+            never_probed,
+        ];
+        let q = Query {
+            sort: Sort::Visibility,
+            ..Query::default()
+        };
+        let out = q.apply(&repos, 10_000);
+        assert_eq!(
+            out.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(),
+            vec![
+                "flaky-repo",
+                "public-repo",
+                "private-repo",
+                "internal-repo",
+                "never-probed",
+            ],
+            "failed, public and private each keep their own tier; internal \
+             and a never-probed repo fall back to the activity tie-break, \
+             which is 3000/1500 -- descending -- for those two"
+        );
+    }
+
+    #[test]
+    fn sort_visibility_orders_duplicates_within_a_tier_by_activity() {
+        // Two repos in the same visibility state don't tie arbitrarily --
+        // the usual activity fallback still applies inside a tier, same as
+        // it does between tiers. This doubles every state from
+        // sort_visibility_puts_failed_first_then_public_then_private:
+        // two CheckFailed, two Public, two Private, and two pairs from the
+        // untiered bottom group (Internal and NoRemote), all with distinct
+        // activity so the exact order is provable rather than assumed.
+        let make = |name: &str, status: VisibilityStatus, mtime: i64| {
+            let mut r = repo("a", name, 0, 0, 0);
+            r.visibility = Some(VisibilityInfo {
+                status,
+                checked_at: 0,
+            });
+            r.work.as_mut().unwrap().newest_mtime = Some(mtime);
+            r
+        };
+
+        let repos = vec![
+            make(
+                "failed-newer",
+                VisibilityStatus::CheckFailed("timeout".into()),
+                8_000,
+            ),
+            make(
+                "failed-older",
+                VisibilityStatus::CheckFailed("timeout".into()),
+                7_000,
+            ),
+            make(
+                "public-newer",
+                VisibilityStatus::Known(Visibility::Public),
+                6_000,
+            ),
+            make(
+                "public-older",
+                VisibilityStatus::Known(Visibility::Public),
+                5_000,
+            ),
+            make(
+                "private-newer",
+                VisibilityStatus::Known(Visibility::Private),
+                4_000,
+            ),
+            make(
+                "private-older",
+                VisibilityStatus::Known(Visibility::Private),
+                3_000,
+            ),
+            // These four are all rank 0 -- two different untiered states,
+            // interleaved by activity alone, to show the bottom tier really
+            // is one bucket and not secretly four.
+            make(
+                "internal-newest",
+                VisibilityStatus::Known(Visibility::Internal),
+                2_800,
+            ),
+            make("no-remote-newer", VisibilityStatus::NoRemote, 2_600),
+            make(
+                "internal-older",
+                VisibilityStatus::Known(Visibility::Internal),
+                2_400,
+            ),
+            make("no-remote-oldest", VisibilityStatus::NoRemote, 2_200),
+        ];
+
+        let q = Query {
+            sort: Sort::Visibility,
+            ..Query::default()
+        };
+        let out = q.apply(&repos, 10_000);
+        assert_eq!(
+            out.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(),
+            vec![
+                "failed-newer",
+                "failed-older",
+                "public-newer",
+                "public-older",
+                "private-newer",
+                "private-older",
+                "internal-newest",
+                "no-remote-newer",
+                "internal-older",
+                "no-remote-oldest",
+            ],
+            "each ranked tier stays intact and ordered newest-first \
+             internally; the two untiered states interleave by activity \
+             alone since they share the same rank"
+        );
+    }
+
+    #[test]
+    fn sort_visibility_is_a_no_op_without_a_checked_answer() {
+        // None of these five ever resulted from an actual check succeeding --
+        // no remote, an unsupported host, a repo that couldn't be read,
+        // checking turned off, and never having been probed at all. Every
+        // one of them is real, distinct data the tool already tracks, but
+        // none of it should earn a repo a different spot in this sort: with
+        // no CheckFailed, Public or Private answer anywhere in the list (an
+        // Internal repo would tie here too, for the same reason -- only
+        // those three carry their own tier), `visibility` must order exactly
+        // like `activity` does, so a repo can't get reshuffled by this sort
+        // key before anyone has ever turned visibility checking on.
+        let mut no_remote = repo("a", "no-remote-repo", 0, 0, 0);
+        no_remote.visibility = Some(VisibilityInfo {
+            status: VisibilityStatus::NoRemote,
+            checked_at: 0,
+        });
+
+        let mut unsupported = repo("b", "gitlab-repo", 0, 0, 0);
+        unsupported.visibility = Some(VisibilityInfo {
+            status: VisibilityStatus::Unsupported,
+            checked_at: 0,
+        });
+
+        let mut unreadable = repo("c", "unreadable-repo", 0, 0, 0);
+        unreadable.visibility = Some(VisibilityInfo {
+            status: VisibilityStatus::Unknown,
+            checked_at: 0,
+        });
+
+        let mut disabled = repo("d", "checking-off-repo", 0, 0, 0);
+        disabled.visibility = Some(VisibilityInfo {
+            status: VisibilityStatus::CheckingDisabled,
+            checked_at: 0,
+        });
+
+        let never_probed = repo("e", "never-probed-repo", 0, 0, 0);
+
+        // Distinct activity so a genuine no-op has something to prove: any
+        // reordering here would mean a tier leaked in that shouldn't have.
+        let mut repos = vec![no_remote, unsupported, unreadable, disabled, never_probed];
+        for (i, r) in repos.iter_mut().enumerate() {
+            r.refs.as_mut().unwrap().branches[0].committed_at = 1_000 + i as i64;
+        }
+
+        let by_activity = Query {
+            sort: Sort::Activity,
+            ..Query::default()
+        }
+        .apply(&repos, 10_000)
+        .iter()
+        .map(|r| r.name.clone())
+        .collect::<Vec<_>>();
+
+        let by_visibility = Query {
+            sort: Sort::Visibility,
+            ..Query::default()
+        }
+        .apply(&repos, 10_000)
+        .iter()
+        .map(|r| r.name.clone())
+        .collect::<Vec<_>>();
+
+        assert_eq!(by_visibility, by_activity);
+    }
+
+    #[test]
+    fn next_skips_visibility_when_checking_is_off() {
+        // Cycling wraps all the way around back to Activity without ever
+        // landing on Visibility -- the `s` key shouldn't gain an extra stop
+        // for someone who has never turned checking on.
+        let expected = [
+            Sort::Name,
+            Sort::Group,
+            Sort::Dirty,
+            Sort::Ahead,
+            Sort::Behind,
+            Sort::SinceTag,
+            Sort::State,
+            Sort::Activity,
+            Sort::Name,
+        ];
+        let mut s = Sort::Activity;
+        for want in expected {
+            s = s.next(false);
+            assert_eq!(s, want);
+        }
+    }
+
+    #[test]
+    fn next_visits_visibility_when_checking_is_on() {
+        let expected = [
+            Sort::Name,
+            Sort::Group,
+            Sort::Dirty,
+            Sort::Ahead,
+            Sort::Behind,
+            Sort::SinceTag,
+            Sort::State,
+            Sort::Visibility,
+            Sort::Activity,
+        ];
+        let mut s = Sort::Activity;
+        for want in expected {
+            s = s.next(true);
+            assert_eq!(s, want);
+        }
     }
 
     #[test]

@@ -984,7 +984,7 @@ fn handle_normal_key(app: &mut App, key: KeyEvent, tx: &mpsc::UnboundedSender<In
         }
 
         KeyCode::Char('s') => {
-            app.query.sort = app.query.sort.next();
+            app.query.sort = app.query.sort.next(app.cfg.visibility.enabled);
             app.notify(format!("Sorted by {}", app.query.sort.label()));
             app.recompute();
         }
