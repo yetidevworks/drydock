@@ -227,6 +227,14 @@ pub fn detail(repo: &RepoStatus, now: i64) -> String {
         out.push_str(&format!("  head         {}\n", refs.head.label()));
         if let Some(url) = &refs.remote_url {
             out.push_str(&format!("  remote       {url}\n"));
+            match refs.fetched_at {
+                Some(at) => {
+                    out.push_str(&format!("  fetched      {} ago\n", fmt::age(at, now)));
+                }
+                None => {
+                    out.push_str("  fetched      never — the behind count has never been checked\n")
+                }
+            }
         } else {
             out.push_str("  remote       (none)\n");
         }
@@ -396,6 +404,14 @@ pub struct RepoView<'a> {
     pub upstream: Option<String>,
     pub ahead: u32,
     pub behind: u32,
+    /// When anything last fetched this repo, from `FETCH_HEAD`. `null` means
+    /// nothing ever has, which is what makes `behind: 0` a number nobody
+    /// checked rather than a repo in sync.
+    pub fetched_at: Option<i64>,
+    /// True when there is a remote to check against and nothing has ever
+    /// checked. Derived from `fetched_at`, but worth its own field: it is the
+    /// condition a script would otherwise have to know to look for.
+    pub never_fetched: bool,
     pub staged: u32,
     pub unstaged: u32,
     pub untracked: u32,
@@ -461,6 +477,8 @@ pub fn view<'a>(repo: &'a RepoStatus, now: i64) -> RepoView<'a> {
             .and_then(|b| b.upstream.clone()),
         ahead: repo.unpushed_total(),
         behind: repo.behind_total(),
+        fetched_at: repo.fetched_at(),
+        never_fetched: repo.never_fetched(),
         staged: work.map(|w| w.staged).unwrap_or(0),
         unstaged: work.map(|w| w.unstaged).unwrap_or(0),
         untracked: work.map(|w| w.untracked).unwrap_or(0),

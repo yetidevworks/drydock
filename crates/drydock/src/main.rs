@@ -24,7 +24,7 @@ use std::sync::Arc;
 use cli::{Cli, Commands, ConfigCommands, ListArgs};
 use filter::{Filter, MatchMode, Query, Sort};
 use model::RepoStatus;
-use probe::Tier;
+use probe::{Fetch, Tier};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -40,7 +40,11 @@ async fn main() -> Result<()> {
             include_changelog,
             json,
         }) => cmd_releasable(min_commits, include_changelog, json).await,
-        Some(Commands::Scan { fast, no_cache }) => cmd_scan(fast, no_cache).await,
+        Some(Commands::Scan {
+            fast,
+            no_cache,
+            fetch,
+        }) => cmd_scan(fast, no_cache, fetch).await,
         Some(Commands::Groups { json }) => cmd_groups(json).await,
         Some(Commands::Config(c)) => cmd_config(c),
         Some(Commands::TuiSnapshot {
@@ -100,13 +104,53 @@ fn load_config() -> Arc<config::Config> {
     Arc::new(cfg)
 }
 
-async fn gather(cfg: Arc<config::Config>, tier: Tier, no_cache: bool) -> Result<Vec<RepoStatus>> {
+async fn gather(
+    cfg: Arc<config::Config>,
+    tier: Tier,
+    no_cache: bool,
+    fetch: Fetch,
+) -> Result<Vec<RepoStatus>> {
     if no_cache {
         let _ = cache::clear();
     }
-    let fleet = probe::sweep(cfg, tier, None).await?;
+    announce_fetch(&fetch);
+    let fleet = probe::sweep(cfg, tier, fetch, None).await?;
     print_scan_note(&fleet.timings);
+    print_fetch_note(&fleet.timings);
     Ok(fleet.repos)
+}
+
+/// A fetch across a few hundred remotes is not instant and not free, so say
+/// it's happening before it starts rather than leaving the terminal silent.
+fn announce_fetch(fetch: &Fetch) {
+    match fetch {
+        Fetch::Skip => {}
+        Fetch::All => eprintln!("drydock: fetching every repo with a remote..."),
+        Fetch::Group(group) => eprintln!("drydock: fetching the {group} group..."),
+    }
+}
+
+/// Say what the fetch phase managed, on stderr so it never contaminates piped
+/// output. Failures are worth a word: a repo that couldn't be reached still
+/// reports whatever its last fetch left, and silently passing that off as
+/// checked is the thing this whole flag exists to stop.
+fn print_fetch_note(timings: &probe::Timings) {
+    if timings.fetched == 0 {
+        return;
+    }
+    let failed = if timings.fetch_failed > 0 {
+        format!(
+            ", {} could not be reached and still show their last known counts",
+            timings.fetch_failed
+        )
+    } else {
+        String::new()
+    };
+    eprintln!(
+        "drydock: fetched {} repos in {}{failed}",
+        timings.fetched,
+        fmt::duration(timings.fetch)
+    );
 }
 
 /// A sweep across hundreds of repos takes a moment. Say what it cost, on
@@ -166,6 +210,18 @@ fn build_query(args: &ListArgs) -> Result<Query> {
     Ok(query)
 }
 
+/// What `--fetch` means for one `list` invocation. Narrowed to `--group` when
+/// there is one: the rows outside it aren't going to be printed, so fetching
+/// them is a few hundred network round trips spent on output nobody asked
+/// for.
+fn list_fetch(args: &ListArgs) -> Fetch {
+    match (args.fetch, &args.group) {
+        (false, _) => Fetch::Skip,
+        (true, Some(group)) => Fetch::Group(group.clone()),
+        (true, None) => Fetch::All,
+    }
+}
+
 async fn cmd_list(args: ListArgs) -> Result<()> {
     let cfg = load_config();
     let query = build_query(&args)?;
@@ -181,7 +237,7 @@ async fn cmd_list(args: ListArgs) -> Result<()> {
         repos
     } else {
         let tier = if args.fast { Tier::Refs } else { Tier::Full };
-        gather(cfg, tier, args.no_cache).await?
+        gather(cfg, tier, args.no_cache, list_fetch(&args)).await?
     };
 
     let now = git::now_unix();
@@ -244,7 +300,7 @@ async fn cmd_status(path: Option<String>, json: bool) -> Result<()> {
 
 async fn cmd_releasable(min_commits: u32, include_changelog: bool, json: bool) -> Result<()> {
     let cfg = load_config();
-    let repos = gather(cfg, Tier::Full, false).await?;
+    let repos = gather(cfg, Tier::Full, false, Fetch::Skip).await?;
     let now = git::now_unix();
 
     let mut selected: Vec<&RepoStatus> = repos
@@ -356,23 +412,36 @@ async fn cmd_releasable(min_commits: u32, include_changelog: bool, json: bool) -
     Ok(())
 }
 
-async fn cmd_scan(fast: bool, no_cache: bool) -> Result<()> {
+async fn cmd_scan(fast: bool, no_cache: bool, fetch: bool) -> Result<()> {
     let cfg = load_config();
     if no_cache {
         let _ = cache::clear();
     }
+    let fetch = if fetch { Fetch::All } else { Fetch::Skip };
+    announce_fetch(&fetch);
     let tier = if fast { Tier::Refs } else { Tier::Full };
-    let fleet = probe::sweep(cfg, tier, None).await?;
+    let fetched = fetch != Fetch::Skip;
+    let fleet = probe::sweep(cfg, tier, fetch, None).await?;
     println!("{}", report::summary(&fleet.repos, Some(&fleet.timings)));
     if fast {
         println!("Working trees were not scanned (--fast).");
+    }
+    print_fetch_note(&fleet.timings);
+    if !fetched {
+        let never = fleet.repos.iter().filter(|r| r.never_fetched()).count();
+        if never > 0 {
+            println!(
+                "{never} repos have never fetched, so their behind counts are unchecked. \
+                 Run `drydock scan --fetch` to check them."
+            );
+        }
     }
     Ok(())
 }
 
 async fn cmd_groups(json: bool) -> Result<()> {
     let cfg = load_config();
-    let repos = gather(cfg, Tier::Full, false).await?;
+    let repos = gather(cfg, Tier::Full, false, Fetch::Skip).await?;
     if json {
         let now = git::now_unix();
         let views: Vec<_> = repos.iter().map(|r| report::view(r, now)).collect();

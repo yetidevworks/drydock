@@ -21,8 +21,9 @@ Written in Rust. Works on macOS and Linux.
 
 Colour carries the state, so the rows worth acting on stand out without reading
 a word: yellow for uncommitted changes, cyan for commits you haven't pushed,
-magenta for commits past the last tag, red for conflicts and half-finished
-merges, and everything clean dimmed out of the way.
+bold light red for commits waiting on the remote, magenta for commits past the
+last tag, red for conflicts and half-finished merges, and everything clean
+dimmed out of the way.
 
 ## What it answers
 
@@ -100,11 +101,22 @@ current directory, so it behaves the same wherever you invoke it.
 | `[` `]` | step through groups |
 | `1` `2` `3` `4` | touched in the last hour, day, week, month · `0` any age |
 | `s` `S` | cycle the sort key · reverse it |
-| `o` `t` `T` | open in your editor, git client, or a terminal |
+| `o` `O` | show the folder in Finder · open in your editor |
+| `t` | open in your git client |
+| `T` `ctrl-o` | open a terminal there |
 | `w` `y` | open the remote in a browser · copy the path |
 | `f` `F` | fetch the selected repo · everything on screen |
+| `ctrl-f` | fetch **every** repo in the fleet, whatever is filtered or scrolled off |
 | `C` | choose which columns to show |
-| `R` | rescan now · `?` help, with a legend for every marker on screen · `q` quit |
+| `R` `ctrl-r` | rescan now — the local twin of `ctrl-f` |
+| `?` `q` | help, with a legend for every marker on screen · quit |
+
+Hold shift or ctrl and the hints along the bottom change to what *those* keys
+would do — `o finder` becomes `O editor`, ctrl shows `^o terminal` and the rest
+of its row. That needs a terminal which reports a modifier being held on its
+own (the kitty keyboard protocol: kitty, Ghostty, WezTerm, iTerm2 3.5+, foot).
+Anywhere else the footer is the static list it always was, and `?` still lists
+everything.
 
 ### Commands
 
@@ -112,9 +124,12 @@ current directory, so it behaves the same wherever you invoke it.
 drydock list --dirty --since 1d              # a table, then exit
 drydock list --unpushed --group acme --json  # machine-readable
 drydock list --cached                        # last known state, no probing (~5ms)
+drydock list --behind --fetch                # check every remote, then show what's behind
+drydock list --behind --fetch -g acme        # ...just that group's remotes
 drydock releasable --min-commits 3           # what's worth a release pass
 drydock status .                             # everything about one repo
 drydock scan                                 # refresh the cache
+drydock scan --fetch                         # ...checking the remotes as it goes
 drydock groups                               # per-group tallies
 drydock config init                          # write a config file
 ```
@@ -126,6 +141,9 @@ to drive a status line.
 
 `--dirty` `--unpushed` `--behind` `--conflicted` `--in-progress` `--detached`
 `--no-remote` `--no-upstream` `--stashed` `--clean` `--errored`
+
+`--behind` reads what your last fetch left behind; add `--fetch` to check the
+remotes first.
 
 Release state: `--unreleased` (never tagged), `--needs-release`, `--released`.
 
@@ -182,10 +200,39 @@ Ahead and behind counts come from remote-tracking refs you have **already
 fetched**, so no network access is involved and they are safe to recompute
 constantly. That also means **"behind" is only as fresh as your last fetch**.
 
+Which is why a repo nothing has ever fetched shows `?` in BEHIND rather than
+`·`. Zero there would say "in sync", and for a repo that has never fetched
+that's a claim nobody checked — the count is zero because there was nothing to
+compare against. The header counts them: `57 behind · 59 never fetched`.
+
 Fetching is off by default, because it is real traffic against every remote you
-own and a remote that wants credentials can hang. Press `f` to fetch the
-selected repo, `F` for everything on screen, or set `remote.fetch = true` to
-have it happen on a timer.
+own and a remote that wants credentials can hang. To do it:
+
+| | |
+|---|---|
+| `f` `F` `ctrl-f` | in the dashboard: the selected repo, everything on screen, the whole fleet |
+| `--fetch` | on `drydock list` and `drydock scan`, before anything is probed |
+| `remote.fetch = true` | on a timer, every `remote.interval` |
+
+Every one of those is bounded by `remote.concurrency` (4 by default — raise it
+if you're fetching hundreds and can wait less), capped per repo by
+`remote.timeout`, and refuses credential prompts rather than letting one hang.
+A remote that can't be reached leaves that repo's counts exactly as stale as
+they were, and says so rather than passing them off as checked.
+
+`drydock list --fetch` narrows to `--group` when you pass one, so
+`--group acme --behind --fetch` is thirty fetches rather than five hundred.
+
+Tags come along with a fetch, by git's ordinary auto-follow. They have to: the
+release half of the table is built on them, so a tag pushed from another
+machine that never arrived meant a repo went on reporting `needs release` for
+work that had already been released. Local tags are never pruned, though — a
+tag you've cut but not pushed is exactly what `needs release` exists to find.
+
+The FETCHED column, off by default, shows how long since each repo last heard
+from its remote (`never` if it never has). The detail view (`⏎`) says the same
+for whichever repo you're on. Both read git's own `FETCH_HEAD`, so a `git pull`
+you ran yourself in a terminal counts.
 
 ### Worktrees
 
@@ -271,8 +318,8 @@ columns = ["group", "repo", "branch", "state", "changes", "age"]
 ```
 
 Leave it unset and you get the defaults, which are every column except
-VISIBILITY, and VISIBILITY as well when `visibility.enabled` is on. Set it and
-you get exactly what you list, in the order you list it.
+VISIBILITY and FETCHED, and VISIBILITY as well when `visibility.enabled` is on.
+Set it and you get exactly what you list, in the order you list it.
 
 Turning VISIBILITY on in the picker turns `visibility.enabled` on with it and
 kicks off a sweep — otherwise the column could only ever say "checking off".
@@ -321,6 +368,8 @@ read_changelog = true
 [remote]
 fetch = false                # see "Ahead, behind, and the network"
 interval = "1h"
+concurrency = 4              # how many fetches run at once
+timeout = "20s"              # per repo, then it's given up on
 
 [visibility]
 enabled = false               # see "Visibility"; requires `gh`
@@ -331,9 +380,15 @@ interval = "24h"
 default_filters = []         # e.g. ["dirty", "unpushed"]
 default_sort = "activity"
 default_since = ""           # e.g. "1w"
-editor_command = ["zed", "{path}"]
-git_client_command = ["open", "-a", "Tower", "{path}"]
+editor_command = ["zed", "{path}"]              # O
+file_manager_command = ["open", "{path}"]      # o — `open -R` reveals instead
+git_client_command = ["open", "-a", "Tower", "{path}"]      # t
+terminal_command = ["open", "-a", "Terminal", "{path}"]     # T and ctrl-o
 ```
+
+Every one of those is a command template with `{path}` replaced by the repo
+root, so point them at whatever you actually use — `["open", "-a", "iTerm",
+"{path}"]` for iTerm2, `["open", "-a", "Ghostty", "{path}"]` for Ghostty.
 
 `drydock config show` prints the effective config; `drydock config path` says
 where things live.

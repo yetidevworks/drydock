@@ -245,12 +245,15 @@ pub struct UiConfig {
     pub default_sort: String,
     /// Initial "modified since" window, e.g. `1h`, `1d`, `1w`. Empty for all.
     pub default_since: String,
-    /// Command used by the `o` key. `{path}` is replaced with the repo root.
+    /// Command used by the `O` key. `{path}` is replaced with the repo root.
     pub editor_command: Vec<String>,
     /// Command used by the `t` key.
     pub git_client_command: Vec<String>,
-    /// Command used by the `T` key.
+    /// Command used by the `T` and `ctrl-o` keys.
     pub terminal_command: Vec<String>,
+    /// Command used by the `o` key. `open {path}` shows the repo's folder in
+    /// Finder; `open -R {path}` would reveal it in its parent instead.
+    pub file_manager_command: Vec<String>,
     /// Columns to show, left to right. Unset means the defaults, which
     /// include VISIBILITY only when `visibility.enabled` is on. Set it and
     /// you get exactly what you list, in that order — the `c` key in the
@@ -272,6 +275,7 @@ impl Default for UiConfig {
                 "Terminal".into(),
                 "{path}".into(),
             ],
+            file_manager_command: vec!["open".into(), "{path}".into()],
             columns: None,
         }
     }

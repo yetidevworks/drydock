@@ -532,6 +532,7 @@ mod tests {
             commits_since_tag: Some(since_tag),
             since_tag_subjects: Vec::new(),
             index_mtime: None,
+            fetched_at: None,
             remote_url: Some("git@github.com:x/y.git".into()),
             changelog: None,
             is_bare: false,

@@ -10,7 +10,8 @@ use anyhow::Result;
 use crossterm::{
     event::{
         self, DisableMouseCapture, EnableMouseCapture, Event as TermEvent, KeyCode, KeyEvent,
-        KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+        KeyEventKind, KeyModifiers, KeyboardEnhancementFlags, ModifierKeyCode, MouseButton,
+        MouseEvent, MouseEventKind, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
     },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
@@ -112,6 +113,17 @@ pub struct App {
     /// empty space, measured by the last frame that drew it. Zero when there
     /// is no overlay, or when it fits.
     pub overlay_max_scroll: u16,
+    /// Which modifier keys are held right now, so the footer can show what
+    /// they'd do. Only ever non-empty when [`App::modifier_events`] is set:
+    /// without the keyboard protocol a modifier is only seen alongside the key
+    /// it modified, and the footer would latch on the last one pressed and
+    /// stay wrong until something else was typed.
+    pub mods: KeyModifiers,
+    /// Whether this terminal reports modifier keys being pressed and released
+    /// on their own (the kitty keyboard protocol: kitty, Ghostty, WezTerm,
+    /// iTerm2 3.5+, foot). Apple Terminal doesn't, and there the footer stays
+    /// the static list it always was.
+    pub modifier_events: bool,
     pub should_quit: bool,
 }
 
@@ -147,6 +159,8 @@ impl App {
             columns,
             column_cursor: 0,
             overlay_max_scroll: 0,
+            mods: KeyModifiers::NONE,
+            modifier_events: false,
             mode: Mode::Normal,
             search_input: String::new(),
             message: None,
@@ -487,9 +501,10 @@ pub async fn run() -> Result<()> {
         ));
     }
 
-    let mut terminal = setup_terminal()?;
+    let (mut terminal, modifier_events) = setup_terminal()?;
+    app.modifier_events = modifier_events;
     let result = run_loop(&mut terminal, &mut app).await;
-    restore_terminal(&mut terminal)?;
+    restore_terminal(&mut terminal, modifier_events)?;
     result
 }
 
@@ -607,8 +622,21 @@ async fn run_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut A
                     dirty = true;
                 }
             }
-            Input::Term(TermEvent::Key(key)) if key.kind == KeyEventKind::Press => {
-                handle_key(app, key, &tx);
+            Input::Term(TermEvent::Key(key)) => {
+                // Every key event carries the modifier state, and with the
+                // protocol on, the modifiers arrive as events of their own.
+                // Tracked before dispatch so the footer is right in the same
+                // frame as whatever the key did.
+                track_modifiers(app, &key);
+                // Repeat counts as press. Without the keyboard protocol a held
+                // key just sends more presses, but `REPORT_EVENT_TYPES` splits
+                // them out -- so ignoring them would mean holding `j` scrolled
+                // exactly one row in the terminals this feature is for.
+                if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
+                    && !matches!(key.code, KeyCode::Modifier(_))
+                {
+                    handle_key(app, key, &tx);
+                }
                 dirty = true;
             }
             Input::Term(TermEvent::Resize(_, _)) => {
@@ -727,7 +755,7 @@ fn start_sweep(app: &mut App, tx: &mpsc::UnboundedSender<Input>, tier: Tier) {
                 }
             }
         });
-        if let Err(err) = probe::sweep(cfg, tier, Some(ptx)).await {
+        if let Err(err) = probe::sweep(cfg, tier, probe::Fetch::Skip, Some(ptx)).await {
             tracing::warn!(error = %format!("{err:#}"), "sweep failed");
         }
         let _ = forward.await;
@@ -827,7 +855,65 @@ fn handle_mouse(app: &mut App, ev: MouseEvent, size: Option<Size>) {
     }
 }
 
+/// Keep [`App::mods`] in step with what's actually held down.
+///
+/// A modifier key reports as its own press and release; anything else carries
+/// the modifiers that were down when it was typed. Both are used: the first
+/// is what makes holding shift alone change the footer, the second keeps the
+/// state honest if a press is somehow missed.
+///
+/// Does nothing at all unless the terminal reports modifier keys, since
+/// otherwise the only sighting of shift is the `O` you just typed, and the
+/// footer would sit there claiming shift was held long after it wasn't.
+fn track_modifiers(app: &mut App, key: &KeyEvent) {
+    if !app.modifier_events {
+        return;
+    }
+    match key.code {
+        KeyCode::Modifier(which) => {
+            let flag = match which {
+                ModifierKeyCode::LeftShift | ModifierKeyCode::RightShift => KeyModifiers::SHIFT,
+                ModifierKeyCode::LeftControl | ModifierKeyCode::RightControl => {
+                    KeyModifiers::CONTROL
+                }
+                ModifierKeyCode::LeftAlt | ModifierKeyCode::RightAlt => KeyModifiers::ALT,
+                ModifierKeyCode::LeftSuper | ModifierKeyCode::RightSuper => KeyModifiers::SUPER,
+                _ => return,
+            };
+            match key.kind {
+                KeyEventKind::Press | KeyEventKind::Repeat => app.mods.insert(flag),
+                KeyEventKind::Release => app.mods.remove(flag),
+            }
+        }
+        // A released key reports the modifiers that were down for the press,
+        // which is history by the time it arrives.
+        _ if key.kind == KeyEventKind::Release => {}
+        _ => app.mods = key.modifiers,
+    }
+}
+
+/// Fold a held shift into the character itself, so `O` means `O`.
+///
+/// Under the kitty protocol a shifted letter can arrive as the unshifted
+/// codepoint with a shift flag beside it, which no `KeyCode::Char('O')` arm
+/// would ever match. Every binding in here is written as the character you
+/// actually type, so this puts the event back into that shape rather than
+/// making each arm ask about modifiers.
+fn normalise_shift(mut key: KeyEvent) -> KeyEvent {
+    if key.modifiers.contains(KeyModifiers::SHIFT) {
+        if let KeyCode::Char(c) = key.code {
+            if let Some(upper) = c.to_uppercase().next() {
+                if upper != c {
+                    key.code = KeyCode::Char(upper);
+                }
+            }
+        }
+    }
+    key
+}
+
 fn handle_key(app: &mut App, key: KeyEvent, tx: &mpsc::UnboundedSender<Input>) {
+    let key = normalise_shift(key);
     if key.modifiers.contains(KeyModifiers::CONTROL) {
         match key.code {
             KeyCode::Char('c') => {
@@ -837,6 +923,18 @@ fn handle_key(app: &mut App, key: KeyEvent, tx: &mpsc::UnboundedSender<Input>) {
             KeyCode::Char('r') => {
                 start_sweep(app, tx, Tier::Full);
                 app.notify("Rescanning");
+                return;
+            }
+            // Beside ctrl-r because they're the pair: one re-reads every repo
+            // on disk, the other re-checks every repo against its remote.
+            KeyCode::Char('f') => {
+                fetch_fleet(app, tx);
+                return;
+            }
+            // The third of the o-family: `o` Finder, `O` editor, `ctrl-o`
+            // terminal. `T` still does the same thing.
+            KeyCode::Char('o') => {
+                open_terminal(app);
                 return;
             }
             KeyCode::Char('d') => {
@@ -897,7 +995,9 @@ fn handle_key(app: &mut App, key: KeyEvent, tx: &mpsc::UnboundedSender<Input>) {
             KeyCode::Char('k') | KeyCode::Up => app.scroll_overlay(-1),
             KeyCode::PageDown => app.detail_scroll = app.detail_scroll.saturating_add(10),
             KeyCode::PageUp => app.detail_scroll = app.detail_scroll.saturating_sub(10),
-            KeyCode::Char('o') => open_editor(app),
+            KeyCode::Char('o') => open_file_manager(app),
+            KeyCode::Char('O') => open_editor(app),
+            KeyCode::Char('T') => open_terminal(app),
             KeyCode::Char('t') => open_git_client(app),
             KeyCode::Char('y') => copy_path(app),
             _ => {}
@@ -1001,7 +1101,10 @@ fn handle_normal_key(app: &mut App, key: KeyEvent, tx: &mpsc::UnboundedSender<In
         }
 
         // Handing off to other tools.
-        KeyCode::Char('o') => open_editor(app),
+        // `o` is the one you reach for most, so it's the file manager; the
+        // editor is a shift away.
+        KeyCode::Char('o') => open_file_manager(app),
+        KeyCode::Char('O') => open_editor(app),
         KeyCode::Char('t') => open_git_client(app),
         KeyCode::Char('T') => open_terminal(app),
         KeyCode::Char('w') => open_remote(app),
@@ -1056,6 +1159,40 @@ fn fetch_visible(app: &mut App, tx: &mpsc::UnboundedSender<Input>) {
     }
     app.notify(format!("Fetching {} repos", roots.len()));
     spawn_fetch(app, tx, roots);
+}
+
+/// Fetch every repo in the fleet, filters and scrolling irrelevant.
+///
+/// `F` fetches what's on screen, which is the right default -- it's bounded by
+/// what you're looking at. But the repos worth knowing about are exactly the
+/// ones you aren't looking at: a repo you haven't filtered to, haven't
+/// scrolled to, and haven't thought about is where an unnoticed upstream
+/// change sits. This is the one that checks those.
+fn fetch_fleet(app: &mut App, tx: &mpsc::UnboundedSender<Input>) {
+    let roots = fleet_roots(app);
+    if roots.is_empty() {
+        app.notify("Nothing in the fleet has a remote");
+        return;
+    }
+    app.notify(format!(
+        "Fetching all {} repos with a remote, rows update as they land",
+        roots.len()
+    ));
+    spawn_fetch(app, tx, roots);
+}
+
+/// Every repo with a remote, `app.visible` deliberately not consulted.
+fn fleet_roots(app: &App) -> Vec<PathBuf> {
+    app.repos
+        .iter()
+        .filter(|r| {
+            r.refs
+                .as_ref()
+                .and_then(|refs| refs.remote_url.as_ref())
+                .is_some()
+        })
+        .map(|r| r.root.clone())
+        .collect()
 }
 
 fn spawn_fetch(app: &App, tx: &mpsc::UnboundedSender<Input>, roots: Vec<PathBuf>) {
@@ -1158,6 +1295,14 @@ fn open_terminal(app: &mut App) {
     spawn_command(app, &template, &path, "terminal");
 }
 
+fn open_file_manager(app: &mut App) {
+    let Some(path) = app.current().map(|r| r.root.clone()) else {
+        return;
+    };
+    let template = app.cfg.ui.file_manager_command.clone();
+    spawn_command(app, &template, &path, "Finder");
+}
+
 /// Open the repo's remote in a browser, converting an SSH remote to its https
 /// equivalent first.
 fn open_remote(app: &mut App) {
@@ -1216,15 +1361,53 @@ fn copy_path(app: &mut App) {
 // Terminal lifecycle and headless rendering
 // ---------------------------------------------------------------------------
 
-fn setup_terminal() -> Result<Terminal<CrosstermBackend<Stdout>>> {
+/// Returns the terminal, and whether it reports modifier keys on their own.
+fn setup_terminal() -> Result<(Terminal<CrosstermBackend<Stdout>>, bool)> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
-    Ok(Terminal::new(CrosstermBackend::new(stdout))?)
+
+    // Standalone modifier keys are only reported under the kitty keyboard
+    // protocol, and only with `REPORT_ALL_KEYS_AS_ESCAPE_CODES` -- the spec is
+    // explicit that a bare shift is invisible without it. Both flags together,
+    // or neither: asking for event types alone would buy nothing.
+    //
+    // Terminals that don't support it are left exactly as they were. This is
+    // the whole reason the footer's live hints are a nicety rather than the
+    // only way to learn a key: `?` lists everything, whatever you're running.
+    let modifier_events = crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false);
+    if modifier_events {
+        let _ = execute!(
+            stdout,
+            PushKeyboardEnhancementFlags(
+                KeyboardEnhancementFlags::REPORT_EVENT_TYPES
+                    | KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES
+                    // Without this, a shifted key arrives as its *unshifted*
+                    // codepoint plus a shift flag -- `shift+o` as `o`, not
+                    // `O` -- and every uppercase binding here would stop
+                    // working the moment the protocol was on. See
+                    // [`normalise_shift`], which covers it even if a terminal
+                    // accepts the flag and then doesn't honour it.
+                    | KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS
+            )
+        );
+    }
+    Ok((
+        Terminal::new(CrosstermBackend::new(stdout))?,
+        modifier_events,
+    ))
 }
 
-fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
+fn restore_terminal(
+    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    modifier_events: bool,
+) -> Result<()> {
     disable_raw_mode()?;
+    // Popped before leaving the alternate screen, so the flags don't outlive
+    // the dashboard and leave the shell that follows reading keys differently.
+    if modifier_events {
+        let _ = execute!(terminal.backend_mut(), PopKeyboardEnhancementFlags);
+    }
     execute!(
         terminal.backend_mut(),
         LeaveAlternateScreen,
@@ -1259,7 +1442,7 @@ pub async fn snapshot(width: u16, height: u16, view: &str) -> Result<String> {
 
     if app.repos.is_empty() {
         // Nothing cached, so probe enough to render something real.
-        let fleet = probe::sweep(cfg, Tier::Full, None).await?;
+        let fleet = probe::sweep(cfg, Tier::Full, probe::Fetch::Skip, None).await?;
         app.repos = fleet.repos;
         app.timings = fleet.timings;
         app.reindex();
@@ -1268,6 +1451,10 @@ pub async fn snapshot(width: u16, height: u16, view: &str) -> Result<String> {
     app.recompute();
 
     match view {
+        // The footer changes with what's held down, and holding a key is the
+        // one thing a snapshot can't do on its own.
+        "shift" => app.mods = KeyModifiers::SHIFT,
+        "ctrl" => app.mods = KeyModifiers::CONTROL,
         "help" => app.mode = Mode::Help,
         "detail" => app.mode = Mode::Detail,
         "columns" => app.mode = Mode::Columns,
@@ -1339,6 +1526,118 @@ mod tests {
         app
     }
 
+    // Holding shift should say what shift does. The terminal that can't
+    // report a bare modifier keeps `mods` empty and gets the plain row, which
+    // is the same row it always had.
+    #[test]
+    fn the_footer_follows_the_modifier_being_held() {
+        let mut app = app_with(1);
+        let plain = crate::tui::ui::key_hints(&app);
+        assert!(plain.iter().any(|(k, what)| *k == "o" && *what == "finder"));
+
+        app.mods = KeyModifiers::SHIFT;
+        let shifted = crate::tui::ui::key_hints(&app);
+        assert!(shifted
+            .iter()
+            .any(|(k, what)| *k == "O" && *what == "editor"));
+
+        app.mods = KeyModifiers::CONTROL;
+        let ctrl = crate::tui::ui::key_hints(&app);
+        assert!(ctrl
+            .iter()
+            .any(|(k, what)| *k == "^o" && *what == "terminal"));
+
+        // Both down is a chord in progress; ctrl's bindings are the same in
+        // every mode, so showing them is never wrong.
+        app.mods = KeyModifiers::SHIFT | KeyModifiers::CONTROL;
+        assert_eq!(crate::tui::ui::key_hints(&app), ctrl);
+    }
+
+    // A terminal that reports the unshifted codepoint with a shift flag would
+    // otherwise miss every uppercase binding in the dashboard.
+    #[test]
+    fn a_shifted_letter_is_the_letter_you_typed() {
+        let shifted = normalise_shift(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::SHIFT));
+        assert_eq!(shifted.code, KeyCode::Char('O'));
+
+        // Terminals that send the shifted key directly are already right.
+        let already = normalise_shift(KeyEvent::new(KeyCode::Char('O'), KeyModifiers::SHIFT));
+        assert_eq!(already.code, KeyCode::Char('O'));
+
+        // Nothing else is touched: ctrl-f is not ctrl-F.
+        let ctrl = normalise_shift(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL));
+        assert_eq!(ctrl.code, KeyCode::Char('f'));
+    }
+
+    // Without the keyboard protocol the only sighting of shift is the `O` you
+    // just typed, and a latched footer would claim it was still held.
+    #[test]
+    fn modifiers_are_not_tracked_when_the_terminal_cannot_report_them() {
+        let mut app = app_with(1);
+        app.modifier_events = false;
+        track_modifiers(
+            &mut app,
+            &KeyEvent::new(KeyCode::Char('O'), KeyModifiers::SHIFT),
+        );
+        assert_eq!(app.mods, KeyModifiers::NONE);
+
+        app.modifier_events = true;
+        track_modifiers(
+            &mut app,
+            &KeyEvent::new(KeyCode::Char('O'), KeyModifiers::SHIFT),
+        );
+        assert_eq!(app.mods, KeyModifiers::SHIFT);
+
+        // Letting go of shift itself clears it.
+        let mut release = KeyEvent::new(
+            KeyCode::Modifier(ModifierKeyCode::LeftShift),
+            KeyModifiers::SHIFT,
+        );
+        release.kind = KeyEventKind::Release;
+        track_modifiers(&mut app, &release);
+        assert_eq!(app.mods, KeyModifiers::NONE);
+    }
+
+    /// The whole point of ctrl-f over `F`: the repo you can't see is exactly
+    /// the one whose upstream changes you don't know about.
+    #[test]
+    fn the_fleet_fetch_ignores_what_is_filtered_or_scrolled_away() {
+        let mut app = app_with(3);
+        for (i, repo) in app.repos.iter_mut().enumerate() {
+            let mut refs = crate::model::RefsInfo {
+                head: crate::model::Head::Branch("main".into()),
+                branches: Vec::new(),
+                last_commit: None,
+                stashes: 0,
+                operation: None,
+                newest_tag: None,
+                described_tag: None,
+                commits_since_tag: None,
+                since_tag_subjects: Vec::new(),
+                tags_orphaned: false,
+                index_mtime: None,
+                fetched_at: None,
+                remote_url: Some(format!("git@github.com:owner/r{i}.git")),
+                changelog: None,
+                is_bare: false,
+                is_shallow: false,
+            };
+            // The last one has no remote, so there's nothing to fetch from.
+            if i == 2 {
+                refs.remote_url = None;
+            }
+            repo.refs = Some(refs);
+        }
+        // Only one row is on screen. `F` would fetch that one.
+        app.visible = vec![0];
+
+        let roots = fleet_roots(&app);
+        assert_eq!(
+            roots,
+            vec![PathBuf::from("/p/g/r0"), PathBuf::from("/p/g/r1")]
+        );
+    }
+
     fn cursor_on(app: &App) -> Column {
         app.picker_rows()[app.column_cursor].0
     }
@@ -1352,13 +1651,17 @@ mod tests {
         assert_eq!(rows.len(), Column::all().len(), "every column is listed");
         let shown: Vec<Column> = rows.iter().filter(|(_, on)| *on).map(|(c, _)| *c).collect();
         assert_eq!(shown, app.columns);
-        // Both visibility forms sit in the hidden section by default.
+        // Both visibility forms and FETCHED sit in the hidden section by
+        // default -- the three opt-in columns.
         let hidden: Vec<Column> = rows
             .iter()
             .filter(|(_, on)| !*on)
             .map(|(c, _)| *c)
             .collect();
-        assert_eq!(hidden, vec![Column::Visibility, Column::VisibilityShort]);
+        assert_eq!(
+            hidden,
+            vec![Column::Visibility, Column::VisibilityShort, Column::Fetched]
+        );
     }
 
     // Turning a column back on should put it where the defaults have it, not

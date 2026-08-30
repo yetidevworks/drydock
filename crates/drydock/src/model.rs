@@ -128,6 +128,13 @@ pub struct RefsInfo {
     #[serde(default)]
     pub tags_orphaned: bool,
     pub index_mtime: Option<i64>,
+    /// When this repo last fetched, from `FETCH_HEAD`. `None` means it never
+    /// has, which is what makes a zero "behind" count meaningless rather than
+    /// reassuring. Deserializes to `None` for cache entries written before
+    /// this field existed -- the same "never checked" state, so no cache
+    /// version bump was needed.
+    #[serde(default)]
+    pub fetched_at: Option<i64>,
     pub remote_url: Option<String>,
     pub changelog: Option<ChangelogInfo>,
     pub is_bare: bool,
@@ -571,6 +578,27 @@ impl RepoStatus {
 
     pub fn behind_total(&self) -> u32 {
         self.refs.as_ref().map(|r| r.unpulled()).unwrap_or(0)
+    }
+
+    /// When anything last fetched this repo, or `None` if nothing ever has.
+    pub fn fetched_at(&self) -> Option<i64> {
+        self.refs.as_ref().and_then(|r| r.fetched_at)
+    }
+
+    /// True when this repo has a remote worth asking about and nobody has
+    /// ever asked.
+    ///
+    /// The distinction the "behind" column exists to draw. Zero behind reads
+    /// as "in sync", and for a repo that has never fetched that is a claim
+    /// nothing checked: the count is zero because there are no remote-tracking
+    /// refs to compare against, not because the remote has nothing new. A repo
+    /// with no remote at all is not in this state -- there is nothing to be
+    /// behind.
+    pub fn never_fetched(&self) -> bool {
+        match self.refs.as_ref() {
+            Some(refs) => refs.remote_url.is_some() && refs.fetched_at.is_none(),
+            None => false,
+        }
     }
 
     pub fn commits_since_tag(&self) -> u32 {

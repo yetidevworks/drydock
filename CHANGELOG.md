@@ -1,9 +1,19 @@
 # 1.1.0
 
-## 08/28/2026
+## 08/30/2026
 
 1. [](#new)
+    * **`--fetch` on `drydock list` and `drydock scan`.** Behind counts are read from remote-tracking refs, so they were only ever as fresh as your last fetch, and nothing outside the dashboard could refresh them — `drydock list --behind` reported whatever was on disk. `--fetch` runs a network phase before anything is probed, bounded by `remote.concurrency` and capped per repo by `remote.timeout`, and says how many repos it reached. On `list` it narrows to `--group` when you pass one, so `--group acme --behind --fetch` is thirty fetches rather than five hundred.
+    * **`ctrl-f` fetches the whole fleet** in the dashboard. `F` fetches what's on screen, which is bounded by what you're looking at — but the repos worth knowing about are the ones you *aren't* looking at, filtered out or scrolled past. `ctrl-f` is to the remotes what `ctrl-r` is to the disk, and it's in the footer beside it.
+    * A `FETCHED` column, off by default, showing how long since each repo last heard from its remote, and `never` when it never has. The detail view says the same for the repo you're on. Both read git's own `FETCH_HEAD`, so a `git pull` you ran yourself in a terminal counts. `fetched_at` and `never_fetched` are in `--json` too.
+    * **`o` shows a repo's folder in Finder**, with the editor moved to `O` — `o` is the one you reach for most. `ctrl-o` opens a terminal there, the same as `T`. The new `[ui] file_manager_command` is a `{path}` template like the other three, so `open -R {path}` reveals the folder in its parent instead, and it's whatever you use on a machine that isn't a Mac.
+    * **The footer hints follow the modifier you're holding.** Hold shift and `o finder` becomes `O editor`, alongside `T terminal`, `F fetch screen` and the rest of the uppercase row; hold ctrl and you get `^o terminal`, `^f fetch all`, `^r rescan`, `^d/^u half page`, `^c quit`. Needs a terminal that reports a bare modifier — the kitty keyboard protocol, so kitty, Ghostty, WezTerm, iTerm2 3.5+, foot — and anywhere else the footer stays exactly as it was. Turning that protocol on also means a shifted letter can arrive as its unshifted codepoint with a flag beside it, and that key repeats stop counting as presses, so both are folded back into the shape the bindings are written in.
     * A `visibility` sort key that groups the table by what each repo's visibility check found — a failed check first, then the private repos, then the public ones, then everything with no checked answer — which the `s` key only stops on once visibility checking is turned on, while `--sort visibility` and `default_sort = "visibility"` are honoured either way.
+2. [](#improved)
+    * **A repo nothing has ever fetched now shows `?` in BEHIND, not `·`.** Zero there reads as "in sync", and for a repo that has never fetched that's a claim nobody checked — the count is zero because there were no remote-tracking refs to compare against, not because the remote had nothing new. The header counts them alongside the rest: `57 behind · 59 never fetched`.
+    * **The behind count is bold light red now** rather than the grey used for "nothing to say". It's its own axis: unpushed work is still in your hands, but commits sitting on the remote block whatever you do next until you pull them, and a repo twelve commits behind used to read as quiet as a clean one. Branch tracking lines in the detail view pick up the same colour.
+    * `f` and `F` are in the `?` help now, under a "Checking the remotes" section with `ctrl-f`. They were documented only in the README, which is a poor place for the keys that decide whether BEHIND means anything.
+    * A fetch no longer passes `--no-tags`. Tags come along by git's ordinary auto-follow, because the release half of the table is built on them: a tag pushed from another machine never arrived, so a repo went on reporting `needs release` for work that had already been released. Local tags are still never pruned — a tag you've cut but not pushed is exactly what `needs release` exists to find.
 
 # 1.0.0
 

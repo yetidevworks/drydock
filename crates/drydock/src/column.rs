@@ -31,6 +31,9 @@ pub enum Column {
     Changes,
     Ahead,
     Behind,
+    /// How long since anything fetched this repo. The freshness date on the
+    /// BEHIND column beside it.
+    Fetched,
     Tag,
     SinceTag,
     Age,
@@ -62,6 +65,7 @@ impl Column {
             Column::Changes,
             Column::Ahead,
             Column::Behind,
+            Column::Fetched,
             Column::Tag,
             Column::SinceTag,
             Column::Age,
@@ -80,6 +84,11 @@ impl Column {
             // glyphs before a column of bare glyphs is an improvement.
             .filter(|c| *c != Column::VisibilityShort)
             .filter(|c| *c != Column::Visibility || visibility_enabled)
+            // FETCHED is opt-in too: BEHIND already says `?` when nothing has
+            // ever fetched, which is the part you have to know. The exact age
+            // of the last fetch is for people who want to watch it, and it's
+            // in the detail pane for everyone else.
+            .filter(|c| *c != Column::Fetched)
             .collect()
     }
 
@@ -96,6 +105,7 @@ impl Column {
             Column::Changes => "changes",
             Column::Ahead => "ahead",
             Column::Behind => "behind",
+            Column::Fetched => "fetched",
             Column::Tag => "tag",
             Column::SinceTag => "since_tag",
             Column::Age => "age",
@@ -121,6 +131,7 @@ impl Column {
             Column::Changes => "CHANGES",
             Column::Ahead => "AHEAD",
             Column::Behind => "BEHIND",
+            Column::Fetched => "FETCHED",
             Column::Tag => "TAG",
             Column::SinceTag => "+TAG",
             Column::Age => "AGE",
@@ -139,7 +150,8 @@ impl Column {
             Column::VisibilityShort => "the same, as just its marker: ● public, ⊘ private",
             Column::Changes => "staged, unstaged and untracked counts",
             Column::Ahead => "commits not pushed to the upstream",
-            Column::Behind => "commits on the upstream and not here",
+            Column::Behind => "commits on the upstream and not here, ? if never fetched",
+            Column::Fetched => "how long since anything fetched this repo",
             Column::Tag => "the newest tag",
             Column::SinceTag => "commits since that tag",
             Column::Age => "time since the last activity",
@@ -148,7 +160,9 @@ impl Column {
 
     pub fn align(&self) -> Align {
         match self {
-            Column::Ahead | Column::Behind | Column::SinceTag | Column::Age => Align::Right,
+            Column::Ahead | Column::Behind | Column::SinceTag | Column::Age | Column::Fetched => {
+                Align::Right
+            }
             _ => Align::Left,
         }
     }
@@ -172,6 +186,8 @@ impl Column {
             Column::Changes => Width::Fixed(12),
             Column::Ahead => Width::Fixed(6),
             Column::Behind => Width::Fixed(7),
+            // "never" is 5, the header is 7, and one more leaves a gutter.
+            Column::Fetched => Width::Fixed(8),
             Column::Tag => Width::Fixed(14),
             Column::SinceTag => Width::Fixed(5),
             Column::Age => Width::Fixed(5),
@@ -222,11 +238,33 @@ impl Column {
                     }
                 }),
             Column::Ahead => fmt::count(repo.unpushed_total()),
-            Column::Behind => fmt::count(repo.behind_total()),
+            // `?` rather than `·` when nothing has ever fetched: the count is
+            // zero because there was nothing to compare against, not because
+            // the remote has nothing new. Same reading as CHANGES' `?`.
+            Column::Behind => {
+                if repo.behind_total() == 0 && repo.never_fetched() {
+                    "?".into()
+                } else {
+                    fmt::count(repo.behind_total())
+                }
+            }
+            Column::Fetched => fetched_label(repo, now),
             Column::Tag => fmt::truncate(&repo.tag_label(), 18),
             Column::SinceTag => fmt::count(repo.commits_since_tag()),
             Column::Age => fmt::age(repo.activity_at(), now),
         }
+    }
+}
+
+/// The FETCHED cell, and the same wording the detail pane uses. `never` is a
+/// worse state than an old fetch, not a missing value, so it gets a word
+/// rather than the `·` that means "nothing to say here" -- which is what a
+/// repo with no remote does get.
+pub fn fetched_label(repo: &RepoStatus, now: i64) -> String {
+    match repo.fetched_at() {
+        Some(at) => fmt::age(at, now),
+        None if repo.never_fetched() => "never".into(),
+        None => "·".into(),
     }
 }
 
@@ -316,13 +354,57 @@ mod tests {
             let shown = Column::defaults(enabled);
             for column in Column::all() {
                 // Both visibility forms are conditional: the long one on the
-                // flag, the short one on being asked for.
-                if matches!(column, Column::Visibility | Column::VisibilityShort) {
+                // flag, the short one on being asked for. FETCHED is opt-in
+                // for the same reason as the short form — BEHIND's `?` is
+                // what you have to know, and this is the detail behind it.
+                if matches!(
+                    column,
+                    Column::Visibility | Column::VisibilityShort | Column::Fetched
+                ) {
                     continue;
                 }
                 assert!(shown.contains(column), "{} missing", column.key());
             }
         }
+    }
+
+    // The distinction the column exists to draw: a zero that was checked
+    // against a remote reads as `·`, and a zero that never was reads as `?`.
+    #[test]
+    fn behind_says_unknown_until_something_has_fetched() {
+        let mut repo = RepoStatus::new("/tmp/x".into(), "g".into(), "r".into());
+        repo.refs = Some(crate::model::RefsInfo {
+            head: crate::model::Head::Branch("main".into()),
+            branches: Vec::new(),
+            last_commit: None,
+            stashes: 0,
+            operation: None,
+            newest_tag: None,
+            described_tag: None,
+            commits_since_tag: None,
+            since_tag_subjects: Vec::new(),
+            tags_orphaned: false,
+            index_mtime: None,
+            fetched_at: None,
+            remote_url: Some("git@github.com:owner/repo.git".into()),
+            changelog: None,
+            is_bare: false,
+            is_shallow: false,
+        });
+        assert_eq!(Column::Behind.cell(&repo, 0, false), "?");
+        assert_eq!(Column::Fetched.cell(&repo, 0, false), "never");
+
+        // Fetched, and genuinely in sync.
+        let refs = repo.refs.as_mut().unwrap();
+        refs.fetched_at = Some(1_000);
+        assert_eq!(Column::Behind.cell(&repo, 1_000, false), "·");
+
+        // No remote at all: nothing to be behind, and nothing to fetch, so
+        // neither column claims otherwise.
+        repo.refs.as_mut().unwrap().remote_url = None;
+        repo.refs.as_mut().unwrap().fetched_at = None;
+        assert_eq!(Column::Behind.cell(&repo, 0, false), "·");
+        assert_eq!(Column::Fetched.cell(&repo, 0, false), "·");
     }
 
     // The short form is a column of bare glyphs -- worth having, but only

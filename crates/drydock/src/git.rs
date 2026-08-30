@@ -282,6 +282,7 @@ pub async fn probe_refs(root: &Path, cfg: &Config) -> Result<RefsInfo> {
         since_tag_subjects,
         tags_orphaned,
         index_mtime: mtime_secs(&git_dir.join("index")),
+        fetched_at: last_fetch_at(&git_dir),
         remote_url: cfg_scan.remote_url,
         changelog: None,
         is_bare: cfg_scan.bare,
@@ -613,6 +614,32 @@ fn scan_git_config(git_dir: &Path) -> GitConfigScan {
     scan
 }
 
+/// When this repo last fetched, from `FETCH_HEAD`'s mtime, or `None` if it
+/// never has.
+///
+/// Read off the filesystem rather than tracked by this tool, because the
+/// question is "when did anything last talk to the remote", not "when did
+/// drydock last talk to it". Git rewrites `FETCH_HEAD` on every fetch and
+/// every pull, so a fetch you ran yourself in a terminal counts, which is the
+/// honest answer and the one that stops this from nagging about a repo you
+/// just pulled.
+///
+/// `None` is a real answer too: `git clone` doesn't write `FETCH_HEAD`, so a
+/// fresh clone that's never fetched has none, and its "behind" count has
+/// never been checked against anything.
+fn last_fetch_at(git_dir: &Path) -> Option<i64> {
+    mtime_secs(&common_git_dir(git_dir).join("FETCH_HEAD"))
+}
+
+/// The remote URL without probing the repo, for callers that only need to
+/// know whether there's anything to fetch. One file read, no process: the
+/// fetch phase runs before tier 1 has established anything, and spawning a
+/// `git fetch` per remote-less repo to watch it no-op is a few hundred
+/// processes to learn what `.git/config` already says.
+pub fn quick_remote_url(root: &Path) -> Option<String> {
+    scan_git_config(&resolve_git_dir(root).ok()?).remote_url
+}
+
 /// Compare the top version heading in the changelog against the tags that
 /// exist. A changelog sitting above its newest tag is an in-flight release.
 fn read_changelog(root: &Path, refs: &RefsInfo, cfg: &ReleaseConfig) -> Option<ChangelogInfo> {
@@ -703,6 +730,19 @@ fn tag_eq_version(tag: &str, version: &str) -> bool {
 /// ever happens on request or on a long timer, credential prompts are refused
 /// rather than left to block, and a hung remote is capped by its own timeout
 /// instead of the general one.
+///
+/// Tags come along, by git's ordinary auto-follow: a tag pointing at a commit
+/// we just fetched is fetched with it. This used to pass `--no-tags`, which
+/// made a fetch refresh the branch half of the table and quietly leave the
+/// release half stale -- a tag pushed from another machine never arrived, so
+/// a repo went on reporting `needs release` for work that had already been
+/// released. Auto-follow costs nothing beyond the refs already coming down.
+///
+/// Not `--prune-tags`, though, which is the same argument in reverse: it
+/// deletes local tags the remote doesn't have, and a tag you cut but haven't
+/// pushed is exactly what `needs release` is built to find. Pruning branches
+/// is safe because a remote-tracking branch is a copy of the remote's; a tag
+/// is not.
 pub async fn fetch(root: &Path, timeout: Duration) -> Result<()> {
     let mut cmd = Command::new("git");
     cmd.arg("--no-optional-locks")
@@ -715,7 +755,6 @@ pub async fn fetch(root: &Path, timeout: Duration) -> Result<()> {
             "--all",
             "--prune",
             "--quiet",
-            "--no-tags",
         ])
         .env("GIT_OPTIONAL_LOCKS", "0")
         .env("GIT_TERMINAL_PROMPT", "0")

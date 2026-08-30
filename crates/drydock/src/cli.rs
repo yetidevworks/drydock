@@ -49,6 +49,11 @@ pub enum Commands {
         /// Ignore the existing cache and re-probe everything.
         #[arg(long)]
         no_cache: bool,
+        /// Fetch every repo with a remote first, so "behind" counts reflect
+        /// the remotes rather than your last fetch. Network traffic against
+        /// every remote you own.
+        #[arg(long)]
+        fetch: bool,
     },
 
     /// Group summary: repo counts and how many need attention in each.
@@ -106,7 +111,8 @@ pub struct ListArgs {
     /// Repos tagged with nothing since.
     #[arg(long)]
     pub released: bool,
-    /// Repos whose upstream is ahead. Only as fresh as your last fetch.
+    /// Repos whose upstream is ahead. Only as fresh as your last fetch, so
+    /// pair it with --fetch to check the remotes now.
     #[arg(long)]
     pub behind: bool,
     /// Repos with merge conflicts.
@@ -189,6 +195,12 @@ pub struct ListArgs {
     /// stale as your last scan.
     #[arg(long)]
     pub cached: bool,
+
+    /// Fetch every repo with a remote before probing, so "behind" counts
+    /// reflect the remotes rather than your last fetch. Network traffic
+    /// against every remote you own, bounded by `remote.concurrency`.
+    #[arg(long, conflicts_with = "cached")]
+    pub fetch: bool,
 
     /// Print full paths instead of group/name.
     #[arg(long)]

@@ -56,12 +56,17 @@ pub enum Event {
 #[derive(Debug, Default, Clone)]
 pub struct Timings {
     pub discovery: Duration,
+    /// Time spent in the optional fetch phase. Zero when it didn't run, which
+    /// is the usual case: fetching is opt-in everywhere.
+    pub fetch: Duration,
     pub refs: Duration,
     pub work: Duration,
     pub total: Duration,
     pub repos: usize,
     pub work_scanned: usize,
     pub work_cached: usize,
+    pub fetched: usize,
+    pub fetch_failed: usize,
 }
 
 pub struct Fleet {
@@ -326,6 +331,93 @@ async fn fill_visibility(
     }
 }
 
+/// Which repos a sweep's fetch phase should touch.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Fetch {
+    /// Leave the network alone. What every sweep does unless asked otherwise.
+    Skip,
+    /// Every discovered repo that has a remote.
+    All,
+    /// Only the repos in one group. `--group grav --fetch` is thirty fetches
+    /// rather than five hundred, and the answer is the same for the rows
+    /// you're going to be shown.
+    Group(String),
+}
+
+impl Fetch {
+    fn wanted(&self, d: &Discovered) -> bool {
+        match self {
+            Fetch::Skip => false,
+            Fetch::All => true,
+            Fetch::Group(group) => d.group == *group,
+        }
+    }
+}
+
+/// What a fetch phase managed to do.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct FetchReport {
+    /// Repos that had a remote and were fetched from.
+    pub attempted: usize,
+    /// How many of those failed -- unreachable, needed credentials, timed out.
+    pub failed: usize,
+}
+
+/// Fetch every one of these repos that has a remote, bounded by
+/// `remote.concurrency`, before anything gets probed.
+///
+/// The one network phase in a sweep, and the only reason "behind" ever means
+/// anything: the counts themselves come from remote-tracking refs, which are
+/// as stale as whatever last updated them. A repo with no remote is skipped
+/// rather than fetched, since `git fetch` there is a process spawned to do
+/// nothing.
+///
+/// Failures are counted and logged, never fatal. A remote that's unreachable,
+/// wants a password, or times out leaves that repo's counts exactly as stale
+/// as they already were, which is strictly better than abandoning the sweep.
+pub async fn fetch_all(cfg: Arc<Config>, roots: Vec<PathBuf>) -> FetchReport {
+    let with_remotes: Vec<PathBuf> = tokio::task::spawn_blocking(move || {
+        roots
+            .into_iter()
+            .filter(|root| git::quick_remote_url(root).is_some())
+            .collect()
+    })
+    .await
+    .unwrap_or_default();
+
+    if with_remotes.is_empty() {
+        return FetchReport::default();
+    }
+
+    let timeout = cfg.remote_timeout();
+    let limit = Arc::new(Semaphore::new(cfg.remote.concurrency.max(1)));
+    let failed = Arc::new(AtomicUsize::new(0));
+    let mut set = JoinSet::new();
+
+    for root in &with_remotes {
+        let root = root.clone();
+        let limit = limit.clone();
+        let failed = failed.clone();
+        set.spawn(async move {
+            let _permit = limit.acquire().await;
+            if let Err(err) = git::fetch(&root, timeout).await {
+                tracing::debug!(
+                    repo = %root.display(),
+                    error = %format!("{err:#}"),
+                    "fetch failed"
+                );
+                failed.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+    }
+    while set.join_next().await.is_some() {}
+
+    FetchReport {
+        attempted: with_remotes.len(),
+        failed: failed.load(Ordering::Relaxed),
+    }
+}
+
 /// Probe one repo end to end. Used for `drydock status <path>` and by the
 /// watcher when a single repo changes; sweeps use the pipelined path below so
 /// tier 1 and tier 2 can run at different concurrencies.
@@ -356,9 +448,16 @@ pub async fn probe_one(
 
 /// Run a full sweep. `tx` is optional: pass one to stream progress, or None to
 /// just wait for the result.
+///
+/// Anything but [`Fetch::Skip`] inserts a network phase between discovery and
+/// probing, so the "behind" counts this sweep reports were checked against the
+/// remotes rather than read off whatever the last fetch left behind. It runs
+/// first, and to completion, because tier 1 reads the remote-tracking refs it
+/// updates.
 pub async fn sweep(
     cfg: Arc<Config>,
     tier: Tier,
+    fetch: Fetch,
     tx: Option<mpsc::UnboundedSender<Event>>,
 ) -> Result<Fleet> {
     let started = Instant::now();
@@ -389,6 +488,26 @@ pub async fn sweep(
             roots: discovered.iter().map(|d| d.root.clone()).collect(),
         },
     );
+
+    if fetch != Fetch::Skip {
+        let t0 = Instant::now();
+        let roots: Vec<PathBuf> = discovered
+            .iter()
+            .filter(|d| fetch.wanted(d))
+            .map(|d| d.root.clone())
+            .collect();
+        let report = fetch_all(cfg.clone(), roots).await;
+        timings.fetch = t0.elapsed();
+        timings.fetched = report.attempted;
+        timings.fetch_failed = report.failed;
+        emit(
+            &tx,
+            Event::Phase {
+                name: "fetch",
+                elapsed: timings.fetch,
+            },
+        );
+    }
 
     let cached = cache::load();
     let repos = sweep_repos(cfg.clone(), discovered, cached, tier, &tx, &mut timings).await;
@@ -527,6 +646,26 @@ fn emit(tx: &Option<mpsc::UnboundedSender<Event>>, event: Event) {
 mod tests {
     use super::*;
 
+    // `--group acme --fetch` should be that group's remotes, not the whole
+    // tree's: the other rows aren't going to be printed.
+    #[test]
+    fn a_group_scoped_fetch_only_wants_that_group() {
+        let repo = |group: &str| Discovered {
+            root: PathBuf::from("/p").join(group).join("r"),
+            group: group.to_string(),
+            name: "r".into(),
+        };
+        let acme = repo("acme");
+        let other = repo("other");
+
+        let scoped = Fetch::Group("acme".into());
+        assert!(scoped.wanted(&acme));
+        assert!(!scoped.wanted(&other));
+
+        assert!(Fetch::All.wanted(&other));
+        assert!(!Fetch::Skip.wanted(&acme));
+    }
+
     fn bare_status(is_bare: bool) -> RepoStatus {
         let mut status = RepoStatus::new(PathBuf::from("/nonexistent"), "g".into(), "r".into());
         status.refs = Some(crate::model::RefsInfo {
@@ -541,6 +680,7 @@ mod tests {
             since_tag_subjects: Vec::new(),
             tags_orphaned: false,
             index_mtime: None,
+            fetched_at: None,
             remote_url: None,
             changelog: None,
             is_bare,
@@ -708,6 +848,7 @@ mod tests {
             since_tag_subjects: Vec::new(),
             tags_orphaned: false,
             index_mtime: None,
+            fetched_at: None,
             remote_url: remote_url.map(String::from),
             changelog: None,
             is_bare: false,

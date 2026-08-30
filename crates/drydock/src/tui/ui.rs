@@ -12,6 +12,8 @@ use ratatui::{
     Frame,
 };
 
+use crossterm::event::KeyModifiers;
+
 use super::{App, Mode};
 use crate::column::{Column, Width};
 use crate::fmt;
@@ -24,6 +26,17 @@ const DIM: Color = Color::DarkGray;
 const DIRTY: Color = Color::Yellow;
 const UNPUSHED: Color = Color::Cyan;
 const UNRELEASED: Color = Color::Magenta;
+/// Commits waiting on the remote. Its own colour because it's its own axis:
+/// unpushed is work you have that the remote doesn't, behind is work the
+/// remote has that you don't, and rendering the second in the grey reserved
+/// for "nothing to say" is how a repo twelve commits behind reads as quiet.
+///
+/// Light red rather than something softer, and bold with it, because behind
+/// is the one count you can't work around: unpushed work is still in your
+/// hands, but commits sitting on the remote block anything you do next until
+/// you pull them. Near TROUBLE's red without being it — the two never appear
+/// in the same column, and this is the same order of "deal with me first".
+const BEHIND: Color = Color::LightRed;
 const TROUBLE: Color = Color::Red;
 const CLEAN: Color = Color::Green;
 // Private isn't a warning state -- it's the one most repos should be in -- so
@@ -181,6 +194,26 @@ fn render_title(f: &mut Frame, app: &App, area: Rect) {
             Style::default().fg(UNRELEASED),
         ),
     ];
+
+    // Behind, and never-checked, only appear when there are any. They're the
+    // two counts that are usually zero, and a permanent "0 behind" would be
+    // the same reassuring nothing the BEHIND column used to give.
+    let behind = app.repos.iter().filter(|r| r.behind_total() > 0).count();
+    if behind > 0 {
+        spans.push(Span::raw(" · "));
+        spans.push(Span::styled(
+            format!("{behind} behind"),
+            Style::default().fg(BEHIND).add_modifier(Modifier::BOLD),
+        ));
+    }
+    let never = app.repos.iter().filter(|r| r.never_fetched()).count();
+    if never > 0 {
+        spans.push(Span::raw(" · "));
+        spans.push(Span::styled(
+            format!("{never} never fetched"),
+            Style::default().fg(DIM),
+        ));
+    }
 
     if app.watching {
         spans.push(Span::styled(" · live", Style::default().fg(CLEAN)));
@@ -443,7 +476,25 @@ fn repo_line(repo: &RepoStatus, layout: &TableLayout, now: i64, selected: bool) 
                     }),
                 ),
                 Column::Behind => {
-                    Span::styled(rpad(&fmt::count(repo.behind_total()), w), base.fg(DIM))
+                    let behind = repo.behind_total();
+                    // `?`, not `·`: zero here means nothing was ever compared
+                    // against a remote, which is not the same as in sync.
+                    if behind > 0 {
+                        Span::styled(
+                            rpad(&fmt::count(behind), w),
+                            base.fg(BEHIND).add_modifier(Modifier::BOLD),
+                        )
+                    } else {
+                        let text = if repo.never_fetched() { "?" } else { "·" };
+                        Span::styled(rpad(text, w), base.fg(DIM))
+                    }
+                }
+                Column::Fetched => {
+                    let text = crate::column::fetched_label(repo, now);
+                    Span::styled(
+                        rpad(&text, w),
+                        base.fg(if text == "never" { BEHIND } else { DIM }),
+                    )
                 }
                 Column::Tag => Span::styled(
                     pad(&fmt::truncate(&repo.tag_label(), w.saturating_sub(1)), w),
@@ -521,16 +572,46 @@ fn release_cell(repo: &RepoStatus) -> String {
     format!("{marker} {}", state.label())
 }
 
-fn render_keys(f: &mut Frame, app: &App, area: Rect) {
-    let keys: &[(&str, &str)] = match app.mode {
+/// What the footer lists, which depends on what's held down.
+///
+/// Holding shift or ctrl swaps the row for what those keys would do right
+/// now, so the modified bindings are discoverable by pressing the modifier
+/// rather than by reading the help. Terminals that don't report a bare
+/// modifier keep [`App::mods`] empty and always get the first row.
+pub(super) fn key_hints(app: &App) -> &'static [(&'static str, &'static str)] {
+    let shift = app.mods.contains(KeyModifiers::SHIFT);
+    let ctrl = app.mods.contains(KeyModifiers::CONTROL);
+
+    match app.mode {
+        // Ctrl wins when both are down: its bindings are the same everywhere,
+        // so showing them is never wrong, and a chord in progress is more
+        // likely to be a ctrl one.
+        _ if ctrl => &[
+            ("^o", "terminal"),
+            ("^f", "fetch all"),
+            ("^r", "rescan"),
+            ("^d/^u", "half page"),
+            ("^c", "quit"),
+        ],
+        Mode::Detail if shift => &[("O", "editor"), ("T", "terminal")],
         Mode::Detail => &[
             ("esc", "back"),
             ("j/k", "scroll"),
-            ("o", "editor"),
+            ("o", "finder"),
             ("t", "client"),
             ("y", "copy path"),
         ],
         Mode::Search => &[("esc", "cancel"), ("enter", "keep"), ("type", "to filter")],
+        Mode::Columns if shift => &[("J/K", "move column"), ("C", "close")],
+        _ if shift => &[
+            ("O", "editor"),
+            ("T", "terminal"),
+            ("F", "fetch screen"),
+            ("N", "unreleased"),
+            ("S", "reverse sort"),
+            ("C", "columns"),
+            ("R", "rescan"),
+        ],
         _ => &[
             ("j/k", "move"),
             ("⏎", "detail"),
@@ -542,10 +623,15 @@ fn render_keys(f: &mut Frame, app: &App, area: Rect) {
             ("/", "search"),
             ("[ ]", "group"),
             ("1-4", "since"),
-            ("o", "open"),
+            ("o", "finder"),
+            ("^f", "fetch all"),
             ("?", "help"),
         ],
-    };
+    }
+}
+
+fn render_keys(f: &mut Frame, app: &App, area: Rect) {
+    let keys = key_hints(app);
 
     let mut spans = vec![Span::raw(" ")];
     for (key, what) in keys {
@@ -721,11 +807,20 @@ fn render_help(f: &mut Frame, app: &App, area: Rect) -> u16 {
             &[("s", "cycle the sort key"), ("S", "reverse the sort")],
         ),
         (
+            "Checking the remotes",
+            &[
+                ("f", "fetch the selected repo"),
+                ("F", "fetch everything on screen"),
+                ("ctrl-f", "fetch every repo in the fleet, filters ignored"),
+            ],
+        ),
+        (
             "Handing off",
             &[
-                ("o", "open in your editor"),
+                ("o", "show the folder in Finder"),
+                ("O", "open in your editor"),
+                ("T / ctrl-o", "open a terminal there"),
                 ("t", "open in your git client"),
-                ("T", "open a terminal there"),
                 ("w", "open the remote in a browser"),
                 ("y", "copy the path"),
                 ("R / ctrl-r", "rescan now"),
@@ -772,14 +867,14 @@ fn render_help(f: &mut Frame, app: &App, area: Rect) -> u16 {
         lines.push(Line::from(""));
     }
 
-    lines.push(Line::from(Span::styled(
+    for note in [
         " Ahead and behind counts come from refs you have already fetched, so",
-        Style::default().fg(DIM),
-    )));
-    lines.push(Line::from(Span::styled(
-        " \"behind\" is only as fresh as your last fetch.",
-        Style::default().fg(DIM),
-    )));
+        " \"behind\" is only as fresh as your last fetch. A `?` there means",
+        " nothing has ever fetched that repo, so its behind count has never",
+        " been checked against anything -- press f, F or ctrl-f to check it.",
+    ] {
+        lines.push(Line::from(Span::styled(note, Style::default().fg(DIM))));
+    }
 
     let block = Block::default()
         .borders(Borders::ALL)
@@ -944,6 +1039,19 @@ fn render_detail(f: &mut Frame, app: &App, area: Rect) -> u16 {
                     .unwrap_or_else(|| "(none)".to_string()),
             ),
         ]));
+        if refs.remote_url.is_some() {
+            let (text, colour) = match refs.fetched_at {
+                Some(at) => (format!("{} ago", fmt::age(at, app.now)), DIM),
+                None => (
+                    "never — this repo's behind count has never been checked".to_string(),
+                    BEHIND,
+                ),
+            };
+            lines.push(Line::from(vec![
+                label("fetched"),
+                Span::styled(text, Style::default().fg(colour)),
+            ]));
+        }
         if refs.stashes > 0 {
             lines.push(Line::from(vec![
                 label("stashes"),
@@ -1039,7 +1147,13 @@ fn render_detail(f: &mut Frame, app: &App, area: Rect) -> u16 {
                     ),
                     Span::styled(
                         format!("{:<34}", fmt::truncate(&tracking, 33)),
-                        Style::default().fg(if b.ahead > 0 { UNPUSHED } else { DIM }),
+                        Style::default().fg(if b.ahead > 0 {
+                            UNPUSHED
+                        } else if b.behind > 0 {
+                            BEHIND
+                        } else {
+                            DIM
+                        }),
                     ),
                     Span::styled(
                         format!("{:>5}  ", fmt::age(b.committed_at, app.now)),
