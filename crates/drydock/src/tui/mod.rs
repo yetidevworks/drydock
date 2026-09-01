@@ -30,10 +30,11 @@ use tokio::sync::mpsc;
 
 use crate::cache;
 use crate::column::Column;
-use crate::config::Config;
+use crate::config::{CloneProtocol, Config, OrgConfig, OrgProvider};
 use crate::filter::{Filter, MatchMode, Query, Sort};
 use crate::git;
 use crate::model::RepoStatus;
+use crate::org;
 use crate::probe::{self, Tier, Timings};
 use crate::watch;
 
@@ -61,9 +62,13 @@ pub enum Mode {
     Help,
     /// The column picker: toggle columns on and off, and reorder them.
     Columns,
+    /// The org manager: registered owners, what's on disk for each, and the
+    /// keys to add, edit, remove and sync them.
+    Orgs,
+    /// The org add/edit form: one field at a time, Enter to advance.
+    OrgForm,
 }
 
-/// The `since` presets, cycled with the number keys.
 pub const SINCE_PRESETS: &[(&str, &str)] = &[
     ("0", ""),
     ("1", "1h"),
@@ -71,6 +76,128 @@ pub const SINCE_PRESETS: &[(&str, &str)] = &[
     ("3", "1w"),
     ("4", "1mo"),
 ];
+
+/// The org form's rows, top to bottom: six text fields, then three toggles.
+/// `OrgForm::field` walks this order, and the overlay renders in it.
+const ORG_TEXT_FIELDS: usize = 6;
+const ORG_FIELD_COUNT: usize = ORG_TEXT_FIELDS + 3;
+
+/// The add/edit form's state: which row is active, the text values, the
+/// toggles, and whether a save will edit an existing org or add one. Text
+/// entry is the search bar's model applied a row at a time -- append and
+/// delete, no caret to steer -- so a field is either text or a checkbox and
+/// nothing else.
+pub struct OrgForm {
+    /// `Some(i)` when editing `cfg.orgs[i]`, `None` when adding.
+    pub editing: Option<usize>,
+    /// Active row: `0..ORG_TEXT_FIELDS` are text, the rest are toggles.
+    pub field: usize,
+    pub provider: String,
+    pub host: String,
+    pub owner: String,
+    pub path: String,
+    pub login: String,
+    pub protocol: String,
+    pub include_forks: bool,
+    pub include_archived: bool,
+    pub include_subgroups: bool,
+}
+
+impl OrgForm {
+    fn blank() -> Self {
+        Self {
+            editing: None,
+            field: 0,
+            provider: String::new(),
+            host: String::new(),
+            owner: String::new(),
+            path: String::new(),
+            login: String::new(),
+            // The default everywhere else in the feature is ssh, so the form
+            // starts there too rather than making it two keystrokes.
+            protocol: "ssh".into(),
+            include_forks: false,
+            include_archived: false,
+            include_subgroups: false,
+        }
+    }
+
+    /// Seed the form, either from an existing org for editing or from the
+    /// defaults for adding. An `editing` index without a matching org falls
+    /// back to blank -- it can only happen if the list shrank while the form
+    /// was open, and the save is validated against the real config anyway.
+    fn open(editing: Option<usize>, org: Option<&OrgConfig>) -> Self {
+        let Some(org) = org else {
+            return Self::blank();
+        };
+        Self {
+            editing,
+            field: 0,
+            provider: org
+                .provider
+                .map(|p| p.as_str().to_string())
+                .unwrap_or_default(),
+            host: org.host.clone(),
+            owner: org.owner.clone(),
+            path: org.path.clone().unwrap_or_default(),
+            login: org.login.clone(),
+            protocol: if org.protocol == CloneProtocol::Https {
+                "https"
+            } else {
+                "ssh"
+            }
+            .to_string(),
+            include_forks: org.include_forks,
+            include_archived: org.include_archived,
+            include_subgroups: org.include_subgroups,
+        }
+    }
+
+    fn active_is_toggle(&self) -> bool {
+        self.field >= ORG_TEXT_FIELDS
+    }
+
+    /// The active text field, if the active row is a text one.
+    fn text_mut(&mut self) -> Option<&mut String> {
+        match self.field {
+            0 => Some(&mut self.provider),
+            1 => Some(&mut self.host),
+            2 => Some(&mut self.owner),
+            3 => Some(&mut self.path),
+            4 => Some(&mut self.login),
+            5 => Some(&mut self.protocol),
+            _ => None,
+        }
+    }
+
+    /// Flip the active toggle row. A no-op on a text row: the key handler
+    /// routes space and Enter by row kind, this is just the back half.
+    fn flip_toggle(&mut self) {
+        match self.field - ORG_TEXT_FIELDS {
+            0 => self.include_forks = !self.include_forks,
+            1 => self.include_archived = !self.include_archived,
+            2 => self.include_subgroups = !self.include_subgroups,
+            _ => {}
+        }
+    }
+}
+
+/// One org sync in flight: who it's for, where it stands, and what has
+/// landed so far. The counts accumulate on the loop side from the streamed
+/// events, so the overlay stays live even though the work runs in a task.
+pub struct OrgSyncRun {
+    /// The owner being synced, or a count when several run back to back.
+    pub owner: String,
+    pub done: usize,
+    pub total: usize,
+    pub label: String,
+    pub cloned: usize,
+    pub updated: usize,
+    pub current: usize,
+    pub skipped: usize,
+    pub orphaned: usize,
+    pub errors: usize,
+}
 
 pub struct App {
     pub cfg: Arc<Config>,
@@ -124,6 +251,21 @@ pub struct App {
     /// iTerm2 3.5+, foot). Apple Terminal doesn't, and there the footer stays
     /// the static list it always was.
     pub modifier_events: bool,
+    /// Row the org manager is sitting on, indexing `cfg.orgs`.
+    pub orgs_cursor: usize,
+    /// Set between the first and second press of `x` in the org manager, so
+    /// removing an owner takes a confirming second press. Cleared by any
+    /// cursor move or close, like a delete key with a hair trigger.
+    pub orgs_confirm_remove: bool,
+    /// The add/edit form shown in `Mode::OrgForm`.
+    pub org_form: OrgForm,
+    /// The org sync in flight, if any. `Some` is what makes `s` and `S` say
+    /// "already running" instead of starting a second one.
+    pub org_sync: Option<OrgSyncRun>,
+    /// Last recorded sync per (provider, host, owner), for the LAST SYNC
+    /// column. Loaded once at startup and re-read after each sync lands,
+    /// rather than kept in step by hand.
+    pub org_states: HashMap<(String, String, String), cache::OrgSyncState>,
     pub should_quit: bool,
 }
 
@@ -174,6 +316,11 @@ impl App {
             spinner: 0,
             now: git::now_unix(),
             rows_on_screen: 20,
+            orgs_cursor: 0,
+            orgs_confirm_remove: false,
+            org_form: OrgForm::blank(),
+            org_sync: None,
+            org_states: cache::load_org_states(),
             should_quit: false,
         };
         app.reindex();
@@ -471,6 +618,23 @@ impl App {
         };
         self.recompute();
     }
+
+    /// The org under the org manager's cursor, cloned. Callers hand it to
+    /// the form or the sync task, both of which want their own copy: the
+    /// config behind `app.cfg` can be swapped out under an in-flight save.
+    pub fn selected_org(&self) -> Option<OrgConfig> {
+        self.cfg.orgs.get(self.orgs_cursor).cloned()
+    }
+
+    pub fn move_orgs_cursor(&mut self, delta: isize) {
+        let len = self.cfg.orgs.len();
+        if len == 0 {
+            return;
+        }
+        let next = (self.orgs_cursor as isize + delta).clamp(0, len as isize - 1);
+        self.orgs_cursor = next as usize;
+        self.orgs_confirm_remove = false;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -487,6 +651,15 @@ enum Input {
     Resweep,
     /// The periodic fetch is due, if one is configured.
     AutoFetch,
+    /// An org sync's progress tick or per-repo outcome, streamed from the
+    /// background task the way `Input::Probe` streams a sweep.
+    Sync(org::SyncEvent),
+    /// The org sync task finished: how many orgs ran, and the one-line
+    /// verdict that goes in the status line.
+    SyncDone {
+        owner_count: usize,
+        summary: String,
+    },
     Tick,
 }
 
@@ -614,10 +787,11 @@ async fn run_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut A
                 // While a sweep is running, every tick repaints so the spinner
                 // turns and the counter climbs. Idle, repaint about once a
                 // second, which is often enough for the age column and quiet
-                // enough to leave open all day.
+                // enough to leave open all day. A running org sync turns the
+                // spinner too, for the same reason.
                 app.spinner = app.spinner.wrapping_add(1);
                 idle_ticks += 1;
-                if app.sweeping || idle_ticks >= 4 {
+                if app.sweeping || app.org_sync.is_some() || idle_ticks >= 4 {
                     idle_ticks = 0;
                     dirty = true;
                 }
@@ -657,6 +831,28 @@ async fn run_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut A
                 dirty = true;
             }
             Input::Resweep => {
+                start_sweep(app, &tx, Tier::Full);
+                dirty = true;
+            }
+            Input::Sync(event) => {
+                handle_sync_event(app, event);
+                dirty = true;
+            }
+            Input::SyncDone {
+                owner_count,
+                summary,
+            } => {
+                app.org_sync = None;
+                // The sync just recorded fresh states for every org it ran;
+                // re-reading the map beats keeping it in step by hand, the
+                // same trade the column picker makes with the config.
+                app.org_states = cache::load_org_states();
+                app.notify(format!(
+                    "Synced {owner_count} org{}: {summary}",
+                    if owner_count == 1 { "" } else { "s" }
+                ));
+                // Fresh clones exist on disk now. A full sweep is what puts
+                // them in the table without waiting for the refresh timer.
                 start_sweep(app, &tx, Tier::Full);
                 dirty = true;
             }
@@ -838,6 +1034,16 @@ fn handle_mouse(app: &mut App, ev: MouseEvent, size: Option<Size>) {
             }
             return;
         }
+        // Same gesture as the picker: the org list is short, the wheel is
+        // what people reach for first.
+        Mode::Orgs => {
+            match ev.kind {
+                MouseEventKind::ScrollDown => app.move_orgs_cursor(1),
+                MouseEventKind::ScrollUp => app.move_orgs_cursor(-1),
+                _ => {}
+            }
+            return;
+        }
         _ => {}
     }
 
@@ -1002,6 +1208,8 @@ fn handle_key(app: &mut App, key: KeyEvent, tx: &mpsc::UnboundedSender<Input>) {
             KeyCode::Char('y') => copy_path(app),
             _ => {}
         },
+        Mode::Orgs => handle_orgs_key(app, key, tx),
+        Mode::OrgForm => handle_org_form_key(app, key),
         Mode::Normal => handle_normal_key(app, key, tx),
     }
 }
@@ -1029,6 +1237,307 @@ fn handle_search_key(app: &mut App, key: KeyEvent) {
     }
 }
 
+/// Keys inside the org manager. The list on screen is `app.cfg.orgs` read
+/// fresh every frame, so a save or removal shows up without any bookkeeping
+/// here.
+fn handle_orgs_key(app: &mut App, key: KeyEvent, tx: &mpsc::UnboundedSender<Input>) {
+    match key.code {
+        KeyCode::Esc | KeyCode::Char('q') => {
+            app.mode = Mode::Normal;
+            app.orgs_confirm_remove = false;
+        }
+        KeyCode::Char('j') | KeyCode::Down => app.move_orgs_cursor(1),
+        KeyCode::Char('k') | KeyCode::Up => app.move_orgs_cursor(-1),
+        KeyCode::Char('a') => {
+            app.org_form = OrgForm::open(None, None);
+            app.mode = Mode::OrgForm;
+        }
+        KeyCode::Char('e') => {
+            let Some(org) = app.selected_org() else {
+                return;
+            };
+            let editing = Some(app.orgs_cursor);
+            app.org_form = OrgForm::open(editing, Some(&org));
+            app.mode = Mode::OrgForm;
+        }
+        KeyCode::Char('x') => remove_org(app),
+        KeyCode::Char('s') => {
+            if app.org_sync.is_some() {
+                app.notify("A sync is already running; let it finish first");
+                return;
+            }
+            let Some(org) = app.selected_org() else {
+                return;
+            };
+            start_org_sync(app, tx, vec![org]);
+        }
+        KeyCode::Char('S') => {
+            if app.org_sync.is_some() {
+                app.notify("A sync is already running; let it finish first");
+                return;
+            }
+            let orgs: Vec<OrgConfig> = app
+                .cfg
+                .orgs
+                .iter()
+                .filter(|org| org.enabled)
+                .cloned()
+                .collect();
+            if orgs.is_empty() {
+                app.notify("No enabled orgs to sync");
+                return;
+            }
+            start_org_sync(app, tx, orgs);
+        }
+        KeyCode::Char('?') => {
+            app.mode = Mode::Help;
+            app.detail_scroll = 0;
+        }
+        _ => {}
+    }
+}
+
+/// `x` twice removes: the first press asks, the second does. Only the
+/// registration goes -- the checkouts on disk were never ours to touch.
+fn remove_org(app: &mut App) {
+    let Some(org) = app.selected_org() else {
+        return;
+    };
+    if !app.orgs_confirm_remove {
+        app.orgs_confirm_remove = true;
+        app.notify(format!(
+            "Press x again to remove {} from {}",
+            org.owner, org.host
+        ));
+        return;
+    }
+    app.orgs_confirm_remove = false;
+    let mut cfg = (*app.cfg).clone();
+    cfg.orgs.remove(app.orgs_cursor);
+    match crate::config::save(&cfg) {
+        Ok(_) => {
+            app.cfg = Arc::new(cfg);
+            app.move_orgs_cursor(0); // re-clamps against the shorter list
+            app.notify(format!("Removed {} (checkouts untouched)", org.owner));
+        }
+        Err(err) => app.notify(format!("could not save config: {err:#}")),
+    }
+}
+
+/// Keys inside the add/edit form: the search bar's text entry applied to
+/// whichever row is active, Tab and the arrows to move between rows, Enter
+/// to advance and save at the end. There is no caret to steer -- the search
+/// bar works the same way, and a form field is short enough to retype.
+fn handle_org_form_key(app: &mut App, key: KeyEvent) {
+    match key.code {
+        KeyCode::Esc => app.mode = Mode::Orgs,
+        KeyCode::Backspace => {
+            if let Some(text) = app.org_form.text_mut() {
+                text.pop();
+            }
+        }
+        KeyCode::Tab | KeyCode::Down => {
+            app.org_form.field = (app.org_form.field + 1).min(ORG_FIELD_COUNT - 1);
+        }
+        KeyCode::BackTab | KeyCode::Up => {
+            app.org_form.field = app.org_form.field.saturating_sub(1);
+        }
+        // Space flips a toggle and stays put, so a misflip is one more press
+        // to undo rather than a walk back from the next row.
+        KeyCode::Char(' ') if app.org_form.active_is_toggle() => app.org_form.flip_toggle(),
+        KeyCode::Char(c) => {
+            if let Some(text) = app.org_form.text_mut() {
+                text.push(c);
+            }
+        }
+        KeyCode::Enter => {
+            let last = app.org_form.field == ORG_FIELD_COUNT - 1;
+            if app.org_form.active_is_toggle() {
+                app.org_form.flip_toggle();
+            }
+            if last {
+                save_org_form(app);
+            } else {
+                app.org_form.field += 1;
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Turn the form into an `OrgConfig`, splice it into a cloned config,
+/// validate, and save. Swapping `app.cfg`'s Arc is the whole concurrency
+/// story: in-flight sweeps holding the old config finish against it, and the
+/// next sweep picks this one up.
+///
+/// A problem reported by [`Config::org_problems`] keeps the form open -- the
+/// text is still on the fields, so a fix is an edit, not a retype.
+fn save_org_form(app: &mut App) {
+    let provider = match app.org_form.provider.trim() {
+        "" => None, // inferred from the host; org_problems catches ambiguity
+        "github" => Some(OrgProvider::GitHub),
+        "gitlab" => Some(OrgProvider::GitLab),
+        "gitea" => Some(OrgProvider::Gitea),
+        other => {
+            app.notify(format!(
+                "provider must be github, gitlab or gitea, not \"{other}\""
+            ));
+            return;
+        }
+    };
+    let protocol = match app.org_form.protocol.trim() {
+        "" | "ssh" => CloneProtocol::Ssh,
+        "https" => CloneProtocol::Https,
+        other => {
+            app.notify(format!("protocol must be ssh or https, not \"{other}\""));
+            return;
+        }
+    };
+
+    let mut org = match app.org_form.editing {
+        // Editing keeps the fields the form doesn't show -- exclude globs,
+        // enabled -- exactly as they were.
+        Some(ix) => app.cfg.orgs.get(ix).cloned().unwrap_or_default(),
+        None => OrgConfig::default(),
+    };
+    org.provider = provider;
+    org.host = app.org_form.host.trim().to_string();
+    org.owner = app.org_form.owner.trim().to_string();
+    org.path = match app.org_form.path.trim() {
+        "" => None,
+        p => Some(p.to_string()),
+    };
+    org.login = app.org_form.login.trim().to_string();
+    org.protocol = protocol;
+    org.include_forks = app.org_form.include_forks;
+    org.include_archived = app.org_form.include_archived;
+    org.include_subgroups = app.org_form.include_subgroups;
+
+    let mut cfg = (*app.cfg).clone();
+    match app.org_form.editing {
+        Some(ix) if ix < cfg.orgs.len() => cfg.orgs[ix] = org,
+        _ => cfg.orgs.push(org),
+    }
+
+    if let Some(problem) = cfg.org_problems().first() {
+        app.notify(problem.clone());
+        return;
+    }
+
+    match crate::config::save(&cfg) {
+        Ok(_) => {
+            app.cfg = Arc::new(cfg);
+            app.mode = Mode::Orgs;
+            app.notify("org saved");
+        }
+        Err(err) => app.notify(format!("could not save config: {err:#}")),
+    }
+}
+
+/// Start the sync task for one or more orgs. Serial across orgs as well as
+/// within them: `sync_org` is awaited in a plain loop, one owner at a time,
+/// and each owner's repos run one at a time inside it.
+fn start_org_sync(app: &mut App, tx: &mpsc::UnboundedSender<Input>, orgs: Vec<OrgConfig>) {
+    let owner = match orgs.as_slice() {
+        [one] => one.owner.clone(),
+        many => format!("{} orgs", many.len()),
+    };
+    app.org_sync = Some(OrgSyncRun {
+        owner,
+        done: 0,
+        total: 0,
+        label: "starting".into(),
+        cloned: 0,
+        updated: 0,
+        current: 0,
+        skipped: 0,
+        orphaned: 0,
+        errors: 0,
+    });
+    let cfg = app.cfg.clone();
+    let inner = tx.clone();
+    tokio::spawn(async move {
+        let mut cloned = 0usize;
+        let mut updated = 0;
+        let mut current = 0;
+        let mut skipped = 0;
+        let mut orphaned = 0;
+        let mut errors = 0;
+        // `sync_org` streams `SyncEvent`s, the loop speaks `Input`: a
+        // forwarder bridges the two, the same shape `start_sweep` uses for
+        // probe events.
+        let (stx, mut srx) = mpsc::unbounded_channel::<org::SyncEvent>();
+        let forward_tx = inner.clone();
+        let forward = tokio::spawn(async move {
+            while let Some(event) = srx.recv().await {
+                if forward_tx.send(Input::Sync(event)).is_err() {
+                    break;
+                }
+            }
+        });
+        for org in &orgs {
+            match org::sync_org(org, &cfg, Some(&stx)).await {
+                Ok(outcomes) => {
+                    for outcome in outcomes {
+                        match outcome.action {
+                            crate::org::Action::Cloned => cloned += 1,
+                            crate::org::Action::Updated => updated += 1,
+                            crate::org::Action::Current => current += 1,
+                            crate::org::Action::Skipped => skipped += 1,
+                            crate::org::Action::Orphaned => orphaned += 1,
+                            crate::org::Action::Error => errors += 1,
+                        }
+                    }
+                }
+                Err(err) => {
+                    errors += 1;
+                    tracing::warn!(owner = %org.owner, error = %format!("{err:#}"), "org sync failed");
+                }
+            }
+        }
+        // Done emitting: closing the sync channel lets the forwarder drain
+        // and finish, so the terminal SyncDone can't overtake the last Repo
+        // event on its way to the loop.
+        drop(stx);
+        let _ = forward.await;
+        // Counts only: the loop's SyncDone arm wraps these with how many
+        // orgs ran.
+        let owner_count = orgs.len();
+        let summary = format!(
+            "cloned {cloned}, updated {updated}, \
+             current {current}, skipped {skipped}, orphans {orphaned}, errors {errors}"
+        );
+        // The channel outliving the dashboard is fine: a failed send just
+        // means nobody is watching, and the sync already finished.
+        let _ = inner.send(Input::SyncDone {
+            owner_count,
+            summary,
+        });
+    });
+}
+
+/// Fold a streamed sync event into the overlay's progress state.
+fn handle_sync_event(app: &mut App, event: org::SyncEvent) {
+    let Some(run) = app.org_sync.as_mut() else {
+        return;
+    };
+    match event {
+        org::SyncEvent::Progress { done, total, label } => {
+            run.done = done;
+            run.total = total;
+            run.label = label;
+        }
+        org::SyncEvent::Repo(outcome) => match outcome.action {
+            crate::org::Action::Cloned => run.cloned += 1,
+            crate::org::Action::Updated => run.updated += 1,
+            crate::org::Action::Current => run.current += 1,
+            crate::org::Action::Skipped => run.skipped += 1,
+            crate::org::Action::Orphaned => run.orphaned += 1,
+            crate::org::Action::Error => run.errors += 1,
+        },
+    }
+}
+
 fn handle_normal_key(app: &mut App, key: KeyEvent, tx: &mpsc::UnboundedSender<Input>) {
     match key.code {
         KeyCode::Char('q') | KeyCode::Esc => app.should_quit = true,
@@ -1039,6 +1548,14 @@ fn handle_normal_key(app: &mut App, key: KeyEvent, tx: &mpsc::UnboundedSender<In
         KeyCode::Char('?') => {
             app.mode = Mode::Help;
             app.detail_scroll = 0;
+        }
+        // The shifted-letter idiom the dashboard already uses (s/S, o/O,
+        // f/F): lowercase `a` clears the filters, so the org manager rides
+        // the shift, the same place `C` put the column picker.
+        KeyCode::Char('A') => {
+            app.orgs_cursor = 0;
+            app.orgs_confirm_remove = false;
+            app.mode = Mode::Orgs;
         }
         KeyCode::Enter => {
             if app.current().is_some() {
@@ -1433,6 +1950,53 @@ pub async fn snapshot(width: u16, height: u16, view: &str) -> Result<String> {
         app.progress = (0, 0);
         app.rows_on_screen = height.saturating_sub(6) as usize;
         app.recompute();
+        return render_once(&app, width, height);
+    }
+    // The org views are synthetic like "scanning": the real config on this
+    // machine would make the snapshot machine-specific, and the probe below
+    // would make it network-dependent. Neither belongs in a layout check.
+    if view == "orgs" || view == "org-form" {
+        let mut cfg = (*app.cfg).clone();
+        cfg.roots = vec!["~/dev/github.com".into()];
+        cfg.orgs = vec![
+            OrgConfig {
+                host: "github.com".into(),
+                owner: "yetidevworks".into(),
+                ..Default::default()
+            },
+            OrgConfig {
+                host: "gitlab.com".into(),
+                owner: "acme".into(),
+                path: Some("~/Projects/acme".into()),
+                ..Default::default()
+            },
+            OrgConfig {
+                provider: Some(OrgProvider::Gitea),
+                host: "git.example.com".into(),
+                owner: "otter".into(),
+                path: Some("~/Projects/otter".into()),
+                ..Default::default()
+            },
+        ];
+        app.cfg = Arc::new(cfg);
+        app.repos = (0..31)
+            .map(|i| {
+                let root = crate::paths::expand("~/dev/github.com/yetidevworks");
+                RepoStatus::new(
+                    root.join(format!("repo{i}")),
+                    "yetidevworks".into(),
+                    format!("repo{i}"),
+                )
+            })
+            .collect();
+        app.reindex();
+        app.mode = Mode::Orgs;
+        if view == "org-form" {
+            app.org_form = OrgForm::open(None, None);
+            app.org_form.host = "github.com".into();
+            app.org_form.owner = "yetidevworks".into();
+            app.mode = Mode::OrgForm;
+        }
         return render_once(&app, width, height);
     }
     if view == "scanning-partial" {
@@ -1976,6 +2540,90 @@ mod tests {
         assert_eq!(
             web_url("ssh://git@git.example.com/team/repo.git"),
             "https://git.example.com/team/repo"
+        );
+    }
+    /// The overlay reads owners straight out of the config: if a hand-edited
+    /// `[[orgs]]` table doesn't show up here, the manager is showing a copy.
+    #[test]
+    fn the_orgs_overlay_lists_configured_owners() {
+        let mut app = app_with(0);
+        let mut cfg = (*app.cfg).clone();
+        cfg.roots = vec!["~/dev/github.com".into()];
+        cfg.orgs = vec![
+            OrgConfig {
+                host: "github.com".into(),
+                owner: "yetidevworks".into(),
+                ..Default::default()
+            },
+            OrgConfig {
+                host: "gitlab.com".into(),
+                owner: "acme".into(),
+                ..Default::default()
+            },
+        ];
+        app.cfg = Arc::new(cfg);
+        let base = crate::paths::expand("~/dev/github.com/yetidevworks");
+        app.repos = (0..3)
+            .map(|i| {
+                RepoStatus::new(
+                    base.join(format!("repo{i}")),
+                    "yetidevworks".into(),
+                    format!("repo{i}"),
+                )
+            })
+            .collect();
+        app.reindex();
+        app.mode = Mode::Orgs;
+
+        let out = render_once(&app, 110, 22).unwrap();
+        assert!(out.contains("PROVIDER"), "column header is drawn:\n{out}");
+        assert!(
+            out.contains("yetidevworks"),
+            "owner from the config:\n{out}"
+        );
+        assert!(out.contains("acme"), "second owner from the config:\n{out}");
+        assert!(out.contains("gitlab.com"), "host column:\n{out}");
+        assert!(
+            out.contains("3"),
+            "ON DISK counts the repos under the org path:\n{out}"
+        );
+        // Nothing has synced yet, so the LAST SYNC column says so rather
+        // than rendering a bare age of "-".
+        assert!(
+            out.contains("never"),
+            "LAST SYNC for a never-synced org:\n{out}"
+        );
+    }
+
+    #[test]
+    fn the_org_form_renders_its_fields_and_toggles() {
+        let mut app = app_with(0);
+        app.mode = Mode::OrgForm;
+        app.org_form = OrgForm::open(None, None);
+        app.org_form.host = "github.com".into();
+        app.org_form.owner = "yetidevworks".into();
+
+        let out = render_once(&app, 80, 22).unwrap();
+        for label in ["provider", "host", "owner", "path", "login", "protocol"] {
+            assert!(out.contains(label), "{label} field is labelled:\n{out}");
+        }
+        assert!(
+            out.contains("github.com"),
+            "typed text shows in its field:\n{out}"
+        );
+        assert!(
+            out.contains("[ ]"),
+            "unchecked toggles render as checkboxes:\n{out}"
+        );
+
+        // Flipping a toggle changes the glyph, which is the whole feedback
+        // loop the form has for those rows.
+        app.org_form.field = ORG_TEXT_FIELDS; // the include-forks row
+        app.org_form.flip_toggle();
+        let out = render_once(&app, 80, 22).unwrap();
+        assert!(
+            out.contains("[x]"),
+            "flipped toggle renders checked:\n{out}"
         );
     }
 }

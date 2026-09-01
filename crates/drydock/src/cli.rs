@@ -62,6 +62,10 @@ pub enum Commands {
         json: bool,
     },
 
+    /// Register an owner, list registrations, or sync a fleet of checkouts.
+    #[command(subcommand)]
+    Org(OrgCommands),
+
     /// Show where config and cache live, or write a starter config.
     #[command(subcommand)]
     Config(ConfigCommands),
@@ -92,6 +96,67 @@ pub enum ConfigCommands {
     },
     /// Print the effective config.
     Show,
+}
+
+/// One registered source: an instance plus an owner, remembered so its
+/// checkouts can be brought up to date on demand. Mirrors `ConfigCommands` —
+/// a handful of small verbs under one roof.
+#[derive(Subcommand, Debug)]
+pub enum OrgCommands {
+    /// Remember an owner so `org sync` can keep its checkouts current.
+    Add {
+        /// The organization or user to list — both list the same way.
+        owner: String,
+        /// github, gitlab, or gitea. Inferred for the hosted instances;
+        /// required for a self-hosted one.
+        #[arg(long)]
+        provider: Option<String>,
+        /// Instance hostname. Defaults to the provider's hosted instance
+        /// (github.com, gitlab.com, gitea.com).
+        #[arg(long)]
+        host: Option<String>,
+        /// Where the checkouts live. Defaults to the first configured root
+        /// plus the owner.
+        #[arg(long)]
+        path: Option<String>,
+        /// Gitea only: which `tea` login to use. Empty means tea's default.
+        #[arg(long)]
+        login: Option<String>,
+        /// How to clone: ssh or https. Defaults to ssh.
+        #[arg(long)]
+        protocol: Option<String>,
+        /// Also sync forked repos.
+        #[arg(long)]
+        include_forks: bool,
+        /// Also sync archived repos.
+        #[arg(long)]
+        include_archived: bool,
+        /// Also add the checkout directory's parent to the scan roots, so the
+        /// new checkouts show up in the dashboard without a config edit.
+        #[arg(long)]
+        root: bool,
+    },
+    /// List the registered owners.
+    List {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Forget an owner. Config only — checkouts on disk are left alone.
+    Remove {
+        /// Every registration with this owner is removed.
+        owner: String,
+    },
+    /// Clone what is missing and fast-forward what is present, one repo at a
+    /// time. Orphans are reported, never deleted.
+    Sync {
+        /// Which owner to sync. Omitted means every enabled registration.
+        owner: Option<String>,
+        /// Print the plan without cloning or updating anything.
+        #[arg(long)]
+        dry_run: bool,
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Args, Debug, Clone)]

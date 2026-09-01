@@ -585,7 +585,10 @@ mod tests {
         let plan = plan(&remote, &disk, &org());
 
         assert_eq!(
-            plan.to_clone.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(),
+            plan.to_clone
+                .iter()
+                .map(|r| r.name.as_str())
+                .collect::<Vec<_>>(),
             vec!["alpha", "gamma"]
         );
         assert_eq!(plan.to_update, vec![PathBuf::from("/r/beta")]);
@@ -645,11 +648,17 @@ mod tests {
         let plan = plan(&remote, &disk, &org());
 
         assert_eq!(
-            plan.to_clone.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(),
+            plan.to_clone
+                .iter()
+                .map(|r| r.name.as_str())
+                .collect::<Vec<_>>(),
             vec!["alpha", "mike"]
         );
         assert_eq!(plan.to_update, vec![PathBuf::from("/r/zulu")]);
-        assert_eq!(plan.orphans, vec![PathBuf::from("/r/beta"), PathBuf::from("/r/yank")]);
+        assert_eq!(
+            plan.orphans,
+            vec![PathBuf::from("/r/beta"), PathBuf::from("/r/yank")]
+        );
     }
 
     // ------------------------------------------------------------------
@@ -668,7 +677,10 @@ mod tests {
         std::fs::create_dir_all(root.join("plain")).unwrap();
         std::fs::write(root.join("loose.txt"), "").unwrap();
 
-        assert_eq!(disk_repos(root), vec![root.join("real"), root.join("worktree")]);
+        assert_eq!(
+            disk_repos(root),
+            vec![root.join("real"), root.join("worktree")]
+        );
     }
 
     #[test]
@@ -685,7 +697,10 @@ mod tests {
         let cfg = cfg_with_root(Path::new("/somewhere"));
         let mut org = org();
         org.path = Some("~/custom/spot".into());
-        assert_eq!(effective_path(&cfg, &org).unwrap(), paths::expand("~/custom/spot"));
+        assert_eq!(
+            effective_path(&cfg, &org).unwrap(),
+            paths::expand("~/custom/spot")
+        );
     }
 
     #[test]
@@ -950,7 +965,11 @@ mod tests {
                     assert_eq!(outcome.name, name_in_label(&pair[0]));
                     let expected = format!(
                         "{} {}",
-                        if outcome.action == Action::Cloned { "cloning" } else { "updating" },
+                        if outcome.action == Action::Cloned {
+                            "cloning"
+                        } else {
+                            "updating"
+                        },
                         outcome.name
                     );
                     assert_eq!(label_of(&pair[0]), expected);
@@ -1050,7 +1069,8 @@ mod tests {
         assert_eq!(outcomes.len(), 1);
         assert_eq!(outcomes[0].action, Action::Error);
         assert_eq!(outcomes[0].name, "acme");
-        assert!(outcomes[0].detail.starts_with("org path could not be resolved"));
+        assert!(outcomes[0]
+            .detail
+            .starts_with("org path could not be resolved"));
     }
 }
-

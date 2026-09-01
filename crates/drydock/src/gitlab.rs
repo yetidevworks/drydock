@@ -38,7 +38,13 @@ async fn run_glab(args: &[&str], host: &str, timeout: Duration) -> Result<String
 
     let output = tokio::time::timeout(timeout, cmd.output())
         .await
-        .map_err(|_| anyhow!("glab {} timed out after {}s", args.join(" "), timeout.as_secs()))?
+        .map_err(|_| {
+            anyhow!(
+                "glab {} timed out after {}s",
+                args.join(" "),
+                timeout.as_secs()
+            )
+        })?
         .with_context(|| format!("running glab {}", args.join(" ")))?;
 
     if !output.status.success() {
@@ -84,7 +90,14 @@ pub async fn list_owner(
             args.push("--user");
             args.push(owner);
         }
-        args.extend(["--output", "json", "--per-page", &per_page_arg, "--page", &page_arg]);
+        args.extend([
+            "--output",
+            "json",
+            "--per-page",
+            &per_page_arg,
+            "--page",
+            &page_arg,
+        ]);
 
         let body = run_glab(&args, host, timeout).await?;
         let page_repos = parse_glab(&body)?;

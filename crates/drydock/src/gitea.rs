@@ -32,7 +32,13 @@ async fn run_tea(args: &[&str], timeout: Duration) -> Result<String> {
 
     let output = tokio::time::timeout(timeout, cmd.output())
         .await
-        .map_err(|_| anyhow!("tea {} timed out after {}s", args.join(" "), timeout.as_secs()))?
+        .map_err(|_| {
+            anyhow!(
+                "tea {} timed out after {}s",
+                args.join(" "),
+                timeout.as_secs()
+            )
+        })?
         .with_context(|| format!("running tea {}", args.join(" ")))?;
 
     if !output.status.success() {
@@ -133,7 +139,10 @@ mod tests {
         assert_eq!(repos.len(), 3);
         assert_eq!(repos[0].name, "fleet");
         assert_eq!(repos[0].ssh_url, "git@git.example.com:otter/fleet.git");
-        assert_eq!(repos[0].https_url, "https://git.example.com/otter/fleet.git");
+        assert_eq!(
+            repos[0].https_url,
+            "https://git.example.com/otter/fleet.git"
+        );
         assert!(!repos[0].archived);
         assert!(!repos[0].fork);
         assert!(repos[1].archived);

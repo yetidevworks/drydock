@@ -18,6 +18,7 @@ use super::{App, Mode};
 use crate::column::{Column, Width};
 use crate::fmt;
 use crate::model::{ChangeKind, ReleaseState, RepoStatus, Visibility, VisibilityStatus};
+use crate::org;
 use crate::paths;
 use crate::report::Align;
 
@@ -135,6 +136,14 @@ pub fn render(f: &mut Frame, app: &App) -> u16 {
         Mode::Detail => render_detail(f, app, f.area()),
         Mode::Columns => {
             render_columns(f, app, f.area());
+            0
+        }
+        Mode::Orgs => {
+            render_orgs(f, app, f.area());
+            0
+        }
+        Mode::OrgForm => {
+            render_org_form(f, app, f.area());
             0
         }
         _ => 0,
@@ -602,6 +611,21 @@ pub(super) fn key_hints(app: &App) -> &'static [(&'static str, &'static str)] {
             ("y", "copy path"),
         ],
         Mode::Search => &[("esc", "cancel"), ("enter", "keep"), ("type", "to filter")],
+        Mode::Orgs => &[
+            ("j/k", "move"),
+            ("a", "add"),
+            ("e", "edit"),
+            ("x", "remove"),
+            ("s", "sync"),
+            ("S", "sync all"),
+            ("esc", "close"),
+        ],
+        Mode::OrgForm => &[
+            ("tab", "next field"),
+            ("enter", "next / save"),
+            ("space", "toggle"),
+            ("esc", "cancel"),
+        ],
         Mode::Columns if shift => &[("J/K", "move column"), ("C", "close")],
         _ if shift => &[
             ("O", "editor"),
@@ -625,6 +649,7 @@ pub(super) fn key_hints(app: &App) -> &'static [(&'static str, &'static str)] {
             ("1-4", "since"),
             ("o", "finder"),
             ("^f", "fetch all"),
+            ("A", "orgs"),
             ("?", "help"),
         ],
     }
@@ -825,6 +850,7 @@ fn render_help(f: &mut Frame, app: &App, area: Rect) -> u16 {
                 ("y", "copy the path"),
                 ("R / ctrl-r", "rescan now"),
                 ("C", "choose which columns to show"),
+                ("A", "manage org owners: add, edit, remove, sync"),
             ],
         ),
     ];
@@ -956,6 +982,180 @@ fn render_columns(f: &mut Frame, app: &App, area: Rect) {
         .borders(Borders::ALL)
         .border_style(Style::default().fg(ACCENT))
         .title(" columns · space toggles · J/K reorders · a resets · esc saves ")
+        .title_alignment(Alignment::Center);
+    f.render_widget(Paragraph::new(lines).block(block), area);
+}
+
+/// The org manager. One row per configured owner: who, where, how much of
+/// it is on disk, and when it last synced -- `drydock org list` with the
+/// keys to change and sync what it shows. The table is read straight from
+/// `app.cfg.orgs` every frame, so a save or removal in the form is already
+/// on screen by the time the form closes.
+fn render_orgs(f: &mut Frame, app: &App, area: Rect) {
+    let area = centred(area, 86, 70);
+    f.render_widget(Clear, area);
+
+    let mut lines: Vec<Line> = Vec::new();
+    if app.cfg.orgs.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  No orgs configured yet. Press a to add one.",
+            Style::default().fg(DIM),
+        )));
+    } else {
+        lines.push(Line::from(Span::styled(
+            format!(
+                "  {:<9}{:<16}{:<18}{:<32}{:>8}  {:<8}",
+                "PROVIDER", "OWNER", "HOST", "PATH", "ON DISK", "LAST SYNC"
+            ),
+            Style::default().fg(DIM),
+        )));
+    }
+
+    for (i, org) in app.cfg.orgs.iter().enumerate() {
+        let selected = i == app.orgs_cursor;
+        let mut style = Style::default().fg(Color::White);
+        if selected {
+            style = style.add_modifier(Modifier::REVERSED);
+        }
+
+        // Computed from the config, not stored: the path field is optional
+        // and the default depends on the configured roots, so anything
+        // stashed on the org would be a second truth to keep in step.
+        let effective = org::effective_path(&app.cfg, org);
+        let path = match &effective {
+            Ok(p) => paths::contract(p),
+            Err(_) => "-".into(),
+        };
+        let on_disk = effective
+            .map(|p| app.repos.iter().filter(|r| r.root.starts_with(&p)).count())
+            .unwrap_or(0);
+        let last_sync = app
+            .org_states
+            .get(&(
+                org.resolved_provider().as_str().to_string(),
+                org.host.clone(),
+                org.owner.clone(),
+            ))
+            .map(|state| fmt::age(state.last_sync_at, app.now))
+            .unwrap_or_else(|| "never".into());
+
+        let disabled = if org.enabled { "" } else { "  (disabled)" };
+        lines.push(Line::from(vec![
+            Span::styled(format!("  {:<9}", org.resolved_provider().as_str()), style),
+            Span::styled(format!("{:<16}", org.owner), style),
+            Span::styled(format!("{:<18}", org.host), style),
+            Span::styled(format!("{:<32}", path), style),
+            Span::styled(format!("{:>8}  ", on_disk), style),
+            Span::styled(format!("{last_sync}{disabled}"), style),
+        ]));
+    }
+
+    lines.push(Line::from(""));
+    if let Some(run) = &app.org_sync {
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("  {} ", app.spinner_frame()),
+                Style::default().fg(ACCENT),
+            ),
+            Span::styled(
+                format!(
+                    "syncing {} · {} {}/{} · cloned {} updated {} errors {}",
+                    run.owner, run.label, run.done, run.total, run.cloned, run.updated, run.errors
+                ),
+                Style::default().fg(Color::White),
+            ),
+        ]));
+    }
+    lines.push(Line::from(Span::styled(
+        " j/k move · a add · e edit · x remove (twice) · s sync · S sync all · esc close",
+        Style::default().fg(DIM),
+    )));
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(ACCENT))
+        .title(" orgs ")
+        .title_alignment(Alignment::Center);
+    f.render_widget(Paragraph::new(lines).block(block), area);
+}
+
+/// The add/edit form. Labelled rows with the active one reversed, the caret
+/// glyph after the active text field, and the toggles as checkboxes -- the
+/// same vocabulary the column picker already teaches.
+fn render_org_form(f: &mut Frame, app: &App, area: Rect) {
+    let area = centred(area, 62, 66);
+    f.render_widget(Clear, area);
+
+    let form = &app.org_form;
+    // A caret on the active field, like the search bar draws one -- text
+    // entry here is the search bar's model, so the feedback should be too.
+    let field = |i: usize, text: &str| -> Span<'static> {
+        let shown = if form.field == i {
+            format!("{text}▏")
+        } else {
+            text.to_string()
+        };
+        let mut style = Style::default().fg(Color::White);
+        if form.field == i {
+            style = style.add_modifier(Modifier::REVERSED);
+        }
+        Span::styled(shown, style)
+    };
+
+    let mut lines: Vec<Line> = Vec::new();
+    for (i, (label, value)) in [
+        ("provider", &form.provider),
+        ("host", &form.host),
+        ("owner", &form.owner),
+        ("path", &form.path),
+        ("login", &form.login),
+        ("protocol", &form.protocol),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        lines.push(Line::from(vec![
+            Span::styled(format!("  {label:<18}"), Style::default().fg(DIM)),
+            field(i, value),
+        ]));
+    }
+    for (i, (label, on)) in [
+        ("include forks", form.include_forks),
+        ("include archived", form.include_archived),
+        ("include subgroups", form.include_subgroups),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let field_index = super::ORG_TEXT_FIELDS + i;
+        let mut style = Style::default().fg(Color::White);
+        if form.field == field_index {
+            style = style.add_modifier(Modifier::REVERSED);
+        }
+        lines.push(Line::from(vec![
+            Span::styled(format!("  {label:<18}"), Style::default().fg(DIM)),
+            Span::styled(format!("[{}]", if on { "x" } else { " " }), style),
+        ]));
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        " provider: github, gitlab or gitea -- empty infers from the host",
+        Style::default().fg(DIM),
+    )));
+    lines.push(Line::from(Span::styled(
+        " path: empty means <first configured root>/<owner>",
+        Style::default().fg(DIM),
+    )));
+
+    let title = match form.editing {
+        Some(_) => " edit org · enter next · esc cancels ",
+        None => " new org · enter next · esc cancels ",
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(ACCENT))
+        .title(title)
         .title_alignment(Alignment::Center);
     f.render_widget(Paragraph::new(lines).block(block), area);
 }

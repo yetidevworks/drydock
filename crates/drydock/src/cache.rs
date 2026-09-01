@@ -106,7 +106,11 @@ fn write_cache_file(path: &Path, mut cache: Cache) -> Result<()> {
 /// The identity of an org state: provider, host, owner — the same triple the
 /// config uses to name a registration.
 fn org_key(state: &OrgSyncState) -> (String, String, String) {
-    (state.provider.clone(), state.host.clone(), state.owner.clone())
+    (
+        state.provider.clone(),
+        state.host.clone(),
+        state.owner.clone(),
+    )
 }
 
 /// Load the cache, keyed by repo root for quick lookup during a sweep.
@@ -224,8 +228,7 @@ mod tests {
     fn org_states_round_trip_through_the_cache_file() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("state.json");
-        save_org_states_at(&path, vec![state("github", "github.com", "acme")])
-            .unwrap();
+        save_org_states_at(&path, vec![state("github", "github.com", "acme")]).unwrap();
 
         let loaded = load_org_states_at(&path);
         assert_eq!(loaded.len(), 1);
@@ -243,8 +246,7 @@ mod tests {
         let repo = RepoStatus::new(dir.path().join("r"), "g".into(), "r1".into());
         save_repos_at(&path, &[repo]).unwrap();
 
-        save_org_states_at(&path, vec![state("gitea", "g.example.com", "otter")])
-            .unwrap();
+        save_org_states_at(&path, vec![state("gitea", "g.example.com", "otter")]).unwrap();
 
         let cache = read_cache_file(&path).unwrap();
         assert_eq!(cache.repos.len(), 1, "repos must survive the org write");

@@ -104,7 +104,13 @@ async fn run_gh(args: &[&str], timeout: Duration) -> Result<String> {
 
     let output = tokio::time::timeout(timeout, cmd.output())
         .await
-        .map_err(|_| anyhow!("gh {} timed out after {}s", args.join(" "), timeout.as_secs()))?
+        .map_err(|_| {
+            anyhow!(
+                "gh {} timed out after {}s",
+                args.join(" "),
+                timeout.as_secs()
+            )
+        })?
         .with_context(|| format!("running gh {}", args.join(" ")))?;
 
     if !output.status.success() {

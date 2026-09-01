@@ -108,6 +108,7 @@ current directory, so it behaves the same wherever you invoke it.
 | `f` `F` | fetch the selected repo · everything on screen |
 | `ctrl-f` | fetch **every** repo in the fleet, whatever is filtered or scrolled off |
 | `C` | choose which columns to show |
+| `A` | orgs: manage organization sources and sync them |
 | `R` `ctrl-r` | rescan now — the local twin of `ctrl-f` |
 | `?` `q` | help, with a legend for every marker on screen · quit |
 
@@ -149,6 +150,58 @@ Release state: `--unreleased` (never tagged), `--needs-release`, `--released`.
 
 Several filters **widen** the result by default: `--dirty --unpushed` means
 "either". Pass `--match all` (or press `&`) to require all of them instead.
+
+### Organizations
+
+Press `A` in the dashboard to manage organization sources, or use the `org`
+commands. Register a GitHub, GitLab, or Gitea/Forgejo owner — an organization
+or a single user, they list the same way — and `sync` makes a directory on
+disk match that owner's repo list: clones what's missing, fast-forwards what's
+there. `drydock org remove` forgets the registration and leaves the checkouts
+alone.
+
+```sh
+drydock org add yetidevworks                    # provider inferred from github.com
+drydock org add --host git.example.com --provider gitea otter
+drydock org list
+drydock org sync                                # every enabled org
+drydock org sync yetidevworks --dry-run         # show the plan, touch nothing
+drydock org sync --json                         # machine-readable report
+```
+
+Registrations persist under `[[orgs]]` in your config:
+
+```toml
+[[orgs]]
+provider = "github"        # github | gitlab | gitea; inferred for github.com, gitlab.com, gitea.com, required otherwise
+host = "github.com"        # instance hostname: github.com, gitlab.com, or a self-hosted host
+owner = "yetidevworks"     # an organization or a single user — both list the same way
+path = "~/Projects/yetidevworks"          # where checkouts live; defaults to <first configured root>/<owner>
+login = ""                 # Gitea only: which `tea login` entry to use; empty = tea's default
+protocol = "ssh"           # ssh | https
+include_forks = false      # skip forked repos
+include_archived = false   # skip archived repos
+include_subgroups = false  # GitLab groups only: also list subgroup projects
+exclude = []               # repo-name globs to skip, e.g. ["sandbox-*"]
+enabled = true             # sync skips disabled orgs
+```
+
+That default path is the point: `~/Projects/<owner>` sits under one of your
+scan roots, so the owner shows up as a dashboard group and every freshly
+cloned repo appears on the next sweep like anything else on disk.
+
+Listing goes through each provider's own CLI — `gh` on GitHub, `glab` on
+GitLab, `tea` on Gitea/Forgejo — riding on credentials you've already
+configured with that tool (`gh auth login`, `glab auth login`,
+`tea login add`). drydock never reads or stores a token, and if the CLI isn't
+authenticated the sync says so rather than guessing.
+
+Sync is deliberately conservative. It runs strictly serially — one repo at a
+time, never in parallel, whatever `remote.concurrency` says. Updates are
+`git pull --ff-only` and nothing else, so a dirty or diverged repo is skipped
+and reported rather than touched. And nothing is ever deleted: repos on disk
+the owner no longer lists are reported as orphans, and removing them stays
+your job.
 
 ## How it works, and why it's quick
 

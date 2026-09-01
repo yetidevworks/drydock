@@ -1,3 +1,10 @@
+# Unreleased
+
+1. [](#new)
+    * **Org sync: register a GitHub, GitLab, or Gitea/Forgejo owner and sync its checkouts.** `drydock org add <owner>` remembers the provider, the host and where the checkouts live (defaulting to `<first configured root>/<owner>`, so the owner reads as a dashboard group); `drydock org sync` clones every repo the owner lists that isn't on disk and fast-forwards the ones that are, with `--dry-run` to show the plan first and `--json` for the report. Updates are `git pull --ff-only` and nothing else — a dirty or diverged repo is skipped and reported rather than touched — and sync runs strictly serially, one repo at a time, whatever `remote.concurrency` says. Nothing is ever deleted: repos on disk the owner no longer lists come back as orphans for you to deal with. Listing rides each provider's own CLI (`gh`, `glab`, `tea`) on credentials you've already configured there; drydock never reads a token.
+    * **`A` opens the org manager in the dashboard**: add, edit and remove registrations, sync one or every enabled org, with progress in the status line and a summary when it finishes.
+    * Registrations persist under `[[orgs]]` in `config.toml`, hand-editable like every other setting; `drydock org remove` forgets one and leaves its checkouts alone.
+
 # 1.1.0
 
 ## 08/30/2026

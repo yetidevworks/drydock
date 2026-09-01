@@ -521,8 +521,11 @@ impl Config {
         // Nested paths mean one sync would fast-forward repos inside another
         // org's directory — or report them as orphans. Either way it's a
         // config bug worth catching before anything runs.
-        let resolved: Vec<Option<PathBuf>> =
-            self.orgs.iter().map(|org| self.resolved_org_path(org)).collect();
+        let resolved: Vec<Option<PathBuf>> = self
+            .orgs
+            .iter()
+            .map(|org| self.resolved_org_path(org))
+            .collect();
         for i in 0..resolved.len() {
             for j in (i + 1)..resolved.len() {
                 let pair = match (&resolved[i], &resolved[j]) {
@@ -729,10 +732,22 @@ mod tests {
 
     #[test]
     fn from_host_knows_the_hosted_instances() {
-        assert_eq!(OrgProvider::from_host("github.com"), Some(OrgProvider::GitHub));
-        assert_eq!(OrgProvider::from_host("GitHub.Com"), Some(OrgProvider::GitHub));
-        assert_eq!(OrgProvider::from_host(" gitlab.com "), Some(OrgProvider::GitLab));
-        assert_eq!(OrgProvider::from_host("gitea.com"), Some(OrgProvider::Gitea));
+        assert_eq!(
+            OrgProvider::from_host("github.com"),
+            Some(OrgProvider::GitHub)
+        );
+        assert_eq!(
+            OrgProvider::from_host("GitHub.Com"),
+            Some(OrgProvider::GitHub)
+        );
+        assert_eq!(
+            OrgProvider::from_host(" gitlab.com "),
+            Some(OrgProvider::GitLab)
+        );
+        assert_eq!(
+            OrgProvider::from_host("gitea.com"),
+            Some(OrgProvider::Gitea)
+        );
         assert_eq!(OrgProvider::from_host("git.example.com"), None);
         assert_eq!(OrgProvider::from_host(""), None);
     }
@@ -763,8 +778,14 @@ mod tests {
         .unwrap();
 
         let problems = cfg.org_problems();
-        assert!(problems.iter().any(|p| p.contains("duplicate")), "{problems:?}");
-        assert!(problems.iter().any(|p| p.contains("overlaps")), "{problems:?}");
+        assert!(
+            problems.iter().any(|p| p.contains("duplicate")),
+            "{problems:?}"
+        );
+        assert!(
+            problems.iter().any(|p| p.contains("overlaps")),
+            "{problems:?}"
+        );
     }
 
     #[test]
