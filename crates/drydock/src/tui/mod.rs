@@ -1505,6 +1505,16 @@ const REPROBE_COOLDOWN_SECS: i64 = 30;
 
 fn reprobe_changed(app: &mut App, paths: Vec<PathBuf>, tx: &mpsc::UnboundedSender<Input>) {
     let now = git::now_unix();
+    let go = reprobe_gate(app, paths, now);
+    if !go.is_empty() {
+        spawn_reprobe(app, go, tx);
+    }
+}
+
+/// The three gates over one watcher batch, separated from the spawn so tests
+/// can drive app state without tasks. Mutates the gate state — that is its
+/// job — and returns the repos that should re-probe now.
+fn reprobe_gate(app: &mut App, paths: Vec<PathBuf>, now: i64) -> Vec<PathBuf> {
     let mut go: Vec<PathBuf> = Vec::new();
     {
         let mut inflight = app
@@ -1534,9 +1544,7 @@ fn reprobe_changed(app: &mut App, paths: Vec<PathBuf>, tx: &mpsc::UnboundedSende
             }
         }
     }
-    if !go.is_empty() {
-        spawn_reprobe(app, go, tx);
-    }
+    go
 }
 
 /// A finished re-probe releases its repos; anything flagged during the run
@@ -1577,6 +1585,21 @@ fn spawn_reprobe(app: &mut App, roots: Vec<PathBuf>, tx: &mpsc::UnboundedSender<
     }
     if targets.is_empty() {
         return;
+    }
+
+    // In-flight registration lives HERE, not only in the gate, so re-issued
+    // probes (a change that landed mid-probe) are protected from pileup too.
+    let now = git::now_unix();
+    {
+        let mut inflight = app
+            .reprobe_inflight
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let mut last = app.reprobe_last.lock().unwrap_or_else(|p| p.into_inner());
+        for (root, _, _) in &targets {
+            inflight.insert(root.clone());
+            last.insert(root.clone(), now);
+        }
     }
 
     let cfg = app.cfg.clone();
@@ -3860,5 +3883,64 @@ mod tests {
             PathBuf::from("/p/g/r2"),
         ];
         assert_eq!(storm_filter(false, paths.clone()), paths);
+    }
+
+    /// The re-probe gates, driven through app state: in-flight dedup, the
+    /// cooldown, pending re-issue, and discovery membership.
+    #[tokio::test]
+    async fn the_reprobe_gate_dedups_cools_down_and_reissues() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("acme/repo");
+        std::fs::create_dir_all(repo.join(".git/refs")).unwrap();
+        let cfg = Arc::new(Config {
+            roots: vec![dir.path().to_string_lossy().to_string()],
+            ..Config::default()
+        });
+        let mut app = App::new(cfg);
+        app.repos
+            .push(RepoStatus::new(repo.clone(), "acme".into(), "repo".into()));
+        app.reindex();
+        let now = git::now_unix();
+        let (tx, _rx) = mpsc::unbounded_channel();
+
+        // First batch goes straight to re-probe.
+        let go = reprobe_gate(&mut app, vec![repo.clone()], now);
+        assert_eq!(go, vec![repo.clone()]);
+
+        // An immediate second batch is held as pending — the probe for the
+        // first is still running.
+        assert!(
+            reprobe_gate(&mut app, vec![repo.clone()], now).is_empty(),
+            "in-flight repos are not re-probed"
+        );
+
+        // The probe lands with the repo flagged again: re-issued even inside
+        // the cooldown, because the flag postdates the probe.
+        app.reprobe_pending
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(repo.clone());
+        reprobe_finished(&mut app, vec![repo.clone()], &tx);
+        assert!(
+            app.reprobe_inflight
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .contains(&repo),
+            "a pending change was re-issued immediately"
+        );
+
+        // The probe lands with nothing pending: the cooldown defers the next
+        // identical batch to the sweep.
+        reprobe_finished(&mut app, vec![repo.clone()], &tx);
+        assert!(
+            reprobe_gate(&mut app, vec![repo.clone()], now).is_empty(),
+            "the cooldown defers back-to-back re-probes"
+        );
+
+        // Paths that are not known repos never re-probe at all.
+        assert!(
+            reprobe_gate(&mut app, vec![PathBuf::from("/nowhere")], now).is_empty(),
+            "unknown paths are dropped"
+        );
     }
 }

@@ -1059,4 +1059,186 @@ mod tests {
             ))
         );
     }
+
+    // ------------------------------------------------------------------
+    // The fingerprint gate
+    // ------------------------------------------------------------------
+
+    fn gate_git(dir: &Path, args: &[&str]) {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@e")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@e")
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {args:?}: {out:?}");
+    }
+
+    fn gate_source_repo(dir: &Path, name: &str) -> PathBuf {
+        let src = dir.join(name);
+        std::fs::create_dir_all(&src).unwrap();
+        gate_git(&src, &["init", "-q", "-b", "main", "."]);
+        std::fs::write(src.join("f.txt"), "one").unwrap();
+        gate_git(&src, &["add", "-A"]);
+        gate_git(&src, &["commit", "-qm", "one"]);
+        src
+    }
+
+    #[test]
+    fn the_fingerprint_is_stable_and_moves_on_a_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = gate_source_repo(dir.path(), "repo");
+
+        let first = repo_fingerprint(&repo);
+        let again = repo_fingerprint(&repo);
+        assert_eq!(
+            first, again,
+            "an untouched checkout fingerprints identically"
+        );
+
+        // An unstaged working-tree edit is the watcher's job, not the
+        // fingerprint's: the documented trade for per-repo watch sets.
+        std::fs::write(repo.join("untracked.txt"), "x").unwrap();
+        assert_eq!(
+            repo_fingerprint(&repo),
+            first,
+            "unstaged edits do not move the fingerprint"
+        );
+
+        // A commit rewrites the loose ref and the reflog; either moving is
+        // enough, and here both do.
+        std::fs::write(repo.join("f.txt"), "two").unwrap();
+        gate_git(&repo, &["add", "-A"]);
+        gate_git(&repo, &["commit", "-qm", "two"]);
+        assert_ne!(
+            repo_fingerprint(&repo),
+            first,
+            "a commit moves the fingerprint"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unchanged_checkout_skips_the_probe_and_returns_the_cached_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = gate_source_repo(dir.path(), "repo");
+        let d = Discovered {
+            root: root.clone(),
+            group: "acme".into(),
+            name: "repo".into(),
+        };
+        let cfg = Config::default();
+
+        let first = probe_one(&d, &cfg, None, Tier::Full, false).await;
+        assert!(first.refs.is_some(), "the first probe runs for real");
+        let fp = first
+            .fingerprint
+            .expect("the first probe records a fingerprint");
+
+        // Unchanged: the cached row comes back verbatim — same probe
+        // timestamps prove no git process ran.
+        let second = probe_one(&d, &cfg, Some(&first), Tier::Full, false).await;
+        assert_eq!(
+            second.refs_probed_at, first.refs_probed_at,
+            "the gate skipped the re-probe"
+        );
+        assert_eq!(second.fingerprint, Some(fp));
+
+        // A watcher event forces a real re-probe even when unchanged. The
+        // pause keeps the probe timestamps on separate walls of the clock:
+        // they are second-resolution, and a same-second re-probe is
+        // indistinguishable from a skip by timestamp alone.
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        let forced = probe_one(&d, &cfg, Some(&first), Tier::Full, true).await;
+        assert_ne!(
+            forced.refs_probed_at, first.refs_probed_at,
+            "force bypasses the gate"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_commit_after_the_last_probe_re_probes() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = gate_source_repo(dir.path(), "src");
+        let work = dir.path().join("work");
+        gate_git(
+            dir.path(),
+            &["clone", "-q", &format!("file://{}", src.display()), "work"],
+        );
+
+        let d = Discovered {
+            root: work.clone(),
+            group: "acme".into(),
+            name: "work".into(),
+        };
+        let cfg = Config::default();
+        let first = probe_one(&d, &cfg, None, Tier::Full, false).await;
+        let fp = first.fingerprint.unwrap();
+
+        // Commit upstream, pull it into the clone: the clone's git state
+        // moved, so the next probe must re-probe rather than skip.
+        std::fs::write(src.join("f.txt"), "two").unwrap();
+        gate_git(&src, &["add", "-A"]);
+        gate_git(&src, &["commit", "-qm", "two"]);
+        gate_git(&work, &["pull", "-q"]);
+
+        // See the force test: second-resolution timestamps need a pause.
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        let second = probe_one(&d, &cfg, Some(&first), Tier::Full, false).await;
+        assert_ne!(
+            second.fingerprint,
+            Some(fp),
+            "the fingerprint moved with the pull"
+        );
+        assert_ne!(
+            second.work_probed_at, first.work_probed_at,
+            "the moved state re-probed"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_sweep_skips_unchanged_repos_and_probes_new_ones() {
+        let dir = tempfile::tempdir().unwrap();
+        let warm_root = gate_source_repo(dir.path(), "warm");
+        let fresh_root = gate_source_repo(dir.path(), "fresh");
+        let cfg = Config::default();
+
+        let warm_d = Discovered {
+            root: warm_root.clone(),
+            group: "acme".into(),
+            name: "warm".into(),
+        };
+        let fresh_d = Discovered {
+            root: fresh_root.clone(),
+            group: "acme".into(),
+            name: "fresh".into(),
+        };
+
+        // Establish the warm repo's cache row (and its fingerprint).
+        let warm_prev = probe_one(&warm_d, &cfg, None, Tier::Full, false).await;
+
+        let mut cached = HashMap::new();
+        cached.insert(warm_root.clone(), warm_prev.clone());
+        let mut timings = Timings::default();
+        let out = sweep_repos(
+            Arc::new(cfg.clone()),
+            vec![warm_d, fresh_d],
+            cached,
+            Tier::Full,
+            &None,
+            &mut timings,
+        )
+        .await;
+        assert_eq!(out.len(), 2);
+
+        let warm = out.iter().find(|r| r.root == warm_root).unwrap();
+        assert_eq!(
+            warm.refs_probed_at, warm_prev.refs_probed_at,
+            "the unchanged repo was skipped, not re-probed"
+        );
+        let fresh = out.iter().find(|r| r.root == fresh_root).unwrap();
+        assert!(fresh.refs.is_some(), "the new repo was probed fresh");
+    }
 }
