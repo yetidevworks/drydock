@@ -501,7 +501,6 @@ async fn cmd_org(command: OrgCommands) -> Result<()> {
             protocol,
             include_forks,
             include_archived,
-            root,
         } => org_add(
             owner,
             provider,
@@ -511,7 +510,6 @@ async fn cmd_org(command: OrgCommands) -> Result<()> {
             protocol,
             include_forks,
             include_archived,
-            root,
         ),
         OrgCommands::List { json } => org_list(json),
         OrgCommands::Remove { owner } => org_remove(&owner),
@@ -717,7 +715,6 @@ fn org_add(
     protocol: Option<String>,
     include_forks: bool,
     include_archived: bool,
-    add_root: bool,
 ) -> Result<()> {
     // Provider, host, and login all come from what the CLI tools are already
     // authenticated to: probe once, then let the resolver either name the
@@ -757,21 +754,12 @@ fn org_add(
         ..config::OrgConfig::default()
     };
 
-    // The checkout path is needed for `--root` and for the confirmation line,
-    // and resolving it here means `org add` fails loudly rather than leaving
-    // a registration that sync cannot place anywhere.
+    // Resolving the checkout here means `org add` fails loudly rather than
+    // leaving a registration that sync cannot place anywhere; the path is
+    // also what the confirmation line names below.
     let checkout = org::effective_path(&cfg, &org)?;
-    if add_root {
-        if let Some(parent) = checkout.parent() {
-            // Compared expanded: a root written as `~/Projects` and a parent
-            // under `$HOME` are the same directory to the sweep.
-            if !cfg.root_paths().contains(&parent.to_path_buf()) {
-                cfg.roots.push(paths::contract(parent));
-            }
-        }
-    }
 
-    cfg.orgs.push(org);
+    cfg.orgs.push(org.clone());
     let problems = cfg.org_problems();
     if !problems.is_empty() {
         // Nothing has been saved: a bad registration should not leave the
@@ -782,12 +770,30 @@ fn org_add(
         return Err(anyhow!("org add failed validation; config not saved"));
     }
 
+    // The registration is validated, so wiring the scan root is safe:
+    // discovery only walks `roots`, and without this an org whose checkouts
+    // sit outside them would sync fine yet never appear on the dashboard.
+    let roots_before = cfg.roots.clone();
+    let root_added = org::ensure_scan_root(&mut cfg, &org)?;
+
     let written = config::save(&cfg)?;
+    let added_roots: Vec<String> = cfg
+        .roots
+        .iter()
+        .filter(|r| !roots_before.contains(r))
+        .cloned()
+        .collect();
+    let root_note = if root_added {
+        format!(" Scan root {} added.", added_roots.join(", "))
+    } else {
+        String::new()
+    };
     println!(
-        "Registered {} on {} — checkouts under {}. Config written to {}.",
+        "Registered {} on {} — checkouts under {}.{} Config written to {}.",
         owner,
         target.host,
         paths::contract(&checkout),
+        root_note,
         written.display(),
     );
     Ok(())
@@ -875,11 +881,15 @@ fn org_remove(owner: &str) -> Result<()> {
 }
 
 async fn org_sync(owner: Option<String>, dry_run: bool, json: bool) -> Result<()> {
-    let cfg = config::load()?;
-    let targets: Vec<&config::OrgConfig> = match owner {
+    let mut cfg = config::load()?;
+    let targets: Vec<config::OrgConfig> = match owner {
         Some(name) => {
-            let matches: Vec<&config::OrgConfig> =
-                cfg.orgs.iter().filter(|o| o.owner == name).collect();
+            let matches: Vec<config::OrgConfig> = cfg
+                .orgs
+                .iter()
+                .filter(|o| o.owner == name)
+                .cloned()
+                .collect();
             if matches.is_empty() {
                 let owners = configured_owners(&cfg);
                 if owners.is_empty() {
@@ -898,7 +908,8 @@ async fn org_sync(owner: Option<String>, dry_run: bool, json: bool) -> Result<()
                     "No orgs are registered. Try `drydock org add <owner>`."
                 ));
             }
-            let enabled: Vec<&config::OrgConfig> = cfg.orgs.iter().filter(|o| o.enabled).collect();
+            let enabled: Vec<config::OrgConfig> =
+                cfg.orgs.iter().filter(|o| o.enabled).cloned().collect();
             if enabled.is_empty() {
                 return Err(anyhow!(
                     "Every registered org is disabled. Enable one in the config or name an owner."
@@ -908,7 +919,32 @@ async fn org_sync(owner: Option<String>, dry_run: bool, json: bool) -> Result<()
         }
     };
 
-    for org in targets {
+    // Discovery only walks configured roots, so an org whose resolved path
+    // sits outside them would sync fine and never appear on the dashboard.
+    // Wire the roots up front — saved once, before any sync runs — instead
+    // of leaving registration to opt in.
+    let roots_before = cfg.roots.clone();
+    for org in &targets {
+        // Nothing to wire when the path cannot be resolved; sync_org's own
+        // path error will surface it with the full context.
+        let _ = org::ensure_scan_root(&mut cfg, org);
+    }
+    let added_roots: Vec<String> = cfg
+        .roots
+        .iter()
+        .filter(|r| !roots_before.contains(r))
+        .cloned()
+        .collect();
+    if !added_roots.is_empty() {
+        config::save(&cfg)?;
+        println!(
+            "Added scan root{}: {} — checkouts there will show up on the dashboard.",
+            if added_roots.len() > 1 { "s" } else { "" },
+            added_roots.join(", ")
+        );
+    }
+
+    for org in &targets {
         if dry_run {
             let (plan, _root) = org::plan_only(org, &cfg)?;
             if json {
@@ -921,10 +957,29 @@ async fn org_sync(owner: Option<String>, dry_run: bool, json: bool) -> Result<()
             // than streaming, and per-repo failures are rows in it, not
             // reasons to abort the rest of the batch.
             let outcomes = org::sync_org(org, &cfg, None).await?;
+            let cloned = outcomes
+                .iter()
+                .filter(|o| o.action == org::Action::Cloned)
+                .count();
             if json {
                 println!("{}", serde_json::to_string_pretty(&outcomes)?);
+                // stdout stays machine-readable in --json mode, so the note
+                // goes to stderr there — same channel as the other notes.
+                if cloned > 0 {
+                    eprintln!(
+                        "drydock: fresh checkouts appear on the dashboard's next sweep; ctrl-r there rescans immediately."
+                    );
+                }
             } else {
                 print_org_report(&outcomes);
+                // The dashboard has no IPC to announce new checkouts, and
+                // silence would read as "it didn't work" — say where they
+                // will show up instead.
+                if cloned > 0 {
+                    println!(
+                        "Fresh checkouts appear on the dashboard's next sweep; ctrl-r there rescans immediately."
+                    );
+                }
             }
         }
     }

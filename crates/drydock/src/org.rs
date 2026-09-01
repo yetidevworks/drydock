@@ -264,6 +264,43 @@ pub fn effective_path(cfg: &Config, org: &OrgConfig) -> Result<PathBuf> {
     }
 }
 
+/// Make sure the org's checkouts will be found by discovery. The org's path
+/// is where its checkouts live one level down (`<path>/<repo>`), so what
+/// discovery needs is the path's PARENT as a scan root — that also makes the
+/// owner read as a dashboard group, the same as the default path layout.
+///
+/// When the resolved path is already under a root (or the parent already is
+/// one), this is a no-op. When the parent is `/`, fall back to adding the
+/// path itself: an ungrouped row beats an invisible one.
+///
+/// Returns whether a root was added. Roots are stored `~`-contracted, and
+/// appended in sorted-scan order is irrelevant, so just append. The only
+/// error is [`effective_path`]'s — no roots and no path — which callers
+/// already treat as their existing failure path.
+pub fn ensure_scan_root(cfg: &mut Config, org: &OrgConfig) -> Result<bool> {
+    let path = effective_path(cfg, org)?;
+    let candidate = match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() && parent != Path::new("/") => {
+            parent.to_path_buf()
+        }
+        _ => path.clone(),
+    };
+    // Compared expanded: a root written as `~/Projects` and a candidate under
+    // `$HOME` are the same directory to the sweep. `starts_with` is
+    // component-wise, which is exactly the "under a root" relation discovery
+    // walks — so `path.starts_with(root)` covers both "equals a root" and
+    // "below one".
+    let covered = cfg
+        .root_paths()
+        .iter()
+        .any(|root| path.starts_with(root) || candidate.starts_with(root));
+    if covered {
+        return Ok(false);
+    }
+    cfg.roots.push(paths::contract(&candidate));
+    Ok(true)
+}
+
 /// Ask the resolved provider for the owner's raw repo list. No filtering
 /// happens here — forks, archives, and globs belong to the planner, and the
 /// raw list is what orphan detection needs.
@@ -1078,5 +1115,130 @@ mod tests {
         assert!(outcomes[0]
             .detail
             .starts_with("org path could not be resolved"));
+    }
+
+    // ------------------------------------------------------------------
+    // Scan-root wiring
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn path_under_an_existing_root_is_a_noop() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = cfg_with_root(dir.path());
+        let org = OrgConfig {
+            host: "github.com".into(),
+            owner: "acme".into(),
+            // The parent of this path is the root itself.
+            path: Some(format!("{}/acme", dir.path().display())),
+            ..OrgConfig::default()
+        };
+
+        assert_eq!(ensure_scan_root(&mut cfg, &org).unwrap(), false);
+        assert_eq!(cfg.roots, vec![dir.path().display().to_string()]);
+    }
+
+    #[test]
+    fn path_outside_the_roots_adds_the_parent() {
+        let mut cfg = Config {
+            roots: vec!["~/elsewhere".into()],
+            ..Config::default()
+        };
+        let org = OrgConfig {
+            host: "github.com".into(),
+            owner: "acme".into(),
+            path: Some("~/org-checkouts/acme".into()),
+            ..OrgConfig::default()
+        };
+
+        assert_eq!(ensure_scan_root(&mut cfg, &org).unwrap(), true);
+        // Stored `~`-contracted, so a hand-edited config stays readable.
+        assert_eq!(
+            cfg.roots,
+            vec!["~/elsewhere".to_string(), "~/org-checkouts".to_string()]
+        );
+    }
+
+    #[test]
+    fn adding_the_same_parent_twice_is_idempotent() {
+        let mut cfg = Config {
+            roots: vec!["~/elsewhere".into()],
+            ..Config::default()
+        };
+        let org = OrgConfig {
+            host: "github.com".into(),
+            owner: "acme".into(),
+            path: Some("~/org-checkouts/acme".into()),
+            ..OrgConfig::default()
+        };
+
+        assert_eq!(ensure_scan_root(&mut cfg, &org).unwrap(), true);
+        assert_eq!(ensure_scan_root(&mut cfg, &org).unwrap(), false);
+        assert_eq!(cfg.roots.len(), 2);
+    }
+
+    #[test]
+    fn a_second_org_under_a_newly_added_parent_is_a_noop() {
+        let mut cfg = Config {
+            roots: vec!["~/elsewhere".into()],
+            ..Config::default()
+        };
+        let first = OrgConfig {
+            host: "github.com".into(),
+            owner: "acme".into(),
+            path: Some("~/org-checkouts/acme".into()),
+            ..OrgConfig::default()
+        };
+        let second = OrgConfig {
+            host: "github.com".into(),
+            owner: "other".into(),
+            path: Some("~/org-checkouts/other".into()),
+            ..OrgConfig::default()
+        };
+
+        assert_eq!(ensure_scan_root(&mut cfg, &first).unwrap(), true);
+        assert_eq!(ensure_scan_root(&mut cfg, &second).unwrap(), false);
+        assert_eq!(
+            cfg.roots,
+            vec!["~/elsewhere".to_string(), "~/org-checkouts".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_root_level_path_falls_back_to_the_path_itself() {
+        let mut cfg = Config {
+            roots: vec!["/elsewhere".into()],
+            ..Config::default()
+        };
+        let org = OrgConfig {
+            host: "github.com".into(),
+            owner: "acme".into(),
+            // Parent is `/`: the org path itself becomes the root, because
+            // an ungrouped row still beats an invisible one. Only a
+            // single-component absolute path has `/` for a parent.
+            path: Some("/srv".into()),
+            ..OrgConfig::default()
+        };
+
+        assert_eq!(ensure_scan_root(&mut cfg, &org).unwrap(), true);
+        assert_eq!(
+            cfg.roots,
+            vec!["/elsewhere".to_string(), "/srv".to_string()]
+        );
+    }
+
+    #[test]
+    fn no_roots_and_no_path_is_an_error() {
+        let mut cfg = Config {
+            roots: Vec::new(),
+            ..Config::default()
+        };
+        let org = OrgConfig {
+            host: "github.com".into(),
+            owner: "acme".into(),
+            ..OrgConfig::default()
+        };
+
+        assert!(ensure_scan_root(&mut cfg, &org).is_err());
+        assert!(cfg.roots.is_empty());
     }
 }

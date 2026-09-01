@@ -131,10 +131,6 @@ pub enum OrgCommands {
         /// Also sync archived repos.
         #[arg(long)]
         include_archived: bool,
-        /// Also add the checkout directory's parent to the scan roots, so the
-        /// new checkouts show up in the dashboard without a config edit.
-        #[arg(long)]
-        root: bool,
     },
     /// List the registered owners.
     List {

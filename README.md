@@ -191,7 +191,11 @@ enabled = true             # sync skips disabled orgs
 
 That default path is the point: `~/Projects/<owner>` sits under one of your
 scan roots, so the owner shows up as a dashboard group and every freshly
-cloned repo appears on the next sweep like anything else on disk.
+cloned repo appears on the next sweep like anything else on disk. A custom
+`path` is wired in the same way, automatically: when the org's directory
+isn't already under a scan root, its parent is added to `roots` for you — at
+`org add`, and again on any sync for a hand-edited config — so the checkouts
+always reach the dashboard without a manual config edit.
 
 Listing goes through each provider's own CLI — `gh` on GitHub, `glab` on
 GitLab, `tea` on Gitea/Forgejo — riding on credentials you've already

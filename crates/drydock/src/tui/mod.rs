@@ -1844,6 +1844,23 @@ fn save_org_form(app: &mut App) {
     org.include_subgroups = app.org_form.include_subgroups;
 
     let mut cfg = (*app.cfg).clone();
+    // Registration implies visibility: an org whose checkouts live under no
+    // configured root would sync fine and never show up on the dashboard, so
+    // the save itself wires the path's parent in as a scan root. Running it
+    // before the problem check means the validation sees the config exactly
+    // as it will be written, and a resolution failure refuses the save like
+    // any other -- half a registration would be worse than none.
+    let added_root = match org::ensure_scan_root(&mut cfg, &org) {
+        Ok(true) => cfg.roots.last().cloned(),
+        Ok(false) => None,
+        Err(err) => {
+            let msg = format!("could not resolve the org path: {err:#}");
+            app.org_form.error = Some(msg.clone());
+            app.notify(msg);
+            return;
+        }
+    };
+
     match app.org_form.editing {
         Some(ix) if ix < cfg.orgs.len() => cfg.orgs[ix] = org,
         _ => cfg.orgs.push(org),
@@ -1859,7 +1876,13 @@ fn save_org_form(app: &mut App) {
         Ok(_) => {
             app.cfg = Arc::new(cfg);
             app.mode = Mode::Orgs;
-            app.notify("org saved");
+            app.notify(match added_root {
+                // The root ensure_scan_root appended is already contracted:
+                // that is the form the config stores, so that is what the
+                // user should read back.
+                Some(root) => format!("org saved — scan root added {root}"),
+                None => "org saved".to_string(),
+            });
         }
         Err(err) => {
             let msg = format!("could not save config: {err:#}");
@@ -1884,6 +1907,35 @@ fn auth_command(provider: OrgProvider) -> &'static str {
 /// within them: `sync_org` is awaited in a plain loop, one owner at a time,
 /// and each owner's repos run one at a time inside it.
 fn start_org_sync(app: &mut App, tx: &mpsc::UnboundedSender<Input>, orgs: Vec<OrgConfig>) {
+    // Same deal as the form save: syncing an org whose checkouts live under
+    // no configured root would do the work and hide the results, so the sync
+    // wires the parents in first. The task itself needs no changes -- it ends
+    // with a full sweep, which is what actually surfaces the clones.
+    let mut ensured = (*app.cfg).clone();
+    let mut added: Vec<String> = Vec::new();
+    for org in &orgs {
+        if let Ok(true) = org::ensure_scan_root(&mut ensured, org) {
+            // An Ok(true) means exactly one root was appended.
+            if let Some(root) = ensured.roots.last() {
+                added.push(root.clone());
+            }
+        }
+    }
+    if !added.is_empty() {
+        match crate::config::save(&ensured) {
+            Ok(_) => {
+                app.cfg = Arc::new(ensured);
+                for root in &added {
+                    app.notify(format!("scan root added {root}"));
+                }
+            }
+            // The sync runs against the on-disk config either way; without
+            // the persisted root the new org's repos may simply not surface,
+            // and the message says why.
+            Err(err) => app.notify(format!("could not save config: {err:#}")),
+        }
+    }
+
     let owner = match orgs.as_slice() {
         [one] => one.owner.clone(),
         many => format!("{} orgs", many.len()),
@@ -3122,9 +3174,16 @@ mod tests {
     }
 
     fn org_form_app(authed: Vec<provider::AuthedHost>) -> App {
+        org_form_app_with_roots(vec!["~/dev/github.com".into()], authed)
+    }
+
+    /// The default layout's first root already covers the default org path,
+    /// so most tests never see the root fixup fire; the roots parameter
+    /// makes the uncovered case constructible.
+    fn org_form_app_with_roots(roots: Vec<String>, authed: Vec<provider::AuthedHost>) -> App {
         let mut app = app_with(0);
         let mut cfg = (*app.cfg).clone();
-        cfg.roots = vec!["~/dev/github.com".into()];
+        cfg.roots = roots;
         app.cfg = Arc::new(cfg);
         app.mode = Mode::OrgForm;
         app.org_form = OrgForm::open(None, None, authed);
@@ -3204,6 +3263,59 @@ mod tests {
         assert!(!org.include_forks);
         assert!(!org.include_archived);
         assert!(!org.include_subgroups);
+
+        // The default path resolves to the first root plus the owner, so
+        // its parent already is a root and the save must not touch them.
+        assert_eq!(
+            app.cfg.roots,
+            vec!["~/dev/github.com".to_string()],
+            "a path already under a root adds no scan root"
+        );
+    }
+
+    /// Registration implies visibility: an org whose path sits under no
+    /// configured root would sync fine and never appear on the dashboard,
+    /// so the save itself wires the path's parent in as a scan root.
+    #[test]
+    fn a_save_under_an_uncovered_path_adds_the_parent_root() {
+        // The save writes the config file; keep it out of the real one.
+        let xdg = tempfile::tempdir().unwrap();
+        std::env::set_var("XDG_CONFIG_HOME", xdg.path());
+
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = org_form_app_with_roots(
+            vec!["~/dev/github.com".into()],
+            vec![provider::AuthedHost {
+                provider: OrgProvider::GitHub,
+                host: "github.com".into(),
+                login: Some("me".into()),
+                name: None,
+            }],
+        );
+
+        // Owner row first, then the path row: an explicit path that no
+        // root covers is the case the fixup exists for.
+        handle_org_form_key(&mut app, key(KeyCode::Down), &tx); // host
+        handle_org_form_key(&mut app, key(KeyCode::Down), &tx); // owner
+        for c in "acme".chars() {
+            handle_org_form_key(&mut app, key(KeyCode::Char(c)), &tx);
+        }
+        handle_org_form_key(&mut app, key(KeyCode::Down), &tx); // path
+        for c in "~/custom/spot".chars() {
+            handle_org_form_key(&mut app, key(KeyCode::Char(c)), &tx);
+        }
+        for _ in FIELD_PATH..ORG_FIELD_COUNT - 1 {
+            handle_org_form_key(&mut app, key(KeyCode::Down), &tx);
+        }
+        handle_org_form_key(&mut app, key(KeyCode::Enter), &tx);
+
+        assert_eq!(app.mode, Mode::Orgs, "the save succeeded");
+        assert_eq!(app.cfg.orgs.len(), 1, "exactly one org was added");
+        assert_eq!(
+            app.cfg.roots,
+            vec!["~/dev/github.com".to_string(), "~/custom".to_string()],
+            "the parent of the org's path joined the roots, contracted"
+        );
     }
 
     /// No auth for any tool means nothing can be listed, so nothing can be
