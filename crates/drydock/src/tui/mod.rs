@@ -21,7 +21,7 @@ use ratatui::{
     layout::{Rect, Size},
     Terminal,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::{self, Stdout};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -1126,123 +1126,138 @@ async fn run_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut A
         });
     }
 
-    let mut dirty = true;
+    // Repaint scheduling. A streaming sweep can queue hundreds of probe
+    // events, and repainting the full table once per event made startup read
+    // as a multi-second freeze with keys answered only between frames. So:
+    //
+    // - a whole queue drain shares one repaint, and the drain happens before
+    //   the draw, so a burst costs one frame no matter how many events;
+    // - user input repaints on the spot; everything background repaints on
+    //   the tick cadence (250ms while a sweep or sync runs, about a second
+    //   idle), which is why the background arms below never touch `repaint`.
+    let mut repaint = true;
     let mut idle_ticks = 0u32;
+    let mut queued: VecDeque<Input> = VecDeque::new();
     loop {
-        if dirty {
-            draw(terminal, app)?;
-            dirty = false;
-        }
-
-        let Some(input) = rx.recv().await else { break };
-        match input {
-            Input::Tick => {
-                // While a sweep is running, every tick repaints so the spinner
-                // turns and the counter climbs. Idle, repaint about once a
-                // second, which is often enough for the age column and quiet
-                // enough to leave open all day. A running org sync turns the
-                // spinner too, for the same reason.
-                app.spinner = app.spinner.wrapping_add(1);
-                idle_ticks += 1;
-                if app.sweeping || app.org_sync.is_some() || idle_ticks >= 4 {
-                    idle_ticks = 0;
-                    dirty = true;
-                }
-            }
-            Input::Term(TermEvent::Key(key)) => {
-                // Every key event carries the modifier state, and with the
-                // protocol on, the modifiers arrive as events of their own.
-                // Tracked before dispatch so the footer is right in the same
-                // frame as whatever the key did.
-                track_modifiers(app, &key);
-                // Repeat counts as press. Without the keyboard protocol a held
-                // key just sends more presses, but `REPORT_EVENT_TYPES` splits
-                // them out -- so ignoring them would mean holding `j` scrolled
-                // exactly one row in the terminals this feature is for.
-                if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
-                    && !matches!(key.code, KeyCode::Modifier(_))
-                {
-                    handle_key(app, key, &tx);
-                }
-                dirty = true;
-            }
-            Input::Term(TermEvent::Resize(_, _)) => {
-                terminal.autoresize()?;
-                dirty = true;
-            }
-            Input::Term(TermEvent::Mouse(ev)) => {
-                handle_mouse(app, ev, terminal.size().ok());
-                dirty = true;
-            }
-            Input::Term(_) => {}
-            Input::Probe(event) => {
-                handle_probe_event(app, event, watcher.as_ref());
-                dirty = true;
-            }
-            Input::Changed(paths) => {
-                reprobe_paths(app, storm_filter(app.org_sync.is_some(), paths), &tx);
-                dirty = true;
-            }
-            Input::Resweep => {
-                start_sweep(app, &tx, Tier::Full);
-                dirty = true;
-            }
-            Input::OwnersFetched {
-                provider,
-                host,
-                result,
-            } => {
-                app.org_form.owners_received(provider, &host, result);
-                dirty = true;
-            }
-            Input::AuthProbed(hosts) => {
-                apply_auth_probed(app, hosts);
-                dirty = true;
-            }
-            Input::Sync(event) => {
-                handle_sync_event(app, event);
-                dirty = true;
-            }
-            Input::SyncDone {
-                owner_count,
-                summary,
-            } => {
-                app.org_sync = None;
-                // The sync just recorded fresh states for every org it ran;
-                // re-reading the map beats keeping it in step by hand, the
-                // same trade the column picker makes with the config.
-                app.org_states = cache::load_org_states();
-                app.notify(format!(
-                    "Synced {owner_count} org{}: {summary}",
-                    if owner_count == 1 { "" } else { "s" }
-                ));
-                // Fresh clones exist on disk now. A full sweep is what puts
-                // them in the table without waiting for the refresh timer.
-                start_sweep(app, &tx, Tier::Full);
-                dirty = true;
-            }
-            Input::AutoFetch => {
-                let roots: Vec<PathBuf> = app
-                    .repos
-                    .iter()
-                    .filter(|r| {
-                        r.refs
-                            .as_ref()
-                            .and_then(|refs| refs.remote_url.as_ref())
-                            .is_some()
-                    })
-                    .map(|r| r.root.clone())
-                    .collect();
-                if !roots.is_empty() {
-                    app.notify(format!("Fetching {} repos in the background", roots.len()));
-                    spawn_fetch(app, &tx, roots);
-                }
-                dirty = true;
-            }
-        }
-
         if app.should_quit {
             break;
+        }
+        if repaint {
+            draw(terminal, app)?;
+            repaint = false;
+        }
+        // Refill the batch only when it has run dry; the drain below then
+        // takes everything that arrived while the batch was being handled.
+        if queued.is_empty() {
+            match rx.recv().await {
+                Some(input) => queued.push_back(input),
+                None => break,
+            }
+        }
+        while let Some(input) = queued.pop_front().or_else(|| rx.try_recv().ok()) {
+            match input {
+                Input::Tick => {
+                    // While a sweep is running, every tick repaints so the spinner
+                    // turns and the counter climbs. Idle, repaint about once a
+                    // second, which is often enough for the age column and quiet
+                    // enough to leave open all day. A running org sync turns the
+                    // spinner too, for the same reason.
+                    app.spinner = app.spinner.wrapping_add(1);
+                    idle_ticks += 1;
+                    if app.sweeping || app.org_sync.is_some() || idle_ticks >= 4 {
+                        idle_ticks = 0;
+                        repaint = true;
+                    }
+                }
+                Input::Term(TermEvent::Key(key)) => {
+                    // Every key event carries the modifier state, and with the
+                    // protocol on, the modifiers arrive as events of their own.
+                    // Tracked before dispatch so the footer is right in the same
+                    // frame as whatever the key did.
+                    track_modifiers(app, &key);
+                    // Repeat counts as press. Without the keyboard protocol a held
+                    // key just sends more presses, but `REPORT_EVENT_TYPES` splits
+                    // them out -- so ignoring them would mean holding `j` scrolled
+                    // exactly one row in the terminals this feature is for.
+                    if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
+                        && !matches!(key.code, KeyCode::Modifier(_))
+                    {
+                        handle_key(app, key, &tx);
+                    }
+                    repaint = true;
+                }
+                Input::Term(TermEvent::Resize(_, _)) => {
+                    terminal.autoresize()?;
+                    repaint = true;
+                }
+                Input::Term(TermEvent::Mouse(ev)) => {
+                    handle_mouse(app, ev, terminal.size().ok());
+                    repaint = true;
+                }
+                Input::Term(_) => {}
+                Input::Probe(event) => {
+                    handle_probe_event(app, event, watcher.as_ref());
+                }
+                Input::Changed(paths) => {
+                    reprobe_paths(app, storm_filter(app.org_sync.is_some(), paths), &tx);
+                }
+                Input::Resweep => {
+                    start_sweep(app, &tx, Tier::Full);
+                }
+                Input::OwnersFetched {
+                    provider,
+                    host,
+                    result,
+                } => {
+                    app.org_form.owners_received(provider, &host, result);
+                    repaint = true;
+                }
+                Input::AuthProbed(hosts) => {
+                    apply_auth_probed(app, hosts);
+                    repaint = true;
+                }
+                Input::Sync(event) => {
+                    handle_sync_event(app, event);
+                }
+                Input::SyncDone {
+                    owner_count,
+                    summary,
+                } => {
+                    app.org_sync = None;
+                    // The sync just recorded fresh states for every org it ran;
+                    // re-reading the map beats keeping it in step by hand, the
+                    // same trade the column picker makes with the config.
+                    app.org_states = cache::load_org_states();
+                    app.notify(format!(
+                        "Synced {owner_count} org{}: {summary}",
+                        if owner_count == 1 { "" } else { "s" }
+                    ));
+                    // Fresh clones exist on disk now. A full sweep is what puts
+                    // them in the table without waiting for the refresh timer.
+                    start_sweep(app, &tx, Tier::Full);
+                    repaint = true;
+                }
+                Input::AutoFetch => {
+                    let roots: Vec<PathBuf> = app
+                        .repos
+                        .iter()
+                        .filter(|r| {
+                            r.refs
+                                .as_ref()
+                                .and_then(|refs| refs.remote_url.as_ref())
+                                .is_some()
+                        })
+                        .map(|r| r.root.clone())
+                        .collect();
+                    if !roots.is_empty() {
+                        app.notify(format!("Fetching {} repos in the background", roots.len()));
+                        spawn_fetch(app, &tx, roots);
+                    }
+                }
+            }
+            if app.should_quit {
+                break;
+            }
         }
     }
     Ok(())
@@ -1282,7 +1297,15 @@ fn handle_probe_event(app: &mut App, event: probe::Event, watcher: Option<&watch
             app.last_sweep_at = Some(git::now_unix());
             app.sweep_started = None;
             app.reindex();
-            let _ = cache::save(&app.repos);
+            // Serializing the whole fleet is real work — a few hundred repos
+            // is a sizeable JSON write — and it happens on a thread so the
+            // event loop never waits on it. A snapshot is what moves: `app`
+            // keeps mutating behind the write, and the next sweep's save
+            // supersedes this one anyway.
+            let snapshot = app.repos.clone();
+            std::thread::spawn(move || {
+                let _ = cache::save(&snapshot);
+            });
             // The post-sweep repo list is the authoritative picture of what
             // exists on disk, so this is the moment to teach the watcher about
             // repos that appeared (a sync, a manual clone) or went away.
