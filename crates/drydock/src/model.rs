@@ -421,6 +421,16 @@ pub struct RepoStatus {
     pub work_probed_at: i64,
     pub work_key: Option<WorkKey>,
 
+    /// A cheap fingerprint of the checkout's git state — the mtimes of the
+    /// handful of files that move whenever anything in this struct could
+    /// have changed. A sweep whose fingerprint matches the cached one skips
+    /// the repo entirely: no process spawns, no status scan. `None` means
+    /// the cache predates fingerprints (deserialized the same way), so the
+    /// next sweep probes once to establish one. See
+    /// [`crate::probe::repo_fingerprint`].
+    #[serde(default)]
+    pub fingerprint: Option<u64>,
+
     /// `probe::fill_visibility` always sets this to `Some` once it has run --
     /// even "no remote" and "checking is off" are real, stored facts (see
     /// [`VisibilityStatus`]), not just an absence. `None` only means it
@@ -443,6 +453,7 @@ impl RepoStatus {
             refs_probed_at: 0,
             work_probed_at: 0,
             work_key: None,
+            fingerprint: None,
             visibility: None,
         }
     }

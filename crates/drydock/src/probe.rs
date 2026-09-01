@@ -9,12 +9,13 @@
 
 use anyhow::Result;
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, Semaphore};
 use tokio::task::JoinSet;
+use walkdir::WalkDir;
 
 use crate::cache;
 use crate::config::Config;
@@ -418,15 +419,73 @@ pub async fn fetch_all(cfg: Arc<Config>, roots: Vec<PathBuf>) -> FetchReport {
     }
 }
 
+/// A cheap fingerprint of everything that could change a probe's answers:
+/// the mtimes of the git files that move on commit, checkout, fetch, stash
+/// and config edits, plus a bounded recursive max-mtime over `refs/` and
+/// `logs/` (both small — a few dozen files — and the only reliable way to
+/// catch a loose ref rewritten in place, whose parent directory mtime never
+/// moves). Hashed with FNV-1a over the raw values so the result is stable
+/// across processes: the fingerprint lives in the on-disk cache and has to
+/// mean the same thing next launch. Cost is a few dozen stat calls, which
+/// is what buys the skip below its keep against a thousand git spawns.
+fn repo_fingerprint(root: &Path) -> Option<u64> {
+    let git_dir = root.join(".git");
+    let files = [
+        git_dir.join("HEAD"),
+        git_dir.join("index"),
+        git_dir.join("packed-refs"),
+        git_dir.join("FETCH_HEAD"),
+        git_dir.join("config"),
+    ];
+    let mut hash: u64 = 0xcbf29ce484222325;
+    let mut fold = |n: u64, v: u64| {
+        hash = (hash ^ n).wrapping_mul(0x100000001b3);
+        hash = (hash ^ v).wrapping_mul(0x100000001b3);
+    };
+    for (n, path) in files.iter().enumerate() {
+        match std::fs::metadata(path) {
+            Ok(m) => {
+                let secs = m
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_nanos() as u64)
+                    .unwrap_or(0);
+                fold(n as u64, secs ^ (m.len() << 1));
+            }
+            // A file that is gone is a state too, and distinct from mtime 0.
+            Err(_) => fold(n as u64, u64::MAX),
+        }
+    }
+    for (n, sub) in [(5u64, "refs"), (6, "logs")] {
+        let mut newest = 0u64;
+        let mut any = false;
+        for entry in WalkDir::new(git_dir.join(sub))
+            .max_depth(3)
+            .into_iter()
+            .flatten()
+        {
+            any = true;
+            if let Ok(m) = entry.metadata() {
+                if let Ok(t) = m.modified() {
+                    if let Ok(d) = t.duration_since(std::time::UNIX_EPOCH) {
+                        newest = newest.max(d.as_nanos() as u64);
+                    }
+                }
+            }
+        }
+        fold(n, if any { newest } else { u64::MAX });
+    }
+    Some(hash)
+}
 /// Probe one repo end to end. Used for `drydock status <path>` and by the
 /// watcher when a single repo changes; sweeps use the pipelined path below so
 /// tier 1 and tier 2 can run at different concurrencies.
 ///
-/// Pass `force` when something already told you the working tree moved. One
-/// repo's scan costs milliseconds, so the callers that probe a single repo on
-/// purpose have no reason to accept a cached answer. Visibility is exempt
-/// from that: it has its own interval, checked separately below, since it
-/// costs a real network round trip rather than a syscall.
+/// Pass `force` when something already told you the working tree moved —
+/// watcher events exist precisely because something did. A first probe (no
+/// cache) also runs. Otherwise the fingerprint gate decides: an unchanged
+/// checkout returns the cached answers without spawning a process.
 pub async fn probe_one(
     d: &Discovered,
     cfg: &Config,
@@ -436,6 +495,25 @@ pub async fn probe_one(
 ) -> RepoStatus {
     let mut status = RepoStatus::new(d.root.clone(), d.group.clone(), d.name.clone());
     let unlimited = Semaphore::new(1);
+
+    // The skip that makes a 500-repo fleet affordable: if the checkout's
+    // git state is fingerprint-identical to the last probe, every answer
+    // this function could produce is already on the shelf, so return it
+    // without spawning a single git process. A sweep of an idle fleet then
+    // costs a few dozen stat calls per repo instead of thousands of spawns.
+    // Watcher events pass `force` — they exist precisely because something
+    // moved — and a first probe (no cache) always runs.
+    let fingerprint = repo_fingerprint(&d.root);
+    if !force {
+        if let (Some(fp), Some(prev)) = (fingerprint, cached) {
+            if prev.fingerprint == Some(fp) && prev.refs.is_some() {
+                let mut cached = prev.clone();
+                cached.fingerprint = Some(fp);
+                return cached;
+            }
+        }
+    }
+
     if fill_refs(&mut status, cfg, cached).await {
         fill_work(&mut status, cfg, cached, tier, force, &unlimited).await;
     }
@@ -443,6 +521,7 @@ pub async fn probe_one(
     // rather than staying unset and rendering as a bare `-`. Carrying a
     // cached value forward is [`fill_visibility`]'s own business.
     fill_visibility(&mut status, cfg, cached, &unlimited).await;
+    status.fingerprint = fingerprint;
     status
 }
 
@@ -576,6 +655,25 @@ pub async fn sweep_repos(
 
         set.spawn(async move {
             let previous = cached.get(&d.root);
+
+            // The gate that makes a 500-repo fleet affordable. A checkout
+            // whose git state fingerprints identical to the last sweep gets
+            // its cached row back — both events, so progress still climbs —
+            // without a single git process being spawned. The bulk of a
+            // sweep on an idle fleet was hundreds of tier-1 spawns plus the
+            // 4-way tier-2 status wave; all of that now only happens for
+            // repos that actually moved. New or changed repos fall through
+            // to the full probe.
+            if let (Some(fp), Some(prev)) = (repo_fingerprint(&d.root), previous) {
+                if prev.fingerprint == Some(fp) && prev.refs.is_some() {
+                    let mut cached_status = prev.clone();
+                    cached_status.fingerprint = Some(fp);
+                    emit(&tx, Event::Refs(Box::new(cached_status.clone())));
+                    emit(&tx, Event::Work(Box::new(cached_status.clone())));
+                    return cached_status;
+                }
+            }
+
             let mut status = RepoStatus::new(d.root.clone(), d.group.clone(), d.name.clone());
 
             let ok = {
@@ -601,6 +699,7 @@ pub async fn sweep_repos(
             }
             fill_visibility(&mut status, &cfg, previous, &visibility_sem).await;
             emit(&tx, Event::Work(Box::new(status.clone())));
+            status.fingerprint = repo_fingerprint(&d.root);
             status
         });
     }

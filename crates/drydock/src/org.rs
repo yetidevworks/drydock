@@ -905,7 +905,7 @@ mod tests {
         git(&["commit", "-qm", "upstream"], &src);
 
         let before = std::fs::read_to_string(checkout.join("local.txt")).unwrap();
-        let second = plan(&[alpha], &[checkout.clone()], &org());
+        let second = plan(&[alpha], std::slice::from_ref(&checkout), &org());
         let outcomes = execute(&org(), &second, &cfg, None).await;
         assert_eq!(outcomes[0].action, Action::Skipped, "{:?}", outcomes[0]);
         assert_eq!(
@@ -1133,7 +1133,7 @@ mod tests {
             ..OrgConfig::default()
         };
 
-        assert_eq!(ensure_scan_root(&mut cfg, &org).unwrap(), false);
+        assert!(!ensure_scan_root(&mut cfg, &org).unwrap());
         assert_eq!(cfg.roots, vec![dir.path().display().to_string()]);
     }
 
@@ -1150,7 +1150,7 @@ mod tests {
             ..OrgConfig::default()
         };
 
-        assert_eq!(ensure_scan_root(&mut cfg, &org).unwrap(), true);
+        assert!(ensure_scan_root(&mut cfg, &org).unwrap());
         // Stored `~`-contracted, so a hand-edited config stays readable.
         assert_eq!(
             cfg.roots,
@@ -1171,8 +1171,8 @@ mod tests {
             ..OrgConfig::default()
         };
 
-        assert_eq!(ensure_scan_root(&mut cfg, &org).unwrap(), true);
-        assert_eq!(ensure_scan_root(&mut cfg, &org).unwrap(), false);
+        assert!(ensure_scan_root(&mut cfg, &org).unwrap());
+        assert!(!ensure_scan_root(&mut cfg, &org).unwrap());
         assert_eq!(cfg.roots.len(), 2);
     }
 
@@ -1195,8 +1195,8 @@ mod tests {
             ..OrgConfig::default()
         };
 
-        assert_eq!(ensure_scan_root(&mut cfg, &first).unwrap(), true);
-        assert_eq!(ensure_scan_root(&mut cfg, &second).unwrap(), false);
+        assert!(ensure_scan_root(&mut cfg, &first).unwrap());
+        assert!(!ensure_scan_root(&mut cfg, &second).unwrap());
         assert_eq!(
             cfg.roots,
             vec!["~/elsewhere".to_string(), "~/org-checkouts".to_string()]
@@ -1219,7 +1219,7 @@ mod tests {
             ..OrgConfig::default()
         };
 
-        assert_eq!(ensure_scan_root(&mut cfg, &org).unwrap(), true);
+        assert!(ensure_scan_root(&mut cfg, &org).unwrap());
         assert_eq!(
             cfg.roots,
             vec!["/elsewhere".to_string(), "/srv".to_string()]

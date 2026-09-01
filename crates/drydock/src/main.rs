@@ -503,13 +503,15 @@ async fn cmd_org(command: OrgCommands) -> Result<()> {
             include_archived,
         } => org_add(
             owner,
-            provider,
-            host,
-            path,
-            login,
-            protocol,
-            include_forks,
-            include_archived,
+            OrgAddFlags {
+                provider,
+                host,
+                path,
+                login,
+                protocol,
+                include_forks,
+                include_archived,
+            },
         ),
         OrgCommands::List { json } => org_list(json),
         OrgCommands::Remove { owner } => org_remove(&owner),
@@ -706,8 +708,9 @@ fn resolve_add_target(
     })
 }
 
-fn org_add(
-    owner: String,
+/// The optional `org add` flags, bundled so the command body reads in terms
+/// of a registration request rather than a wall of parameters.
+struct OrgAddFlags {
     provider: Option<String>,
     host: Option<String>,
     path: Option<String>,
@@ -715,8 +718,18 @@ fn org_add(
     protocol: Option<String>,
     include_forks: bool,
     include_archived: bool,
-) -> Result<()> {
-    // Provider, host, and login all come from what the CLI tools are already
+}
+
+fn org_add(owner: String, flags: OrgAddFlags) -> Result<()> {
+    let OrgAddFlags {
+        provider,
+        host,
+        path,
+        login,
+        protocol,
+        include_forks,
+        include_archived,
+    } = flags;
     // authenticated to: probe once, then let the resolver either name the
     // target or say exactly what to run. The probe is three local CLI calls
     // and no network, so it is cheap enough to do unconditionally.

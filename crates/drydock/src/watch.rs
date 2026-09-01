@@ -730,11 +730,11 @@ mod tests {
 
         let handle = spawn(Arc::new(cfg), Vec::new(), |_| {}).unwrap();
         let before = watched_count(&handle);
-        handle.reconcile(&[repo.clone()]);
+        handle.reconcile(std::slice::from_ref(&repo));
         let after = wait_watched(&handle, before + 1);
         assert!(after > before, "reconcile should register the new repo");
 
-        handle.reconcile(&[repo.clone()]);
+        handle.reconcile(std::slice::from_ref(&repo));
         std::thread::sleep(std::time::Duration::from_millis(300));
         assert_eq!(
             watched_count(&handle),
