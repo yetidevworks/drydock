@@ -1325,15 +1325,21 @@ fn start_sweep(app: &mut App, tx: &mpsc::UnboundedSender<Input>, tier: Tier) {
     if app.sweeping {
         // Only skip if the sweep is plausibly still going. A sweep that never
         // reported back must not be able to block every one after it.
-        let stuck = app
-            .sweep_started
-            .map(|at| at.elapsed() >= SWEEP_STUCK_AFTER)
-            .unwrap_or(true);
-        if !stuck {
-            return;
+        //
+        // `sweeping` without a timestamp is the first-paint state — the frame
+        // before this sweep began — and is adopted silently. Warning there
+        // made every startup announce a stuck sweep that had not started.
+        match app.sweep_started {
+            Some(at) if at.elapsed() < SWEEP_STUCK_AFTER => return,
+            Some(at) => {
+                tracing::warn!(
+                    stuck_for = ?at.elapsed(),
+                    "previous sweep never finished; starting another"
+                );
+                app.notify("The last sweep never finished. Starting another.");
+            }
+            None => {}
         }
-        tracing::warn!("previous sweep never finished; starting another");
-        app.notify("The last sweep never finished. Starting another.");
     }
     app.sweeping = true;
     app.sweep_started = Some(Instant::now());
