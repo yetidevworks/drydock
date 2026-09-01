@@ -21,12 +21,12 @@ use ratatui::{
     layout::{Rect, Size},
     Terminal,
 };
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{self, Stdout};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Semaphore};
 
 use crate::cache;
 use crate::column::Column;
@@ -610,6 +610,21 @@ pub struct App {
     /// column. Loaded once at startup and re-read after each sync lands,
     /// rather than kept in step by hand.
     pub org_states: HashMap<(String, String, String), cache::OrgSyncState>,
+    /// Repos with a watcher re-probe currently running. A repo being written
+    /// continuously — a data pipeline, a dev server — would otherwise get a
+    /// new full probe per debounce window, and the probes pile up into
+    /// hundreds of concurrent `git` processes pegging every core.
+    pub reprobe_inflight: Arc<Mutex<HashSet<PathBuf>>>,
+    /// Repos that changed while their re-probe was in flight, re-issued the
+    /// moment it lands, so freshness survives the dedup.
+    pub reprobe_pending: Arc<Mutex<HashSet<PathBuf>>>,
+    /// When each repo last started a re-probe. The cooldown keeps a repo
+    /// under continuous writes from being re-probed back-to-back forever;
+    /// whatever the cooldown defers, the periodic sweep still covers.
+    pub reprobe_last: Arc<Mutex<HashMap<PathBuf, i64>>>,
+    /// Caps concurrent watcher re-probes at two, so even a storm across the
+    /// whole fleet holds the line there instead of on every core.
+    pub reprobe_sem: Arc<Semaphore>,
     pub should_quit: bool,
 }
 
@@ -649,8 +664,12 @@ impl App {
             modifier_events: false,
             mode: Mode::Normal,
             search_input: String::new(),
-            message: None,
-            groups: Vec::new(),
+            org_states: cache::load_org_states(),
+            reprobe_inflight: Arc::new(Mutex::new(HashSet::new())),
+            reprobe_pending: Arc::new(Mutex::new(HashSet::new())),
+            reprobe_last: Arc::new(Mutex::new(HashMap::new())),
+            reprobe_sem: Arc::new(Semaphore::new(2)),
+            should_quit: false,
             progress: (0, 0),
             sweeping: false,
             timings: Timings::default(),
@@ -664,8 +683,8 @@ impl App {
             orgs_confirm_remove: false,
             org_form: OrgForm::open(None, None, Vec::new()),
             org_sync: None,
-            org_states: cache::load_org_states(),
-            should_quit: false,
+            groups: Vec::new(),
+            message: None,
         };
         app.reindex();
         app.recompute();
@@ -1004,6 +1023,9 @@ enum Input {
         owner_count: usize,
         summary: String,
     },
+    /// A watcher re-probe batch finished; the repos that changed while it
+    /// ran are re-issued immediately.
+    ReprobeDone(Vec<PathBuf>),
     /// The org form's owner listing came back from the provider, tagged
     /// with the provider+host it was asked for so a slow answer can't land
     /// on rows it doesn't belong to.
@@ -1223,7 +1245,10 @@ async fn run_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut A
                     handle_probe_event(app, event, watcher.as_ref());
                 }
                 Input::Changed(paths) => {
-                    reprobe_paths(app, storm_filter(app.org_sync.is_some(), paths), &bg_tx);
+                    reprobe_changed(app, storm_filter(app.org_sync.is_some(), paths), &bg_tx);
+                }
+                Input::ReprobeDone(roots) => {
+                    reprobe_finished(app, roots, &bg_tx);
                 }
                 Input::Resweep => {
                     start_sweep(app, &bg_tx, Tier::Full);
@@ -1469,13 +1494,83 @@ fn storm_filter(syncing: bool, paths: Vec<PathBuf>) -> Vec<PathBuf> {
     }
     paths
 }
+/// A watcher batch wants repos re-probed. Three gates stand between a storm
+/// and the CPU: a repo already being re-probed is skipped (its changes are
+/// remembered and re-issued when the probe lands), a repo re-probed within
+/// the cooldown is deferred to the sweep, and whatever survives holds one of
+/// two semaphore permits. Without these, a repo under continuous writes — a
+/// data pipeline, a dev server — piled up hundreds of concurrent `git
+/// status` runs on real trees and pegged every core.
+const REPROBE_COOLDOWN_SECS: i64 = 30;
 
-/// Re-probe just the repos the watcher flagged. This is the whole point of
-/// watching: a single repo costs milliseconds, where a full sweep costs seconds.
-fn reprobe_paths(app: &mut App, paths: Vec<PathBuf>, tx: &mpsc::UnboundedSender<Input>) {
+fn reprobe_changed(app: &mut App, paths: Vec<PathBuf>, tx: &mpsc::UnboundedSender<Input>) {
+    let now = git::now_unix();
+    let mut go: Vec<PathBuf> = Vec::new();
+    {
+        let mut inflight = app
+            .reprobe_inflight
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let mut pending = app
+            .reprobe_pending
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let mut last = app.reprobe_last.lock().unwrap_or_else(|p| p.into_inner());
+        for path in paths {
+            if inflight.contains(&path) {
+                pending.insert(path.clone());
+                continue;
+            }
+            if last
+                .get(&path)
+                .is_some_and(|t| now - *t < REPROBE_COOLDOWN_SECS)
+            {
+                continue;
+            }
+            if app.by_root.contains_key(&path) {
+                inflight.insert(path.clone());
+                last.insert(path.clone(), now);
+                go.push(path);
+            }
+        }
+    }
+    if !go.is_empty() {
+        spawn_reprobe(app, go, tx);
+    }
+}
+
+/// A finished re-probe releases its repos; anything flagged during the run
+/// goes straight back in flight, bypassing the cooldown — the change
+/// happened after the probe started, so it is a real pending delta.
+fn reprobe_finished(app: &mut App, roots: Vec<PathBuf>, tx: &mpsc::UnboundedSender<Input>) {
+    let mut redo = Vec::new();
+    {
+        let mut inflight = app
+            .reprobe_inflight
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let mut pending = app
+            .reprobe_pending
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        for root in &roots {
+            inflight.remove(root);
+            if pending.remove(root) {
+                redo.push(root.clone());
+            }
+        }
+    }
+    if !redo.is_empty() {
+        spawn_reprobe(app, redo, tx);
+    }
+}
+
+/// Spawn one serial re-probe task over the given repos, holding the shared
+/// two-permit semaphore for the duration.
+fn spawn_reprobe(app: &mut App, roots: Vec<PathBuf>, tx: &mpsc::UnboundedSender<Input>) {
     let mut targets: Vec<(PathBuf, String, String)> = Vec::new();
-    for path in paths {
-        if let Some(&idx) = app.by_root.get(&path) {
+    for root in &roots {
+        if let Some(&idx) = app.by_root.get(root) {
             let repo = &app.repos[idx];
             targets.push((repo.root.clone(), repo.group.clone(), repo.name.clone()));
         }
@@ -1486,6 +1581,7 @@ fn reprobe_paths(app: &mut App, paths: Vec<PathBuf>, tx: &mpsc::UnboundedSender<
 
     let cfg = app.cfg.clone();
     let tx = tx.clone();
+    let sem = app.reprobe_sem.clone();
     let cached: HashMap<PathBuf, RepoStatus> = targets
         .iter()
         .filter_map(|(root, _, _)| {
@@ -1504,6 +1600,7 @@ fn reprobe_paths(app: &mut App, paths: Vec<PathBuf>, tx: &mpsc::UnboundedSender<
             };
             // Forced: the watcher only flags a repo because a file under it
             // changed, and the cache key would not notice an unstaged edit.
+            let _permit = sem.clone().acquire_owned().await;
             let status = probe::probe_one(&d, &cfg, cached.get(&root), Tier::Full, true).await;
             if tx
                 .send(Input::Probe(probe::Event::Work(Box::new(status))))
@@ -1512,6 +1609,7 @@ fn reprobe_paths(app: &mut App, paths: Vec<PathBuf>, tx: &mpsc::UnboundedSender<
                 break;
             }
         }
+        let _ = tx.send(Input::ReprobeDone(roots));
     });
 }
 
