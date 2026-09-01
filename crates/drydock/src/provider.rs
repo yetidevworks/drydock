@@ -20,12 +20,12 @@
 //! elsewhere, so supporting it would mean this tool handling API tokens on
 //! its own — a different shape of feature, not just another arm here.
 
-use anyhow::Result;
 use crate::config::OrgProvider;
-use crate::gitea;
 use crate::gh;
+use crate::gitea;
 use crate::gitlab;
 use crate::model::Visibility;
+use anyhow::Result;
 use std::io::Read;
 use std::time::{Duration, Instant};
 

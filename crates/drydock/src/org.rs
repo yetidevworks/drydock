@@ -547,7 +547,6 @@ pub fn plan_only(org: &OrgConfig, cfg: &Config) -> Result<(SyncPlan, PathBuf)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::CloneProtocol;
 
     fn repo(name: &str) -> OrgRepo {
         OrgRepo {
@@ -914,7 +913,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_failed_clone_leaves_no_directory_and_reports_an_error() {
-        let dir = tempfile::tempdir().unwrap();
+        let _dir = tempfile::tempdir().unwrap();
         let work = tempfile::tempdir().unwrap();
 
         let mut repo = repo("doomed");
@@ -959,7 +958,14 @@ mod tests {
         assert_eq!(events.len(), 6);
         for (i, pair) in events.chunks(2).enumerate() {
             match (&pair[0], &pair[1]) {
-                (SyncEvent::Progress { done, total, label }, SyncEvent::Repo(outcome)) => {
+                (
+                    SyncEvent::Progress {
+                        done,
+                        total,
+                        label: _,
+                    },
+                    SyncEvent::Repo(outcome),
+                ) => {
                     assert_eq!(*done, i, "progress must climb one at a time");
                     assert_eq!(*total, 3);
                     assert_eq!(outcome.name, name_in_label(&pair[0]));

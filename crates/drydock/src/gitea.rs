@@ -394,8 +394,8 @@ struct TeaUser {
 /// the field older instances report under; neither present is an error —
 /// an ownerless listing would be a silent wrong answer.
 fn parse_user(body: &str) -> Result<String> {
-    let payload = json_body(body)
-        .ok_or_else(|| anyhow!("no JSON in tea api /user output: {body:?}"))?;
+    let payload =
+        json_body(body).ok_or_else(|| anyhow!("no JSON in tea api /user output: {body:?}"))?;
     let user: TeaUser = serde_json::from_str(payload)
         .with_context(|| format!("parsing tea api /user output: {payload:?}"))?;
     user.login
@@ -420,8 +420,8 @@ struct TeaOrg {
 /// and only the path lists correctly, so all three are tried before an
 /// entry is dropped.
 fn parse_orgs(body: &str) -> Result<Vec<String>> {
-    let payload = json_body(body)
-        .ok_or_else(|| anyhow!("no JSON in tea api /user/orgs output: {body:?}"))?;
+    let payload =
+        json_body(body).ok_or_else(|| anyhow!("no JSON in tea api /user/orgs output: {body:?}"))?;
     let orgs: Vec<TeaOrg> = serde_json::from_str(payload)
         .with_context(|| format!("parsing tea api /user/orgs output: {payload:?}"))?;
     Ok(orgs
@@ -636,12 +636,18 @@ solo      https://git.example.com          sam";
 
     #[test]
     fn extracts_hosts_from_login_urls() {
-        assert_eq!(url_host("https://git.example.com"), Some("git.example.com".into()));
+        assert_eq!(
+            url_host("https://git.example.com"),
+            Some("git.example.com".into())
+        );
         assert_eq!(
             url_host("https://git.example.com:3000/"),
             Some("git.example.com:3000".into())
         );
-        assert_eq!(url_host("http://GIT.Example.COM/path"), Some("git.example.com".into()));
+        assert_eq!(
+            url_host("http://GIT.Example.COM/path"),
+            Some("git.example.com".into())
+        );
         assert_eq!(url_host(""), None);
     }
 }

@@ -14,8 +14,12 @@ use ratatui::{
 
 use crossterm::event::KeyModifiers;
 
-use super::{App, Mode};
+use super::{
+    App, Mode, FIELD_HOST, FIELD_LOGIN, FIELD_OWNER, FIELD_PATH, FIELD_PROTOCOL, FIELD_PROVIDER,
+    ORG_TEXT_FIELDS,
+};
 use crate::column::{Column, Width};
+use crate::config::{OrgConfig, OrgProvider};
 use crate::fmt;
 use crate::model::{ChangeKind, ReleaseState, RepoStatus, Visibility, VisibilityStatus};
 use crate::org;
@@ -621,9 +625,10 @@ pub(super) fn key_hints(app: &App) -> &'static [(&'static str, &'static str)] {
             ("esc", "close"),
         ],
         Mode::OrgForm => &[
-            ("tab", "next field"),
-            ("enter", "next / save"),
-            ("space", "toggle"),
+            ("tab", "next row"),
+            ("enter", "pick / save"),
+            ("space", "cycle / toggle"),
+            ("←/→", "cycle"),
             ("esc", "cancel"),
         ],
         Mode::Columns if shift => &[("J/K", "move column"), ("C", "close")],
@@ -853,6 +858,19 @@ fn render_help(f: &mut Frame, app: &App, area: Rect) -> u16 {
                 ("A", "manage org owners: add, edit, remove, sync"),
             ],
         ),
+        (
+            "Org owners",
+            &[
+                ("A", "open the org manager"),
+                ("a / e", "add / edit an owner registration"),
+                ("enter", "next row; owner list on owner; saves on the last"),
+                ("space, ← →", "cycle provider, host, login and protocol"),
+                ("space", "flip a toggle"),
+                ("owner row", "type, or press enter to pick from a list"),
+                ("path row", "empty means <first root>/<owner>"),
+                ("esc", "cancel"),
+            ],
+        ),
     ];
 
     let mut lines = Vec::new();
@@ -1079,46 +1097,166 @@ fn render_orgs(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(Paragraph::new(lines).block(block), area);
 }
 
+/// The tool a provider rides on -- the thing that must be logged in, and
+/// the thing the refusal messages talk about.
+fn cli_name(provider: OrgProvider) -> &'static str {
+    match provider {
+        OrgProvider::GitHub => "gh",
+        OrgProvider::GitLab => "glab",
+        OrgProvider::Gitea => "tea",
+    }
+}
+
 /// The add/edit form. Labelled rows with the active one reversed, the caret
 /// glyph after the active text field, and the toggles as checkboxes -- the
 /// same vocabulary the column picker already teaches.
+///
+/// Provider and host cycle through what the CLI tools reported as
+/// authenticated, so their rows read as a choice, not an input. A pair the
+/// tools didn't report -- only possible when editing an org that predates
+/// the gate -- is dimmed and annotated rather than hidden, because saving
+/// that org unchanged is still allowed and the user should know why the
+/// rows won't cycle anywhere useful.
 fn render_org_form(f: &mut Frame, app: &App, area: Rect) {
-    let area = centred(area, 62, 66);
+    let area = centred(area, 66, 70);
     f.render_widget(Clear, area);
 
     let form = &app.org_form;
+    if form.picking {
+        render_owner_picker(f, app, area);
+        return;
+    }
+
     // A caret on the active field, like the search bar draws one -- text
     // entry here is the search bar's model, so the feedback should be too.
-    let field = |i: usize, text: &str| -> Span<'static> {
+    let field = |i: usize, text: &str, dim: bool| -> Span<'static> {
         let shown = if form.field == i {
             format!("{text}▏")
         } else {
             text.to_string()
         };
-        let mut style = Style::default().fg(Color::White);
+        let mut style = if dim {
+            Style::default().fg(DIM)
+        } else {
+            Style::default().fg(Color::White)
+        };
         if form.field == i {
             style = style.add_modifier(Modifier::REVERSED);
         }
         Span::styled(shown, style)
     };
 
+    let pair_authed = form
+        .provider_opt()
+        .is_some_and(|p| form.is_authed(p, &form.host));
+    let empty_auth = form.authed.is_empty();
+
+    let provider_text = if empty_auth {
+        // The honest answer: there is nothing to pick from until a tool is
+        // logged in, and the save refusal says so again.
+        "no authenticated CLI".to_string()
+    } else if form.provider.is_empty() {
+        "-".to_string()
+    } else {
+        // `github (gh)`: the tool in parens is what must be logged in.
+        form.provider_opt()
+            .map(|p| format!("{} ({})", p.as_str(), cli_name(p)))
+            .unwrap_or_else(|| form.provider.clone())
+    };
+    let host_text = if form.host.is_empty() {
+        "-".to_string()
+    } else {
+        form.host.clone()
+    };
+    let unauthed_note = if !empty_auth && !pair_authed {
+        Some(Span::styled(
+            "  not authenticated",
+            Style::default().fg(DIM),
+        ))
+    } else {
+        None
+    };
+
+    // The effective default for an untouched path, so the destination is
+    // visible without being committed to. Computed from the config, not
+    // stored -- the same reason the orgs list does it per frame.
+    let path_default = form
+        .provider_opt()
+        .filter(|_| !form.owner.is_empty())
+        .and_then(|p| {
+            let would_be = OrgConfig {
+                provider: Some(p),
+                host: form.host.clone(),
+                owner: form.owner.clone(),
+                ..OrgConfig::default()
+            };
+            org::effective_path(&app.cfg, &would_be)
+                .ok()
+                .map(|p| paths::contract(&p))
+        })
+        .unwrap_or_default();
+    let path_text = if form.path.is_empty() {
+        path_default
+    } else {
+        form.path.clone()
+    };
+
+    let is_gitea = form.provider_opt().is_some_and(|p| p == OrgProvider::Gitea);
+    let login_text = if form.login.is_empty() {
+        "-".to_string()
+    } else {
+        form.login.clone()
+    };
+
     let mut lines: Vec<Line> = Vec::new();
-    for (i, (label, value)) in [
-        ("provider", &form.provider),
-        ("host", &form.host),
-        ("owner", &form.owner),
-        ("path", &form.path),
-        ("login", &form.login),
-        ("protocol", &form.protocol),
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        lines.push(Line::from(vec![
-            Span::styled(format!("  {label:<18}"), Style::default().fg(DIM)),
-            field(i, value),
-        ]));
-    }
+    let push =
+        |lines: &mut Vec<Line>, label: &str, value: Span<'static>, note: Option<Span<'static>>| {
+            let mut spans = vec![
+                Span::styled(format!("  {label:<18}"), Style::default().fg(DIM)),
+                value,
+            ];
+            if let Some(note) = note {
+                spans.push(note);
+            }
+            lines.push(Line::from(spans));
+        };
+
+    push(
+        &mut lines,
+        "provider",
+        field(FIELD_PROVIDER, &provider_text, empty_auth || !pair_authed),
+        unauthed_note.clone(),
+    );
+    push(
+        &mut lines,
+        "host",
+        field(FIELD_HOST, &host_text, !pair_authed),
+        unauthed_note,
+    );
+    push(
+        &mut lines,
+        "owner",
+        field(FIELD_OWNER, &form.owner, false),
+        Some(Span::styled("  enter: pick", Style::default().fg(DIM))),
+    );
+    push(
+        &mut lines,
+        "path",
+        field(FIELD_PATH, &path_text, form.path.is_empty()),
+        None,
+    );
+    push(
+        &mut lines,
+        "login",
+        field(FIELD_LOGIN, &login_text, !is_gitea),
+        None,
+    );
+    push(
+        &mut lines,
+        "protocol",
+        field(FIELD_PROTOCOL, &form.protocol, false),
+        None,
+    );
     for (i, (label, on)) in [
         ("include forks", form.include_forks),
         ("include archived", form.include_archived),
@@ -1127,7 +1265,7 @@ fn render_org_form(f: &mut Frame, app: &App, area: Rect) {
     .into_iter()
     .enumerate()
     {
-        let field_index = super::ORG_TEXT_FIELDS + i;
+        let field_index = ORG_TEXT_FIELDS + i;
         let mut style = Style::default().fg(Color::White);
         if form.field == field_index {
             style = style.add_modifier(Modifier::REVERSED);
@@ -1138,24 +1276,111 @@ fn render_org_form(f: &mut Frame, app: &App, area: Rect) {
         ]));
     }
 
+    // The refusal lives here, on top of the form, because the status line
+    // is underneath the overlay and would never be seen.
+    if let Some(err) = &form.error {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            format!("  {err}"),
+            Style::default().fg(TROUBLE),
+        )));
+    }
+
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
-        " provider: github, gitlab or gitea -- empty infers from the host",
+        " ←/→ or space cycle provider, host, login, protocol · space flips a toggle",
         Style::default().fg(DIM),
     )));
     lines.push(Line::from(Span::styled(
-        " path: empty means <first configured root>/<owner>",
+        " enter advances · owner opens the picker · enter on the last row saves",
         Style::default().fg(DIM),
     )));
 
     let title = match form.editing {
-        Some(_) => " edit org · enter next · esc cancels ",
-        None => " new org · enter next · esc cancels ",
+        Some(_) => " edit org · enter on the last row saves · esc cancels ",
+        None => " new org · enter on the last row saves · esc cancels ",
     };
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(ACCENT))
         .title(title)
+        .title_alignment(Alignment::Center);
+    f.render_widget(Paragraph::new(lines).block(block), area);
+}
+
+/// The owner picker, drawn in place of the form while it's open. j/k move,
+/// typing filters, enter picks, esc cancels -- the list vocabulary the
+/// column picker teaches. The personal namespace comes first because that
+/// is the order the providers report in.
+fn render_owner_picker(f: &mut Frame, app: &App, area: Rect) {
+    let form = &app.org_form;
+    let mut lines: Vec<Line> = Vec::new();
+
+    if form.owners_fetching {
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("  {} ", app.spinner_frame()),
+                Style::default().fg(ACCENT),
+            ),
+            Span::styled("fetching owners…", Style::default().fg(DIM)),
+        ]));
+    } else {
+        let key = form
+            .provider_opt()
+            .map(|p| (p.as_str().to_string(), form.host.clone()));
+        let entry = key.as_ref().and_then(|k| form.owners.get(k));
+        match entry {
+            // Nothing cached and nothing in flight: the rows aren't in a
+            // state the picker can list for.
+            None => lines.push(Line::from(Span::styled(
+                "  no owner list for these rows",
+                Style::default().fg(DIM),
+            ))),
+            // The failure is cached too -- say so rather than showing an
+            // empty list that reads as "no owners exist".
+            Some(Err(err)) => lines.push(Line::from(Span::styled(
+                format!("  could not list owners: {err}"),
+                Style::default().fg(TROUBLE),
+            ))),
+            Some(Ok(list)) => {
+                let needle = form.picker_filter.to_lowercase();
+                let rows: Vec<&String> = list
+                    .iter()
+                    .filter(|o| needle.is_empty() || o.to_lowercase().contains(&needle))
+                    .collect();
+                if rows.is_empty() {
+                    lines.push(Line::from(Span::styled(
+                        format!("  nothing matches \"{}\"", form.picker_filter),
+                        Style::default().fg(DIM),
+                    )));
+                } else {
+                    let cursor = form.picker_cursor.min(rows.len() - 1);
+                    for (i, name) in rows.iter().enumerate() {
+                        let mut style = Style::default().fg(Color::White);
+                        if i == cursor {
+                            style = style.add_modifier(Modifier::REVERSED);
+                        }
+                        lines.push(Line::from(Span::styled(format!("  {name}"), style)));
+                    }
+                }
+            }
+        }
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        format!("  /{}▏", form.picker_filter),
+        Style::default().fg(Color::White),
+    )));
+    lines.push(Line::from(Span::styled(
+        " j/k move · type to filter · enter picks · esc cancels",
+        Style::default().fg(DIM),
+    )));
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(ACCENT))
+        .title(" pick owner ")
         .title_alignment(Alignment::Center);
     f.render_widget(Paragraph::new(lines).block(block), area);
 }

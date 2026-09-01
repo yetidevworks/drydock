@@ -479,4 +479,3 @@ ghe.corp.example.com
         assert!(parse_owner_lines("\n\n").is_empty());
     }
 }
-

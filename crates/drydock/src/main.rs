@@ -23,6 +23,7 @@ use clap::Parser;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use cli::{Cli, Commands, ConfigCommands, ListArgs, OrgCommands};
 use filter::{Filter, MatchMode, Query, Sort};
@@ -547,14 +548,164 @@ fn parse_protocol(name: &str) -> Result<config::CloneProtocol> {
     }
 }
 
-/// The hostname each provider's hosted instance lives at, for when the user
-/// named a provider but not a host.
-fn default_host(provider: config::OrgProvider) -> String {
+/// The provider/host/login triple `org add` will register, resolved against
+/// what the CLI tools are actually authenticated to. The tools are the source
+/// of truth by design: an org on a host nothing is logged into could be
+/// registered but never listed, so the resolver refuses it rather than
+/// writing a config that can only fail later. Pure on purpose — given the
+/// probe's output and the trimmed flags it either returns the full target or
+/// an error naming what to run or pass next — which is what makes it testable
+/// without a single subprocess.
+#[derive(Debug)]
+struct AddTarget {
+    provider: config::OrgProvider,
+    host: String,
+    login: String,
+}
+
+/// The CLI binary that serves each provider, so errors name the thing the
+/// user can actually fix, not an abstraction.
+fn tool_name(provider: config::OrgProvider) -> &'static str {
     match provider {
-        config::OrgProvider::GitHub => "github.com".into(),
-        config::OrgProvider::GitLab => "gitlab.com".into(),
-        config::OrgProvider::Gitea => "gitea.com".into(),
+        config::OrgProvider::GitHub => "gh",
+        config::OrgProvider::GitLab => "glab",
+        config::OrgProvider::Gitea => "tea",
     }
+}
+
+/// The command that logs a provider's CLI in, for errors that end with the
+/// fix rather than the diagnosis.
+fn login_hint(provider: config::OrgProvider) -> &'static str {
+    match provider {
+        config::OrgProvider::GitHub => "`gh auth login`",
+        config::OrgProvider::GitLab => "`glab auth login`",
+        config::OrgProvider::Gitea => "`tea login add`",
+    }
+}
+
+fn resolve_add_target(
+    authed: &[provider::AuthedHost],
+    provider_flag: Option<&str>,
+    host_flag: Option<&str>,
+    login_flag: Option<&str>,
+) -> Result<AddTarget> {
+    // Provider first: an explicit flag wins, otherwise the tools' own auth
+    // decides. With several providers authenticated a named host can still
+    // settle it — `--host gitlab.com` names exactly one provider — so the
+    // "which one?" error is reserved for when the answer is truly ambiguous.
+    let mut distinct: Vec<config::OrgProvider> = Vec::new();
+    for entry in authed {
+        if !distinct.contains(&entry.provider) {
+            distinct.push(entry.provider);
+        }
+    }
+    let provider = match provider_flag {
+        Some(name) => parse_provider(name)?,
+        None => match distinct.as_slice() {
+            [] => {
+                return Err(anyhow!(
+                    "no authenticated CLI found — run `gh auth login`, \
+                     `glab auth login`, or `tea login add` first"
+                ));
+            }
+            [only] => *only,
+            _ => host_flag
+                .and_then(|want| {
+                    authed
+                        .iter()
+                        .find(|h| h.host.eq_ignore_ascii_case(want))
+                        .map(|h| h.provider)
+                })
+                .ok_or_else(|| {
+                    let names: Vec<&str> = distinct.iter().map(|p| p.as_str()).collect();
+                    anyhow!(
+                        "several providers are authenticated ({}); \
+                         pass --provider github|gitlab|gitea to choose",
+                        names.join(", ")
+                    )
+                })?,
+        },
+    };
+
+    let candidates: Vec<&provider::AuthedHost> =
+        authed.iter().filter(|h| h.provider == provider).collect();
+    if candidates.is_empty() {
+        return Err(anyhow!(
+            "{} reports no authenticated hosts — run {} first",
+            provider.as_str(),
+            login_hint(provider)
+        ));
+    }
+
+    // The host comes from the same probe: the first host the provider's CLI
+    // is logged into, or the requested one — verified, and spelled the way
+    // the tool itself spells it rather than the way the user typed it.
+    let chosen = match host_flag {
+        None => candidates[0],
+        Some(want) => match candidates
+            .iter()
+            .find(|h| h.host.eq_ignore_ascii_case(want))
+        {
+            Some(entry) => *entry,
+            None => {
+                let hosts: Vec<&str> = candidates.iter().map(|h| h.host.as_str()).collect();
+                return Err(anyhow!(
+                    "{} is not authenticated to \"{}\" — authenticated {} hosts: {}",
+                    tool_name(provider),
+                    want,
+                    provider.as_str(),
+                    hosts.join(", ")
+                ));
+            }
+        },
+    };
+
+    // Gitea is the only provider where a login label exists: `tea` keeps
+    // named logins per instance, and `OrgConfig::login` stores the label to
+    // select the instance later. The other providers get the config's empty
+    // "unset", with a note when a flag was passed that would otherwise be
+    // silently dropped.
+    let login = if provider == config::OrgProvider::Gitea {
+        match login_flag {
+            Some(want) => {
+                let siblings: Vec<&provider::AuthedHost> = candidates
+                    .iter()
+                    .copied()
+                    .filter(|h| h.host.eq_ignore_ascii_case(&chosen.host))
+                    .collect();
+                match siblings.iter().find(|h| h.name.as_deref() == Some(want)) {
+                    Some(_) => want.to_string(),
+                    None => {
+                        let names: Vec<&str> =
+                            siblings.iter().filter_map(|h| h.name.as_deref()).collect();
+                        return Err(anyhow!(
+                            "no tea login \"{want}\" on {} — tea logins there: {}",
+                            chosen.host,
+                            names.join(", ")
+                        ));
+                    }
+                }
+            }
+            // The entries arrive in tea's own config order, and the first
+            // login there is tea's default — the one an empty `login` would
+            // select anyway.
+            None => chosen.name.clone().unwrap_or_default(),
+        }
+    } else {
+        if login_flag.is_some() {
+            eprintln!(
+                "drydock: note: --login is gitea-only; ignoring it for {}",
+                provider.as_str()
+            );
+        }
+        String::new()
+    };
+
+    Ok(AddTarget {
+        provider,
+        host: chosen.host.clone(),
+        login,
+    })
 }
 
 fn org_add(
@@ -568,34 +719,25 @@ fn org_add(
     include_archived: bool,
     add_root: bool,
 ) -> Result<()> {
-    // Provider and host resolve each other: an explicit provider takes the
-    // hosted default host, a bare host must be a known instance, and with
-    // neither the assumption is github.com — the common case gets to be no
-    // flags at all. An inferred provider stays unset in the config, so a
-    // hand-edited config keeps the same minimal shape `org add` writes.
-    let trimmed_provider = provider.as_deref().map(str::trim).filter(|p| !p.is_empty());
-    let trimmed_host = host.as_deref().map(str::trim).filter(|h| !h.is_empty());
-    let (resolved, host) = match (trimmed_provider, trimmed_host) {
-        (Some(name), explicit) => {
-            let provider = parse_provider(name)?;
-            let host = explicit
-                .map(str::to_string)
-                .unwrap_or_else(|| default_host(provider));
-            (Some(provider), host)
-        }
-        (None, Some(hostname)) => {
-            // The provider is inferred again at load time, so here it only
-            // has to exist — which is what turns an unknown host into an
-            // error instead of a silently misresolved org.
-            if config::OrgProvider::from_host(hostname).is_none() {
-                return Err(anyhow!(
-                    "host \"{hostname}\" is not a known instance; \
-                     pass --provider github, gitlab, or gitea"
-                ));
-            }
-            (None, hostname.to_string())
-        }
-        (None, None) => (Some(config::OrgProvider::GitHub), "github.com".into()),
+    // Provider, host, and login all come from what the CLI tools are already
+    // authenticated to: probe once, then let the resolver either name the
+    // target or say exactly what to run. The probe is three local CLI calls
+    // and no network, so it is cheap enough to do unconditionally.
+    let provider_flag = provider.as_deref().map(str::trim).filter(|p| !p.is_empty());
+    let host_flag = host.as_deref().map(str::trim).filter(|h| !h.is_empty());
+    let login_flag = login.as_deref().map(str::trim).filter(|l| !l.is_empty());
+    let authed = provider::authenticated_hosts(Duration::from_secs(5));
+    let target = resolve_add_target(&authed, provider_flag, host_flag, login_flag)?;
+    // An inferred provider stays unset when the host alone re-derives it, so
+    // a hand-edited config keeps the same minimal shape `org add` writes. An
+    // explicit flag — or a self-hosted host, which no table can infer — is
+    // recorded as given.
+    let stored_provider = if provider_flag.is_some()
+        || config::OrgProvider::from_host(&target.host) != Some(target.provider)
+    {
+        Some(target.provider)
+    } else {
+        None
     };
     let protocol = match protocol.as_deref() {
         Some(name) => parse_protocol(name)?,
@@ -604,11 +746,11 @@ fn org_add(
 
     let mut cfg = config::load()?;
     let org = config::OrgConfig {
-        provider: resolved,
-        host: host.clone(),
+        provider: stored_provider,
+        host: target.host.clone(),
         owner: owner.clone(),
         path,
-        login: login.unwrap_or_default(),
+        login: target.login,
         protocol,
         include_forks,
         include_archived,
@@ -644,7 +786,7 @@ fn org_add(
     println!(
         "Registered {} on {} — checkouts under {}. Config written to {}.",
         owner,
-        host,
+        target.host,
         paths::contract(&checkout),
         written.display(),
     );
@@ -941,4 +1083,119 @@ fn split_for_display(cfg: &config::Config, root: &Path) -> (String, String) {
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| root.display().to_string()),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// One probe result, with the minimum a resolver needs. `login` is
+    /// filled in because gh and glab always carry an account name.
+    fn entry(
+        provider: config::OrgProvider,
+        host: &str,
+        tea_login: Option<&str>,
+    ) -> provider::AuthedHost {
+        provider::AuthedHost {
+            provider,
+            host: host.to_string(),
+            login: Some("someone".to_string()),
+            name: tea_login.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn no_authenticated_cli_is_an_error_with_the_login_commands() {
+        let err = resolve_add_target(&[], None, None, None).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("no authenticated CLI found"));
+        assert!(msg.contains("gh auth login"));
+    }
+
+    #[test]
+    fn a_single_authenticated_provider_is_inferred() {
+        let authed = vec![entry(config::OrgProvider::GitHub, "github.com", None)];
+        let target = resolve_add_target(&authed, None, None, None).unwrap();
+        assert_eq!(target.provider, config::OrgProvider::GitHub);
+        assert_eq!(target.host, "github.com");
+        assert_eq!(target.login, "");
+    }
+
+    #[test]
+    fn several_providers_without_a_flag_name_the_choice() {
+        let authed = vec![
+            entry(config::OrgProvider::GitHub, "github.com", None),
+            entry(config::OrgProvider::GitLab, "gitlab.com", None),
+        ];
+        let err = resolve_add_target(&authed, None, None, None).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("github") && msg.contains("gitlab"));
+        assert!(msg.contains("--provider"));
+    }
+
+    #[test]
+    fn a_named_host_settles_a_multi_provider_ambiguity() {
+        let authed = vec![
+            entry(config::OrgProvider::GitHub, "github.com", None),
+            entry(config::OrgProvider::GitLab, "gitlab.com", None),
+        ];
+        let target = resolve_add_target(&authed, None, Some("gitlab.com"), None).unwrap();
+        assert_eq!(target.provider, config::OrgProvider::GitLab);
+    }
+
+    #[test]
+    fn a_host_the_tool_never_logged_into_is_refused() {
+        let authed = vec![entry(config::OrgProvider::GitHub, "github.com", None)];
+        let err = resolve_add_target(&authed, None, Some("gitlab.com"), None).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("gh") && msg.contains("gitlab.com"));
+        assert!(msg.contains("github.com"));
+    }
+
+    #[test]
+    fn host_matching_ignores_case_and_keeps_the_tools_spelling() {
+        let authed = vec![entry(config::OrgProvider::GitHub, "github.com", None)];
+        let target = resolve_add_target(&authed, None, Some("GitHub.Com"), None).unwrap();
+        assert_eq!(target.host, "github.com");
+    }
+
+    #[test]
+    fn a_named_provider_with_no_authed_hosts_is_refused() {
+        let authed = vec![entry(config::OrgProvider::GitLab, "gitlab.com", None)];
+        let err = resolve_add_target(&authed, Some("github"), None, None).unwrap_err();
+        assert!(err.to_string().contains("gh"));
+    }
+
+    #[test]
+    fn gitea_login_defaults_to_the_first_entry_for_the_host() {
+        let authed = vec![
+            entry(config::OrgProvider::Gitea, "gitea.com", Some("work")),
+            entry(config::OrgProvider::Gitea, "gitea.com", Some("personal")),
+        ];
+        let target = resolve_add_target(&authed, None, None, None).unwrap();
+        assert_eq!(target.host, "gitea.com");
+        assert_eq!(target.login, "work");
+    }
+
+    #[test]
+    fn gitea_login_flag_must_name_a_real_login_on_that_host() {
+        let authed = vec![
+            entry(config::OrgProvider::Gitea, "gitea.com", Some("work")),
+            entry(config::OrgProvider::Gitea, "git.example.com", Some("ops")),
+        ];
+        let err = resolve_add_target(&authed, None, None, Some("personal")).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("personal") && msg.contains("work"));
+
+        let target =
+            resolve_add_target(&authed, None, Some("git.example.com"), Some("ops")).unwrap();
+        assert_eq!(target.login, "ops");
+    }
+
+    #[test]
+    fn a_login_flag_on_a_non_gitea_provider_is_ignored() {
+        let authed = vec![entry(config::OrgProvider::GitHub, "github.com", None)];
+        let target = resolve_add_target(&authed, None, None, Some("work")).unwrap();
+        assert_eq!(target.login, "");
+    }
 }

@@ -224,7 +224,10 @@ pub async fn list_owners(host: &str, timeout: Duration) -> Result<Vec<String>> {
     loop {
         let page_arg = page.to_string();
         let body = run_glab(
-            &["api", &format!("namespaces?per_page={PAGE_SIZE}&page={page_arg}")],
+            &[
+                "api",
+                &format!("namespaces?per_page={PAGE_SIZE}&page={page_arg}"),
+            ],
             host,
             timeout,
         )

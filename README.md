@@ -154,14 +154,17 @@ Several filters **widen** the result by default: `--dirty --unpushed` means
 ### Organizations
 
 Press `A` in the dashboard to manage organization sources, or use the `org`
-commands. Register a GitHub, GitLab, or Gitea/Forgejo owner — an organization
-or a single user, they list the same way — and `sync` makes a directory on
-disk match that owner's repo list: clones what's missing, fast-forwards what's
+commands. Adding one starts from your tooling: the providers on offer are the
+ones whose CLI you have authenticated, the host comes from that tool's saved
+logins, and the owner is a pick list of the accounts and orgs you belong to.
+Register a GitHub, GitLab, or Gitea/Forgejo owner — an organization or a
+single user, they list the same way — and `sync` makes a directory on disk
+match that owner's repo list: clones what's missing, fast-forwards what's
 there. `drydock org remove` forgets the registration and leaves the checkouts
 alone.
 
 ```sh
-drydock org add yetidevworks                    # provider inferred from github.com
+drydock org add yetidevworks                    # provider and host inferred from gh's auth
 drydock org add --host git.example.com --provider gitea otter
 drydock org list
 drydock org sync                                # every enabled org
@@ -193,8 +196,11 @@ cloned repo appears on the next sweep like anything else on disk.
 Listing goes through each provider's own CLI — `gh` on GitHub, `glab` on
 GitLab, `tea` on Gitea/Forgejo — riding on credentials you've already
 configured with that tool (`gh auth login`, `glab auth login`,
-`tea login add`). drydock never reads or stores a token, and if the CLI isn't
-authenticated the sync says so rather than guessing.
+`tea login add`). drydock never reads or stores a token. Adding an org
+requires that authentication: a provider whose CLI is missing or not logged
+in simply isn't on offer, and `org add` refuses it, naming the login command
+that would unlock it. If the CLI isn't authenticated when a sync runs, it
+says so rather than guessing.
 
 Sync is deliberately conservative. It runs strictly serially — one repo at a
 time, never in parallel, whatever `remote.concurrency` says. Updates are

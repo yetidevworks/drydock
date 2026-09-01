@@ -107,12 +107,12 @@ pub enum OrgCommands {
     Add {
         /// The organization or user to list — both list the same way.
         owner: String,
-        /// github, gitlab, or gitea. Inferred for the hosted instances;
-        /// required for a self-hosted one.
+        /// github, gitlab, or gitea. Inferred from your authenticated CLI
+        /// when omitted.
         #[arg(long)]
         provider: Option<String>,
-        /// Instance hostname. Defaults to the provider's hosted instance
-        /// (github.com, gitlab.com, gitea.com).
+        /// Instance hostname. Inferred from your authenticated CLI when
+        /// omitted.
         #[arg(long)]
         host: Option<String>,
         /// Where the checkouts live. Defaults to the first configured root
