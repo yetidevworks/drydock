@@ -866,7 +866,7 @@ fn render_help(f: &mut Frame, app: &App, area: Rect) -> u16 {
                 ("enter", "next row; owner list on owner; saves on the last"),
                 ("space, ← →", "cycle provider, host, login and protocol"),
                 ("space", "flip a toggle"),
-                ("owner row", "type, or press enter to pick from a list"),
+                ("owner row", "user or org on the host: type, or enter to pick"),
                 ("path row", "empty means <first root>/<owner>"),
                 ("esc", "cancel"),
             ],
@@ -1235,7 +1235,7 @@ fn render_org_form(f: &mut Frame, app: &App, area: Rect) {
     );
     push(
         &mut lines,
-        "owner",
+        "owner (user/org)",
         field(FIELD_OWNER, &form.owner, false),
         Some(Span::styled("  enter: pick", Style::default().fg(DIM))),
     );
