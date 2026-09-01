@@ -46,6 +46,12 @@ const MESSAGE_TTL: Duration = Duration::from_secs(6);
 /// When idle, only every fourth tick repaints.
 const TICK: Duration = Duration::from_millis(250);
 
+/// How many background events one loop iteration handles before checking the
+/// UI again. The bound is what makes the priority real: a 500-repo sync
+/// storm cannot hold the event loop longer than a few hundred microseconds
+/// without a keypress being seen.
+const BG_BATCH_PER_UI_CHECK: usize = 32;
+
 /// How long a sweep may claim to be running before the next one starts anyway.
 /// A cold sweep of 550-plus repos takes seconds, so anything past this means
 /// the sweep died without saying so, and a dashboard left open for days would
@@ -1031,7 +1037,13 @@ pub async fn run() -> Result<()> {
 }
 
 async fn run_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) -> Result<()> {
-    let (tx, mut rx) = mpsc::unbounded_channel::<Input>();
+    // Two channels, because the two kinds of work are not peers. The guiding
+    // rule: the UI always wins. Every key and mouse event is handled before
+    // a single background event, whatever the background is in the middle of
+    // — a sweep, a 500-repo sync storm, a reconcile — and the state a key
+    // produced is on screen before background work resumes.
+    let (ui_tx, mut ui_rx) = mpsc::unbounded_channel::<Input>();
+    let (bg_tx, mut bg_rx) = mpsc::unbounded_channel::<Input>();
 
     // Paint before doing anything else, always. Nothing below this line gets to
     // decide whether the user sees a window or a blank screen: if some piece of
@@ -1040,26 +1052,27 @@ async fn run_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut A
     draw(terminal, app)?;
 
     // Terminal events come from a blocking thread; crossterm's reader isn't
-    // async and this keeps the loop free of polling.
+    // async and this keeps the loop free of polling. They land on the UI
+    // channel, which the loop drains before anything else.
     {
-        let tx = tx.clone();
+        let ui_tx = ui_tx.clone();
         std::thread::spawn(move || {
             while let Ok(ev) = event::read() {
-                if tx.send(Input::Term(ev)).is_err() {
+                if ui_tx.send(Input::Term(ev)).is_err() {
                     break;
                 }
             }
         });
     }
 
-    // Repaint clock.
+    // Repaint clock. Background.
     {
-        let tx = tx.clone();
+        let bg_tx = bg_tx.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(TICK);
             loop {
                 interval.tick().await;
-                if tx.send(Input::Tick).is_err() {
+                if bg_tx.send(Input::Tick).is_err() {
                     break;
                 }
             }
@@ -1068,7 +1081,7 @@ async fn run_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut A
 
     // Start scanning before setting up the watcher, so the slower of the two
     // never delays the other.
-    start_sweep(app, &tx, Tier::Full);
+    start_sweep(app, &bg_tx, Tier::Full);
 
     // Filesystem watcher, so edits show up without waiting for the next sweep.
     // The handle lives until the loop exits; dropping it stops the watcher.
@@ -1076,10 +1089,10 @@ async fn run_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut A
     // the fleet already; whatever a sweep discovers later lands through
     // reconcile instead of restarting the watcher.
     let watcher = if app.cfg.refresh.watch {
-        let tx = tx.clone();
+        let bg_tx = bg_tx.clone();
         let roots: Vec<PathBuf> = app.repos.iter().map(|r| r.root.clone()).collect();
         match watch::spawn(app.cfg.clone(), roots, move |paths| {
-            let _ = tx.send(Input::Changed(paths));
+            let _ = bg_tx.send(Input::Changed(paths));
         }) {
             Ok(handle) => {
                 app.watching = true;
@@ -1096,14 +1109,14 @@ async fn run_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut A
 
     // Periodic full sweep as a backstop for anything the watcher misses.
     {
-        let tx = tx.clone();
+        let bg_tx = bg_tx.clone();
         let interval = app.cfg.refresh_interval();
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(interval);
             ticker.tick().await; // the first tick fires immediately
             loop {
                 ticker.tick().await;
-                if tx.send(Input::Resweep).is_err() {
+                if bg_tx.send(Input::Resweep).is_err() {
                     break;
                 }
             }
@@ -1112,32 +1125,23 @@ async fn run_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut A
 
     // Optional periodic fetch, so behind counts don't silently go stale.
     if app.cfg.remote.fetch {
-        let tx = tx.clone();
+        let bg_tx = bg_tx.clone();
         let interval = app.cfg.remote_interval();
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(interval);
             ticker.tick().await;
             loop {
                 ticker.tick().await;
-                if tx.send(Input::AutoFetch).is_err() {
+                if bg_tx.send(Input::AutoFetch).is_err() {
                     break;
                 }
             }
         });
     }
 
-    // Repaint scheduling. A streaming sweep can queue hundreds of probe
-    // events, and repainting the full table once per event made startup read
-    // as a multi-second freeze with keys answered only between frames. So:
-    //
-    // - a whole queue drain shares one repaint, and the drain happens before
-    //   the draw, so a burst costs one frame no matter how many events;
-    // - user input repaints on the spot; everything background repaints on
-    //   the tick cadence (250ms while a sweep or sync runs, about a second
-    //   idle), which is why the background arms below never touch `repaint`.
     let mut repaint = true;
     let mut idle_ticks = 0u32;
-    let mut queued: VecDeque<Input> = VecDeque::new();
+    let mut bg_queue: VecDeque<Input> = VecDeque::new();
     loop {
         if app.should_quit {
             break;
@@ -1146,15 +1150,61 @@ async fn run_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut A
             draw(terminal, app)?;
             repaint = false;
         }
-        // Refill the batch only when it has run dry; the drain below then
-        // takes everything that arrived while the batch was being handled.
-        if queued.is_empty() {
-            match rx.recv().await {
-                Some(input) => queued.push_back(input),
-                None => break,
+
+        // 1. The UI goes first, unconditionally: every key, click and resize
+        // that has arrived is handled before one background event, and the
+        // state those keys produced is drawn right here, before background
+        // work resumes.
+        while let Ok(ev) = ui_rx.try_recv() {
+            if let Input::Term(term) = ev {
+                handle_ui_event(app, terminal, term, &bg_tx, &mut repaint)?;
+            }
+            if app.should_quit {
+                break;
             }
         }
-        while let Some(input) = queued.pop_front().or_else(|| rx.try_recv().ok()) {
+        if app.should_quit {
+            break;
+        }
+        if repaint {
+            draw(terminal, app)?;
+            repaint = false;
+        }
+
+        // 2. Background, bounded. Idle, sleep until either channel has work —
+        // `biased` polls the UI side first, so a keypress wakes the loop even
+        // when a probe event landed at the same instant. Awake, take one
+        // event, then handle a bounded batch with a UI check between every
+        // event: the longest a keypress can wait is one background event,
+        // which is microseconds, not sweeps.
+        if bg_queue.is_empty() {
+            tokio::select! {
+                biased;
+                maybe = ui_rx.recv() => match maybe {
+                    Some(Input::Term(term)) => {
+                        handle_ui_event(app, terminal, term, &bg_tx, &mut repaint)?;
+                    }
+                    Some(_) => {}
+                    None => break,
+                },
+                maybe = bg_rx.recv() => match maybe {
+                    Some(input) => bg_queue.push_back(input),
+                    None => break,
+                },
+            }
+            if app.should_quit {
+                break;
+            }
+            if repaint {
+                draw(terminal, app)?;
+                repaint = false;
+            }
+        }
+        let mut handled = 0usize;
+        while handled < BG_BATCH_PER_UI_CHECK {
+            let Some(input) = bg_queue.pop_front().or_else(|| bg_rx.try_recv().ok()) else {
+                break;
+            };
             match input {
                 Input::Tick => {
                     // While a sweep is running, every tick repaints so the spinner
@@ -1169,40 +1219,14 @@ async fn run_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut A
                         repaint = true;
                     }
                 }
-                Input::Term(TermEvent::Key(key)) => {
-                    // Every key event carries the modifier state, and with the
-                    // protocol on, the modifiers arrive as events of their own.
-                    // Tracked before dispatch so the footer is right in the same
-                    // frame as whatever the key did.
-                    track_modifiers(app, &key);
-                    // Repeat counts as press. Without the keyboard protocol a held
-                    // key just sends more presses, but `REPORT_EVENT_TYPES` splits
-                    // them out -- so ignoring them would mean holding `j` scrolled
-                    // exactly one row in the terminals this feature is for.
-                    if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
-                        && !matches!(key.code, KeyCode::Modifier(_))
-                    {
-                        handle_key(app, key, &tx);
-                    }
-                    repaint = true;
-                }
-                Input::Term(TermEvent::Resize(_, _)) => {
-                    terminal.autoresize()?;
-                    repaint = true;
-                }
-                Input::Term(TermEvent::Mouse(ev)) => {
-                    handle_mouse(app, ev, terminal.size().ok());
-                    repaint = true;
-                }
-                Input::Term(_) => {}
                 Input::Probe(event) => {
                     handle_probe_event(app, event, watcher.as_ref());
                 }
                 Input::Changed(paths) => {
-                    reprobe_paths(app, storm_filter(app.org_sync.is_some(), paths), &tx);
+                    reprobe_paths(app, storm_filter(app.org_sync.is_some(), paths), &bg_tx);
                 }
                 Input::Resweep => {
-                    start_sweep(app, &tx, Tier::Full);
+                    start_sweep(app, &bg_tx, Tier::Full);
                 }
                 Input::OwnersFetched {
                     provider,
@@ -1234,7 +1258,7 @@ async fn run_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut A
                     ));
                     // Fresh clones exist on disk now. A full sweep is what puts
                     // them in the table without waiting for the refresh timer.
-                    start_sweep(app, &tx, Tier::Full);
+                    start_sweep(app, &bg_tx, Tier::Full);
                     repaint = true;
                 }
                 Input::AutoFetch => {
@@ -1251,14 +1275,75 @@ async fn run_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut A
                         .collect();
                     if !roots.is_empty() {
                         app.notify(format!("Fetching {} repos in the background", roots.len()));
-                        spawn_fetch(app, &tx, roots);
+                        spawn_fetch(app, &bg_tx, roots);
                     }
                 }
+                // Term events only travel on the UI channel; the arm exists
+                // for exhaustiveness.
+                Input::Term(_) => {}
+            }
+            handled += 1;
+
+            // The UI preempts between background events: whatever queued is
+            // handled and painted right here, mid-storm.
+            while let Ok(ev) = ui_rx.try_recv() {
+                if let Input::Term(term) = ev {
+                    handle_ui_event(app, terminal, term, &bg_tx, &mut repaint)?;
+                }
+                if app.should_quit {
+                    break;
+                }
+            }
+            if repaint {
+                draw(terminal, app)?;
+                repaint = false;
             }
             if app.should_quit {
                 break;
             }
         }
+    }
+    Ok(())
+}
+
+/// One terminal event, from the UI's perspective: keys dispatch (handlers
+/// may spawn background work through `bg_tx`), resizes and clicks update the
+/// frame. Anything that arrived sets `repaint` — UI input is always worth a
+/// frame, immediately.
+fn handle_ui_event(
+    app: &mut App,
+    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    term: TermEvent,
+    bg_tx: &mpsc::UnboundedSender<Input>,
+    repaint: &mut bool,
+) -> Result<()> {
+    match term {
+        TermEvent::Key(key) => {
+            // Every key event carries the modifier state, and with the
+            // protocol on, the modifiers arrive as events of their own.
+            // Tracked before dispatch so the footer is right in the same
+            // frame as whatever the key did.
+            track_modifiers(app, &key);
+            // Repeat counts as press. Without the keyboard protocol a held
+            // key just sends more presses, but `REPORT_EVENT_TYPES` splits
+            // them out -- so ignoring them would mean holding `j` scrolled
+            // exactly one row in the terminals this feature is for.
+            if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
+                && !matches!(key.code, KeyCode::Modifier(_))
+            {
+                handle_key(app, key, bg_tx);
+            }
+            *repaint = true;
+        }
+        TermEvent::Resize(_, _) => {
+            terminal.autoresize()?;
+            *repaint = true;
+        }
+        TermEvent::Mouse(ev) => {
+            handle_mouse(app, ev, terminal.size().ok());
+            *repaint = true;
+        }
+        _ => {}
     }
     Ok(())
 }
