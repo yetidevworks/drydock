@@ -1373,6 +1373,10 @@ fn render_owner_picker(f: &mut Frame, app: &App, area: Rect) {
         Style::default().fg(Color::White),
     )));
     lines.push(Line::from(Span::styled(
+        " org missing? an enterprise token policy can hide it — type the owner anyway",
+        Style::default().fg(DIM),
+    )));
+    lines.push(Line::from(Span::styled(
         " j/k move · type to filter · enter picks · esc cancels",
         Style::default().fg(DIM),
     )));
