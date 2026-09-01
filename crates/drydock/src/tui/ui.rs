@@ -1154,7 +1154,12 @@ fn render_org_form(f: &mut Frame, app: &App, area: Rect) {
         .is_some_and(|p| form.is_authed(p, &form.host));
     let empty_auth = form.authed.is_empty();
 
-    let provider_text = if empty_auth {
+    let provider_text = if form.auth_probing {
+        // The probe shells out to gh/glab/tea and one of them is a network
+        // call; the row says what it is waiting for rather than freezing
+        // first and explaining later.
+        "probing tool auth…".to_string()
+    } else if empty_auth {
         // The honest answer: there is nothing to pick from until a tool is
         // logged in, and the save refusal says so again.
         "no authenticated CLI".to_string()
@@ -1171,7 +1176,7 @@ fn render_org_form(f: &mut Frame, app: &App, area: Rect) {
     } else {
         form.host.clone()
     };
-    let unauthed_note = if !empty_auth && !pair_authed {
+    let unauthed_note = if !form.auth_probing && !empty_auth && !pair_authed {
         Some(Span::styled(
             "  not authenticated",
             Style::default().fg(DIM),

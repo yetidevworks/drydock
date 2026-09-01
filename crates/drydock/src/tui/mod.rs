@@ -110,6 +110,11 @@ pub struct OrgForm {
     /// Every host the tools reported as authenticated when the form opened.
     /// This is the gate the provider, host and login rows cycle through.
     pub authed: Vec<provider::AuthedHost>,
+    /// True while the background probe that fills `authed` is still
+    /// running. The form opens without waiting for it — a keypress must
+    /// never cost a network round trip to `gh auth status` — and saving is
+    /// refused until this clears.
+    pub auth_probing: bool,
     pub provider: String,
     pub host: String,
     pub owner: String,
@@ -158,6 +163,7 @@ impl OrgForm {
                 editing: None,
                 field: 0,
                 authed,
+                auth_probing: false,
                 provider: String::new(),
                 host: String::new(),
                 owner: String::new(),
@@ -188,6 +194,7 @@ impl OrgForm {
             editing,
             field: 0,
             authed,
+            auth_probing: false,
             // A stored org with no explicit provider infers it from its
             // host, the same resolution the orgs list and sync both use.
             provider: org
@@ -216,6 +223,16 @@ impl OrgForm {
             picker_filter: String::new(),
             error: None,
         }
+    }
+
+    /// Open the form for an auth probe that is still in flight: the rows
+    /// are usable the moment the probe lands, and until then the form is
+    /// visible but refuses to save. `open` itself stays synchronous because
+    /// tests and the probe-completion path seed it with a known list.
+    fn open_probing(editing: Option<usize>, org: Option<&OrgConfig>) -> Self {
+        let mut form = Self::open(editing, org, Vec::new());
+        form.auth_probing = true;
+        form
     }
 
     /// The providers that have at least one authenticated host, in the fixed
@@ -989,6 +1006,9 @@ enum Input {
         host: String,
         result: Result<Vec<String>, String>,
     },
+    /// The auth probe started when the org form opened came back: every
+    /// host the CLI tools reported as authenticated.
+    AuthProbed(Vec<crate::provider::AuthedHost>),
     Tick,
 }
 
@@ -1173,6 +1193,10 @@ async fn run_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut A
                 result,
             } => {
                 app.org_form.owners_received(provider, &host, result);
+                dirty = true;
+            }
+            Input::AuthProbed(hosts) => {
+                apply_auth_probed(app, hosts);
                 dirty = true;
             }
             Input::Sync(event) => {
@@ -1623,22 +1647,24 @@ fn handle_orgs_key(app: &mut App, key: KeyEvent, tx: &mpsc::UnboundedSender<Inpu
         KeyCode::Char('j') | KeyCode::Down => app.move_orgs_cursor(1),
         KeyCode::Char('k') | KeyCode::Up => app.move_orgs_cursor(-1),
         KeyCode::Char('a') => {
-            // Probed here, once per open, rather than held in app state:
-            // auth changes outside the dashboard (a fresh `gh auth login`,
-            // a new tea login) should be picked up the next time the form
-            // opens, not stale from when it launched.
-            let authed = provider::authenticated_hosts(Duration::from_secs(5));
-            app.org_form = OrgForm::open(None, None, authed);
+            // Probed on every open, rather than held in app state: auth
+            // changes outside the dashboard (a fresh `gh auth login`, a new
+            // tea login) should be picked up the next time the form opens,
+            // not stale from when it launched. Probed OFF the UI thread —
+            // `gh auth status` is a network call, and running it here is
+            // what made the form take seconds to appear.
+            app.org_form = OrgForm::open_probing(None, None);
             app.mode = Mode::OrgForm;
+            spawn_auth_probe(tx);
         }
         KeyCode::Char('e') => {
             let Some(org) = app.selected_org() else {
                 return;
             };
             let editing = Some(app.orgs_cursor);
-            let authed = provider::authenticated_hosts(Duration::from_secs(5));
-            app.org_form = OrgForm::open(editing, Some(&org), authed);
+            app.org_form = OrgForm::open_probing(editing, Some(&org));
             app.mode = Mode::OrgForm;
+            spawn_auth_probe(tx);
         }
         KeyCode::Char('x') => remove_org(app),
         KeyCode::Char('s') => {
@@ -1674,6 +1700,37 @@ fn handle_orgs_key(app: &mut App, key: KeyEvent, tx: &mpsc::UnboundedSender<Inpu
             app.detail_scroll = 0;
         }
         _ => {}
+    }
+}
+
+/// Probe tool auth off the UI thread; the answer arrives as
+/// [`Input::AuthProbed`]. See the comment on the `a` key above.
+fn spawn_auth_probe(tx: &mpsc::UnboundedSender<Input>) {
+    let tx = tx.clone();
+    tokio::spawn(async move {
+        let hosts = tokio::task::spawn_blocking(move || {
+            provider::authenticated_hosts(Duration::from_secs(5))
+        })
+        .await
+        .unwrap_or_default();
+        let _ = tx.send(Input::AuthProbed(hosts));
+    });
+}
+
+/// Apply a finished auth probe to whichever form is open. Escaping before
+/// the probe lands drops it; opening another form lets it land there, since
+/// the answer is form-independent.
+fn apply_auth_probed(app: &mut App, hosts: Vec<provider::AuthedHost>) {
+    if app.mode != Mode::OrgForm {
+        return;
+    }
+    let adding = app.org_form.editing.is_none();
+    app.org_form.authed = hosts;
+    app.org_form.auth_probing = false;
+    if adding && app.org_form.provider.is_empty() {
+        if let Some(first) = app.org_form.providers().first().copied() {
+            app.org_form.set_provider(first);
+        }
     }
 }
 
@@ -1807,6 +1864,10 @@ fn handle_org_form_key(app: &mut App, key: KeyEvent, tx: &mpsc::UnboundedSender<
 /// alone would be invisible while the form is up. The form stays open --
 /// the text is still on the fields, so a fix is an edit, not a retype.
 fn save_org_form(app: &mut App) {
+    if app.org_form.auth_probing {
+        app.org_form.error = Some("still checking tool auth — try again in a moment".into());
+        return;
+    }
     let Some(provider) = app.org_form.provider_opt() else {
         // With nothing authenticated at all there is nothing the form can
         // offer, and the fix lives in the terminal, not the form.
@@ -3352,6 +3413,59 @@ mod tests {
             app.cfg.roots,
             vec!["~/dev/github.com".to_string(), "~/custom".to_string()],
             "the parent of the org's path joined the roots, contracted"
+        );
+    }
+
+    /// The form opens instantly while the auth probe is still running (a
+    /// keypress must never wait on a network call), refuses to save until
+    /// the probe lands, and the landing probe seeds the provider/host rows.
+    #[test]
+    fn the_auth_probe_lands_into_the_open_form() {
+        let mut app = org_form_app(vec![]);
+        app.org_form = OrgForm::open_probing(None, None);
+        app.mode = Mode::OrgForm;
+        assert!(app.org_form.auth_probing, "the form starts in probe state");
+        assert!(app.org_form.providers().is_empty());
+
+        // Saving while the probe is in flight is refused, with the reason
+        // drawn inside the overlay. Reach the save the way a user does:
+        // Enter walks to the last row, Enter there attempts the save.
+        let (tx, _rx) = mpsc::unbounded_channel();
+        for _ in 0..ORG_FIELD_COUNT - 1 {
+            handle_org_form_key(&mut app, key(KeyCode::Down), &tx);
+        }
+        handle_org_form_key(&mut app, key(KeyCode::Enter), &tx);
+        assert!(app.cfg.orgs.is_empty(), "no save while probing");
+        assert!(
+            app.org_form
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("checking tool auth")),
+            "the refusal names the probe: {:?}",
+            app.org_form.error
+        );
+
+        // The probe lands (as `Input::AuthProbed` delivers it): the rows
+        // fill in and the probing state clears.
+        apply_auth_probed(
+            &mut app,
+            vec![provider::AuthedHost {
+                provider: OrgProvider::GitHub,
+                host: "github.com".into(),
+                login: Some("crueber".into()),
+                name: None,
+            }],
+        );
+        assert!(!app.org_form.auth_probing);
+        assert_eq!(app.org_form.provider, "github");
+        assert_eq!(app.org_form.host, "github.com");
+
+        // The rendered row says what the wait was, then what it became.
+        app.org_form = OrgForm::open_probing(None, None);
+        let out = render_once(&app, 90, 24).unwrap();
+        assert!(
+            out.contains("probing tool auth"),
+            "the probing state is visible: {out}"
         );
     }
 

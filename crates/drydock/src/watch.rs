@@ -52,7 +52,10 @@ use notify::{RecommendedWatcher, RecursiveMode};
 use notify_debouncer_full::{new_debouncer_opt, DebounceEventResult, Debouncer, NoCache};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc, Mutex,
+};
 use walkdir::WalkDir;
 
 use crate::config::Config;
@@ -91,6 +94,9 @@ pub struct Handle {
     shared: Arc<Mutex<WatcherState>>,
     roots: Arc<Vec<PathBuf>>,
     prune: Arc<HashSet<String>>,
+    /// Reconcile sequencing: claimed per call, applied under the lock, so a
+    /// slower older walk can never overwrite a newer reconcile's result.
+    seq: Arc<AtomicU64>,
 }
 
 /// The debouncer and the record of what is registered share a lock so that
@@ -104,6 +110,8 @@ struct WatcherState {
     /// Set the first time a registration fails, so the budget warning is
     /// logged once per session instead of once per failing directory.
     budget_warned: bool,
+    /// The newest reconcile sequence applied to `watched`.
+    last_seq: u64,
 }
 
 impl WatcherState {
@@ -194,6 +202,7 @@ where
         debouncer,
         watched: HashMap::new(),
         budget_warned: false,
+        last_seq: 0,
     };
 
     // Root watches are non-recursive and exist only as a cheap fallback signal
@@ -210,11 +219,9 @@ where
         anyhow::bail!("no scan root could be watched");
     }
 
-    for repo in &repos {
-        for (dir, mode) in watch_set_for(repo, &prune) {
-            state.register(&dir, mode);
-        }
-    }
+    // Per-repo sets register on the reconcile thread, not here: the initial
+    // registration walks every working tree, and spawn runs on the
+    // dashboard's event loop, where a walk of 500 trees reads as a freeze.
 
     let shared = Arc::new(Mutex::new(state));
 
@@ -249,11 +256,14 @@ where
         }
     });
 
-    Ok(Handle {
+    let handle = Handle {
         shared,
         roots: Arc::new(roots),
         prune,
-    })
+        seq: Arc::new(AtomicU64::new(0)),
+    };
+    handle.reconcile(&repos);
+    Ok(handle)
 }
 
 impl Handle {
@@ -264,36 +274,54 @@ impl Handle {
     /// re-registered, so a steady-state sweep costs one diff, not a storm of
     /// inotify_add_watch calls.
     pub fn reconcile(&self, repos: &[PathBuf]) {
-        // The filesystem walk and the desired-set computation happen before
-        // the lock is taken: the critical section is then only the diff plus
-        // a handful of inotify syscalls.
-        let mut desired: Vec<PathBuf> = Vec::new();
-        let mut modes: HashMap<PathBuf, RecursiveMode> = HashMap::new();
-        for root in self.roots.iter().filter(|r| r.is_dir()) {
-            modes
-                .entry(root.clone())
-                .or_insert(RecursiveMode::NonRecursive);
-            desired.push(root.clone());
-        }
-        for repo in repos {
-            for (dir, mode) in watch_set_for(repo, &self.prune) {
-                modes.entry(dir.clone()).or_insert(mode);
-                desired.push(dir);
-            }
-        }
+        // A sequence number is claimed per call and checked under the lock:
+        // reconcile runs on a detached thread, and a walk that started
+        // earlier must never overwrite a reconcile that started later.
+        let seq = self.seq.fetch_add(1, Ordering::SeqCst) + 1;
+        let shared = Arc::clone(&self.shared);
+        let roots = Arc::clone(&self.roots);
+        let prune = Arc::clone(&self.prune);
+        let repos = repos.to_vec();
+        // The expensive part — walking every working tree in the fleet —
+        // happens here, on a thread of its own. It used to run on the
+        // caller's thread, which in the dashboard is the event loop: each
+        // sweep's end read as a UI freeze lasting as long as the walk.
+        // Only the short diff-and-register section ever takes the lock.
+        let _ = std::thread::Builder::new()
+            .name("drydock watch reconcile".to_string())
+            .spawn(move || {
+                let mut desired: Vec<PathBuf> = Vec::new();
+                let mut modes: HashMap<PathBuf, RecursiveMode> = HashMap::new();
+                for root in roots.iter().filter(|r| r.is_dir()) {
+                    modes
+                        .entry(root.clone())
+                        .or_insert(RecursiveMode::NonRecursive);
+                    desired.push(root.clone());
+                }
+                for repo in &repos {
+                    for (dir, mode) in watch_set_for(repo, &prune) {
+                        modes.entry(dir.clone()).or_insert(mode);
+                        desired.push(dir);
+                    }
+                }
 
-        let mut state = WatcherState::lock_shared(&self.shared);
-        let (add, remove) = diff_watch_sets(&state.watched, &desired);
-        for path in remove {
-            state.unregister(&path);
-        }
-        for path in add {
-            let mode = modes
-                .get(&path)
-                .copied()
-                .unwrap_or(RecursiveMode::NonRecursive);
-            state.register(&path, mode);
-        }
+                let mut state = WatcherState::lock_shared(&shared);
+                if state.last_seq >= seq {
+                    return;
+                }
+                state.last_seq = seq;
+                let (add, remove) = diff_watch_sets(&state.watched, &desired);
+                for path in remove {
+                    state.unregister(&path);
+                }
+                for path in add {
+                    let mode = modes
+                        .get(&path)
+                        .copied()
+                        .unwrap_or(RecursiveMode::NonRecursive);
+                    state.register(&path, mode);
+                }
+            });
     }
 }
 
@@ -484,6 +512,19 @@ mod tests {
 
     fn watched_count(handle: &Handle) -> usize {
         WatcherState::lock_shared(&handle.shared).watched.len()
+    }
+
+    /// Reconcile applies on a background thread; tests wait for the
+    /// registration to land instead of racing it. Returns the final count.
+    fn wait_watched(handle: &Handle, min: usize) -> usize {
+        for _ in 0..250 {
+            let n = watched_count(handle);
+            if n >= min {
+                return n;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        watched_count(handle)
     }
 
     #[test]
@@ -690,10 +731,11 @@ mod tests {
         let handle = spawn(Arc::new(cfg), Vec::new(), |_| {}).unwrap();
         let before = watched_count(&handle);
         handle.reconcile(&[repo.clone()]);
-        let after = watched_count(&handle);
+        let after = wait_watched(&handle, before + 1);
         assert!(after > before, "reconcile should register the new repo");
 
         handle.reconcile(&[repo.clone()]);
+        std::thread::sleep(std::time::Duration::from_millis(300));
         assert_eq!(
             watched_count(&handle),
             after,
