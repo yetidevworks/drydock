@@ -212,6 +212,86 @@ fn preview(body: &str) -> String {
     head.lines().next().unwrap_or_default().to_string()
 }
 
+/// Ask `gh` which hosts it is logged in to, as (host, account) pairs. Sync,
+/// run once when the add-flow opens: this is the gate the form enforces,
+/// and the async runner's error handling has nothing useful to say about
+/// "not logged in" — that isn't a failure, it's an empty answer.
+pub fn auth_status(timeout: Duration) -> Vec<(String, String)> {
+    let Some(out) = crate::provider::run_probe(
+        "gh",
+        &["auth", "status"],
+        &[("GH_PROMPT_DISABLED", "1")],
+        timeout,
+    ) else {
+        return Vec::new();
+    };
+    let mut pairs = parse_auth_status(&out.stdout);
+    if pairs.is_empty() {
+        pairs = parse_auth_status(&out.stderr);
+    }
+    pairs
+}
+
+/// Pull (host, account) pairs out of `gh auth status` output. Anchored on
+/// the words rather than the line shape, because everything around them
+/// varies: the ✓/✗ marker depends on the terminal, and the trailing
+/// parenthetical is sometimes `(keyring)` and sometimes the config path.
+/// Under each host block the active account is listed first, and only that
+/// one is reported — the inactive accounts would just duplicate hosts the
+/// form already offers.
+fn parse_auth_status(out: &str) -> Vec<(String, String)> {
+    let mut pairs: Vec<(String, String)> = Vec::new();
+    for line in out.lines() {
+        let Some(rest) = line.split("Logged in to ").nth(1) else {
+            continue;
+        };
+        let Some((host, after)) = rest.split_once(" account ") else {
+            continue;
+        };
+        let host = host.trim();
+        // Anything from the first ` (` on is an annotation, not part of the
+        // account name.
+        let user = after.split(" (").next().unwrap_or("").trim();
+        if host.is_empty() || user.is_empty() {
+            continue;
+        }
+        if pairs.iter().any(|(h, _)| h == host) {
+            continue;
+        }
+        pairs.push((host.to_string(), user.to_string()));
+    }
+    pairs
+}
+
+/// List the owners the authenticated account can register: its personal
+/// namespace first, then the organizations it belongs to. Both come from
+/// the API in jq line mode, because `--paginate` concatenates page arrays
+/// into JSON no parser can read — while `--jq` runs per page, leaving
+/// plain newline-separated names.
+pub async fn list_owners(timeout: Duration) -> Result<Vec<String>> {
+    let me = run_gh(&["api", "user", "--jq", ".login"], timeout).await?;
+    let orgs = run_gh(
+        &["api", "user/orgs", "--paginate", "--jq", ".[].login"],
+        timeout,
+    )
+    .await?;
+    Ok(parse_owner_lines(&format!("{me}\n{orgs}")))
+}
+
+/// One name per line, trimmed, blanks dropped, first occurrence kept —
+/// `--paginate` can repeat a name across overlapping pages.
+fn parse_owner_lines(body: &str) -> Vec<String> {
+    let mut owners: Vec<String> = Vec::new();
+    for line in body.lines() {
+        let name = line.trim();
+        if name.is_empty() || owners.iter().any(|o| o == name) {
+            continue;
+        }
+        owners.push(name.to_string());
+    }
+    owners
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -338,4 +418,65 @@ mod tests {
     fn rejects_empty_gh_output() {
         assert!(parse_gh("").is_err());
     }
+    // The exact shape current gh prints, including the config-path
+    // parenthetical that replaced the old `(keyring)`.
+    #[test]
+    fn parses_gh_auth_status_output() {
+        let out = "\
+github.com
+  ✓ Logged in to github.com account crueber (/home/crueber/.config/gh/hosts.yml)
+  - Active account: true
+  - Git operations protocol: ssh
+  - Token: github_pat_****";
+        assert_eq!(
+            parse_auth_status(out),
+            vec![("github.com".to_string(), "crueber".to_string())]
+        );
+    }
+
+    // A GitHub Enterprise install is a second host block in the same
+    // output, and an inactive account under a host the active one already
+    // named must not duplicate that host.
+    #[test]
+    fn parses_multiple_hosts_and_keeps_the_active_account() {
+        let out = "\
+github.com
+  ✓ Logged in to github.com account crueber (keyring)
+  - Active account: true
+  ✗ Logged in to github.com account work (keyring)
+  - Active account: false
+ghe.corp.example.com
+  ✓ Logged in to ghe.corp.example.com account ops";
+        assert_eq!(
+            parse_auth_status(out),
+            vec![
+                ("github.com".to_string(), "crueber".to_string()),
+                ("ghe.corp.example.com".to_string(), "ops".to_string())
+            ]
+        );
+    }
+
+    // A failed `gh auth status` is caught upstream as a non-zero exit; the
+    // parser seeing non-status text must simply report nothing.
+    #[test]
+    fn parses_nothing_from_non_auth_status_text() {
+        assert!(parse_auth_status("not logged in to anything").is_empty());
+        assert!(parse_auth_status("").is_empty());
+    }
+
+    #[test]
+    fn parses_owner_lines_deduped_and_personal_first() {
+        let body = "crueber\nacme\nfleet\ncrueber\n\n  spaced  \n";
+        assert_eq!(
+            parse_owner_lines(body),
+            vec!["crueber", "acme", "fleet", "spaced"]
+        );
+    }
+
+    #[test]
+    fn parses_no_owners_from_empty_output() {
+        assert!(parse_owner_lines("").is_empty());
+        assert!(parse_owner_lines("\n\n").is_empty());
+    }
 }
+

@@ -158,6 +158,125 @@ fn parse_glab(body: &str) -> Result<Vec<OrgRepo>> {
         .collect())
 }
 
+/// Ask `glab` which hosts it is logged in to, as (host, username) pairs.
+/// Sync, run once when the add-flow opens — the same reasoning as `gh`'s
+/// probe: "not logged in" is an empty answer, not a failure. A degraded
+/// parse (exit zero, nothing recognisable) yields one `gitlab.com` entry
+/// with no user: a parse-shape change upstream must not blank the provider,
+/// because the default-host listing still works.
+pub fn auth_status(timeout: Duration) -> Vec<(String, String)> {
+    let Some(out) = crate::provider::run_probe("glab", &["auth", "status"], &[], timeout) else {
+        return Vec::new();
+    };
+    let mut pairs = parse_auth_status(&out.stdout);
+    if pairs.is_empty() {
+        pairs = parse_auth_status(&out.stderr);
+    }
+    if pairs.is_empty() {
+        vec![("gitlab.com".to_string(), String::new())]
+    } else {
+        pairs
+    }
+}
+
+/// Pull (host, username) pairs out of `glab auth status` output. The output
+/// is host-named blocks — the host on its own line (sometimes with a
+/// trailing colon), then `✓ Logged in as <user>` under it — so the parser
+/// tracks the current block header and anchors on the words, not the
+/// markers, which vary with colour and version. A user line under no
+/// header falls back to `gitlab.com`, glab's own default when it has
+/// nothing else to name.
+fn parse_auth_status(out: &str) -> Vec<(String, String)> {
+    let mut pairs: Vec<(String, String)> = Vec::new();
+    let mut host = "gitlab.com".to_string();
+    for line in out.lines() {
+        let trimmed = line.trim();
+        if let Some(i) = trimmed.find("Logged in as ") {
+            let user = trimmed[i + "Logged in as ".len()..].trim();
+            if !user.is_empty() && !pairs.iter().any(|(h, _)| *h == host) {
+                pairs.push((host.clone(), user.to_string()));
+            }
+        } else if !line.starts_with(char::is_whitespace) {
+            // A block header candidate: a bare hostname, optionally with a
+            // trailing colon. Anything else (a version banner, say) has
+            // spaces and can't be a host.
+            let name = trimmed.trim_end_matches(':');
+            if name.contains('.') && !name.contains(char::is_whitespace) {
+                host = name.to_string();
+            }
+        }
+    }
+    pairs
+}
+
+/// List the owners the authenticated account can register on `host`: the
+/// user's own namespace first, then the groups, deduped. Namespaces is the
+/// one endpoint that answers both in a single shape — asking `user/orgs`
+/// and `groups` separately would need two paging loops for no extra
+/// information.
+///
+/// Paged manually through the query string, like every other GitLab
+/// listing here: the API's default page of 20 would silently truncate a
+/// group-heavy account's choices.
+pub async fn list_owners(host: &str, timeout: Duration) -> Result<Vec<String>> {
+    let mut owners: Vec<String> = Vec::new();
+    let mut page = 1u32;
+    loop {
+        let page_arg = page.to_string();
+        let body = run_glab(
+            &["api", &format!("namespaces?per_page={PAGE_SIZE}&page={page_arg}")],
+            host,
+            timeout,
+        )
+        .await?;
+        let page_owners = parse_owners(&body)?;
+        let last_page = page_owners.len() < PAGE_SIZE as usize;
+        // User-before-group ordering happens inside parse_owners per page;
+        // across pages the personal namespace always lands on page one, so
+        // the top of the list stays personal-first. A page that adds
+        // nothing new ends the loop even if the host ignored the page
+        // parameter — a paging loop that can't terminate would hang the
+        // form.
+        let before = owners.len();
+        for name in page_owners {
+            if !owners.contains(&name) {
+                owners.push(name);
+            }
+        }
+        if last_page || owners.len() == before {
+            return Ok(owners);
+        }
+        page += 1;
+    }
+}
+
+#[derive(Deserialize)]
+struct GlabOwnerNamespace {
+    path: String,
+    #[serde(default)]
+    kind: Option<String>,
+}
+
+/// Turn `glab api namespaces` output into owner names: the user's own
+/// namespace (`kind: "user"`) first, then the groups, deduped, because the
+/// form offers them top-down and the personal namespace is the most common
+/// choice. A namespace without a `kind` is treated as a group rather than
+/// failing the whole listing.
+fn parse_owners(body: &str) -> Result<Vec<String>> {
+    let namespaces: Vec<GlabOwnerNamespace> = serde_json::from_str(body)
+        .with_context(|| format!("parsing glab namespaces output: {body:?}"))?;
+    let mut owners: Vec<String> = Vec::new();
+    for user_only in [true, false] {
+        for ns in &namespaces {
+            let is_user = ns.kind.as_deref() == Some("user");
+            if is_user == user_only && !owners.contains(&ns.path) {
+                owners.push(ns.path.clone());
+            }
+        }
+    }
+    Ok(owners)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -223,5 +342,74 @@ mod tests {
     #[test]
     fn rejects_non_json_namespace_output() {
         assert!(parse_glab_namespace("").is_err());
+    }
+
+    #[test]
+    fn parses_glab_auth_status_blocks() {
+        let out = "\
+gitlab.com:
+  ✓ Logged in as crueber
+  ✓ GitLab CLI 1.40.0
+
+git.mycompany.com
+  ✓ Logged in as ops";
+        assert_eq!(
+            parse_auth_status(out),
+            vec![
+                ("gitlab.com".to_string(), "crueber".to_string()),
+                ("git.mycompany.com".to_string(), "ops".to_string())
+            ]
+        );
+    }
+
+    // A user line under no host header is glab's degraded shape; the
+    // default host is the only name that doesn't invent one.
+    #[test]
+    fn falls_back_to_the_default_host_without_a_header() {
+        assert_eq!(
+            parse_auth_status("  ✓ Logged in as crueber"),
+            vec![("gitlab.com".to_string(), "crueber".to_string())]
+        );
+    }
+
+    #[test]
+    fn parses_nothing_from_non_auth_status_text() {
+        assert!(parse_auth_status("").is_empty());
+        assert!(parse_auth_status("error: not authenticated").is_empty());
+    }
+
+    #[test]
+    fn parses_namespaces_users_first_then_groups() {
+        let body = r#"[
+            {"id":3,"path":"fleet","kind":"group"},
+            {"id":1,"path":"crueber","kind":"user"},
+            {"id":2,"path":"acme","kind":"group"},
+            {"id":4,"path":"fleet","kind":"group"}
+        ]"#;
+        assert_eq!(
+            parse_owners(body).expect("fixture should parse"),
+            vec!["crueber", "fleet", "acme"]
+        );
+    }
+
+    // A namespace without a kind still names an owner — dropping it would
+    // hide a real option from the form for no good reason.
+    #[test]
+    fn keeps_namespaces_without_a_kind() {
+        let body = r#"[{"id":1,"path":"crueber","kind":"user"},{"id":2,"path":"mystery"}]"#;
+        assert_eq!(
+            parse_owners(body).expect("fixture should parse"),
+            vec!["crueber", "mystery"]
+        );
+    }
+
+    #[test]
+    fn rejects_non_json_namespaces_output() {
+        assert!(parse_owners("not json at all").is_err());
+    }
+
+    #[test]
+    fn rejects_empty_namespaces_output() {
+        assert!(parse_owners("").is_err());
     }
 }
