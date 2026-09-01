@@ -57,6 +57,9 @@ pub async fn check(provider: Provider, slug: &str, timeout: Duration) -> Result<
 #[derive(Clone, Debug)]
 pub struct OrgRepo {
     pub name: String,
+    /// The namespace the listing says this repo lives in, when the provider
+    /// reports one. Used to pin a sync to exactly the registered owner.
+    pub owner_login: Option<String>,
     pub ssh_url: String,
     pub https_url: String,
     pub archived: bool,

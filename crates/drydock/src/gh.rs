@@ -196,6 +196,7 @@ fn parse_gh(body: &str) -> Result<Vec<OrgRepo>> {
         .into_iter()
         .map(|r| OrgRepo {
             name: r.name,
+            owner_login: None,
             ssh_url: r.ssh_url,
             https_url: r.url,
             archived: r.is_archived,

@@ -150,6 +150,7 @@ fn parse_glab(body: &str) -> Result<Vec<OrgRepo>> {
         .into_iter()
         .map(|p| OrgRepo {
             name: p.name,
+            owner_login: None,
             ssh_url: p.ssh_url_to_repo,
             https_url: p.http_url_to_repo,
             archived: p.archived,

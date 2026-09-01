@@ -64,41 +64,58 @@ pub async fn list_owner(owner: &str, login: &str, timeout: Duration) -> Result<V
     let mut repos = Vec::new();
     let mut page = 1u32;
     loop {
-        let mut args: Vec<String> = vec![
-            "repos".into(),
-            "list".into(),
-            "--owner".into(),
-            owner.into(),
-            "--output".into(),
-            "json".into(),
-            "--limit".into(),
-            PAGE_SIZE.to_string(),
-            "--page".into(),
-            page.to_string(),
-        ];
-        if !login.is_empty() {
-            args.push("-l".into());
-            args.push(login.into());
-        }
-        let args: Vec<&str> = args.iter().map(String::as_str).collect();
-
-        let body = run_tea(&args, timeout).await?;
+        // `tea repos list --output json` looks tempting, but tea 0.15.1
+        // answers with its own compact schema (`owner`/`name`/`type`/`ssh`)
+        // instead of the API's repo objects — no clone URL, no archived or
+        // fork flags — which silently gutted sync. The API search endpoint
+        // answers with the real repo objects and handles users and orgs
+        // alike through the `owner` parameter.
+        let query = format!(
+            "/repos/search?owner={owner}&limit={}&page={page}",
+            PAGE_SIZE
+        );
+        let body = run_tea(&with_login(&["api", &query], login), timeout).await?;
         let page_repos = parse_tea(&body)?;
-        let last_page = page_repos.len() < PAGE_SIZE as usize;
-        repos.extend(page_repos);
+
+        // A page that adds nothing new ends the loop, so an instance that
+        // ignores the page parameter cannot hang the sync in a spin.
+        // The search endpoint's `owner` parameter is advisory on some
+        // instances — it also answers with repos from orgs the account can
+        // reach — so the exact namespace match happens here.
+        let page_repos: Vec<OrgRepo> = page_repos
+            .into_iter()
+            .filter(|r| {
+                r.owner_login
+                    .as_deref()
+                    .map_or(true, |o| o.eq_ignore_ascii_case(owner))
+            })
+            .collect();
+        let fresh: Vec<OrgRepo> = page_repos
+            .into_iter()
+            .filter(|r: &OrgRepo| repos.iter().all(|k: &OrgRepo| k.name != r.name))
+            .collect();
+        let last_page = fresh.len() < PAGE_SIZE as usize;
+        repos.extend(fresh);
         if last_page {
             return Ok(repos);
         }
         page += 1;
     }
 }
-
 #[derive(Deserialize)]
 struct TeaRepo {
     name: String,
+    /// The compact schema carries a plain string; the API carries an
+    /// object with a `login`. Either way it pins the sync to exactly the
+    /// registered owner — the search endpoint's `owner` parameter is not a
+    /// strict filter on every instance.
     #[serde(default)]
+    owner: Option<TeaOwner>,
+    /// The API spells it `ssh_url`; tea's compact `repos list --output json`
+    /// spells it `ssh`. One struct eats both shapes.
+    #[serde(default, alias = "ssh")]
     ssh_url: String,
-    #[serde(default)]
+    #[serde(default, alias = "https_url")]
     clone_url: String,
     #[serde(default)]
     archived: bool,
@@ -106,16 +123,46 @@ struct TeaRepo {
     fork: bool,
 }
 
-/// Map `tea repos list --output json` output onto [`OrgRepo`]. Absent
-/// optional fields default rather than failing the whole listing: a repo
-/// missing one URL still has a name, and sync can still do something with it.
+/// `tea api /repos/search` answers with `{"ok":..,"data":[…]}`. Older or
+/// alternate shapes — a bare API array — are tolerated by parsing on the
+/// first bracket.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum TeaOwner {
+    Name(String),
+    Object { login: String },
+}
+
+#[derive(Deserialize)]
+struct TeaSearch {
+    #[serde(default)]
+    data: Vec<TeaRepo>,
+}
+
+/// Map tea's repo listing onto [`OrgRepo`]. The wrapper object is the
+/// answer for an owner with zero repos too — `data: []` is empty and true,
+/// not a parse failure. Absent optional fields default rather than failing
+/// the whole listing: a repo missing one URL still has a name, and sync can
+/// still do something with it.
 fn parse_tea(body: &str) -> Result<Vec<OrgRepo>> {
-    let repos: Vec<TeaRepo> = serde_json::from_str(body)
-        .with_context(|| format!("parsing tea repos list output: {body:?}"))?;
+    let payload =
+        json_body(body).ok_or_else(|| anyhow!("no JSON in tea repos output: {body:?}"))?;
+    let repos: Vec<TeaRepo> = if payload.trim_start().starts_with('{') {
+        let search: TeaSearch = serde_json::from_str(payload)
+            .with_context(|| format!("parsing tea api repos output: {payload:?}"))?;
+        search.data
+    } else {
+        serde_json::from_str(payload)
+            .with_context(|| format!("parsing tea repos output: {payload:?}"))?
+    };
     Ok(repos
         .into_iter()
         .map(|r| OrgRepo {
             name: r.name,
+            owner_login: r.owner.as_ref().map(|o| match o {
+                TeaOwner::Name(n) => n.clone(),
+                TeaOwner::Object { login } => login.clone(),
+            }),
             ssh_url: r.ssh_url,
             https_url: r.clone_url,
             archived: r.archived,
@@ -649,5 +696,92 @@ solo      https://git.example.com          sam";
             Some("git.example.com".into())
         );
         assert_eq!(url_host(""), None);
+    }
+
+    // tea 0.15.1's `repos list --output json` — the real captured output. A
+    // compact schema with an `ssh` field and no https URL, archived or fork:
+    // the shape that silently gutted sync before the api-based listing.
+    #[test]
+    fn the_compact_tea_schema_loses_only_what_tea_loses() {
+        let body = r#"[
+          {"owner":"crueber","name":"eth-reward-calc","type":"source",
+           "ssh":"ssh://git@git.packden.us:2288/crueber/eth-reward-calc.git"},
+          {"owner":"crueber","name":"dotfiles","type":"mirror",
+           "ssh":"ssh://git@git.packden.us:2288/crueber/dotfiles.git"}
+        ]"#;
+        let repos = parse_tea(body).unwrap();
+        assert_eq!(repos.len(), 2);
+        assert_eq!(repos[0].name, "eth-reward-calc");
+        assert_eq!(
+            repos[0].ssh_url,
+            "ssh://git@git.packden.us:2288/crueber/eth-reward-calc.git"
+        );
+        assert!(
+            repos[0].https_url.is_empty(),
+            "tea compact has no https URL"
+        );
+        assert!(!repos[1].archived);
+    }
+
+    // `tea api /repos/search` — the shape sync actually uses now: a wrapper
+    // object whose `data` carries the real API repo objects, chatter line
+    // and all.
+    #[test]
+    fn the_api_wrapper_is_parsed_with_full_fields() {
+        let body = concat!(
+            "NOTE: some builds print chatter before the payload\n",
+            r#"{"ok":true,"data":[{""#,
+            r#"""#,
+        );
+        let _ = body; // replaced below — kept for readability of the real one
+        let body = r#"NOTE: chatter
+{"ok":true,"data":[{"id":63,"owner":{"login":"crueber"},"name":"ai-rag","full_name":"crueber/ai-rag","ssh_url":"ssh://git@git.packden.us:2288/crueber/ai-rag.git","clone_url":"https://git.packden.us/crueber/ai-rag.git","archived":false,"fork":false},{"id":64,"name":"boxes","ssh_url":"ssh://git@git.packden.us:2288/acme/boxes.git","clone_url":"https://git.packden.us/acme/boxes.git","archived":true,"fork":true}]}"#;
+        let repos = parse_tea(body).unwrap();
+        assert_eq!(repos.len(), 2);
+        assert_eq!(repos[0].name, "ai-rag");
+        assert_eq!(
+            repos[0].ssh_url,
+            "ssh://git@git.packden.us:2288/crueber/ai-rag.git"
+        );
+        assert_eq!(
+            repos[0].https_url,
+            "https://git.packden.us/crueber/ai-rag.git"
+        );
+        assert!(!repos[0].archived);
+        assert!(repos[1].archived && repos[1].fork);
+    }
+
+    #[test]
+    fn an_empty_data_array_is_a_real_empty_answer() {
+        let repos = parse_tea(r#"{"ok":true,"data":[]}"#).unwrap();
+        assert!(repos.is_empty());
+    }
+
+    #[test]
+    fn a_bare_api_array_still_parses() {
+        let repos =
+            parse_tea(r#"[{"name":"r","ssh_url":"ssh://x/r.git","clone_url":"https://x/r.git"}]"#)
+                .unwrap();
+        assert_eq!(repos.len(), 1);
+        assert_eq!(repos[0].https_url, "https://x/r.git");
+    }
+
+    #[test]
+    fn the_owner_login_is_carried_from_both_shapes() {
+        let compact = parse_tea(
+            r#"[{"owner":"crueber","name":"r1","type":"source","ssh":"ssh://x/crueber/r1.git"}]"#,
+        )
+        .unwrap();
+        assert_eq!(compact[0].owner_login.as_deref(), Some("crueber"));
+
+        let api = parse_tea(
+            r#"{"ok":true,"data":[{"name":"r2","owner":{"login":"mhs"},"ssh_url":"ssh://x/mhs/r2.git","clone_url":"https://x/mhs/r2.git"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(api[0].owner_login.as_deref(), Some("mhs"));
+    }
+    #[test]
+    fn no_json_at_all_is_an_error() {
+        assert!(parse_tea("totally not json").is_err());
     }
 }

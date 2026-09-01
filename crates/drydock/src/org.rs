@@ -396,17 +396,31 @@ pub async fn execute(
                 let outcome = match item {
                     Work::Clone(repo) => {
                         let url = clone_url(org, &repo);
-                        match git::clone(url, &root.join(&repo.name), cfg.remote_timeout()).await {
-                            Ok(()) => SyncOutcome {
-                                action: Action::Cloned,
-                                name: repo.name.clone(),
-                                detail: format!("cloned from {}", url),
-                            },
-                            Err(err) => SyncOutcome {
+                        // A listing that lost its URLs (a provider output
+                        // drift, like tea 0.15.1's compact json) must fail
+                        // loudly here, not as a git error about an empty
+                        // repository name — and never as a silent no-op.
+                        if url.is_empty() {
+                            SyncOutcome {
                                 action: Action::Error,
                                 name: repo.name,
-                                detail: first_line(&err),
-                            },
+                                detail: "the provider listing gave no clone URL".into(),
+                            }
+                        } else {
+                            match git::clone(url, &root.join(&repo.name), cfg.remote_timeout())
+                                .await
+                            {
+                                Ok(()) => SyncOutcome {
+                                    action: Action::Cloned,
+                                    name: repo.name.clone(),
+                                    detail: format!("cloned from {}", url),
+                                },
+                                Err(err) => SyncOutcome {
+                                    action: Action::Error,
+                                    name: repo.name,
+                                    detail: first_line(&err),
+                                },
+                            }
                         }
                     }
                     Work::Update(path) => match git::pull_ff(&path, cfg.remote_timeout()).await {
@@ -588,6 +602,7 @@ mod tests {
     fn repo(name: &str) -> OrgRepo {
         OrgRepo {
             name: name.to_string(),
+            owner_login: None,
             ssh_url: String::new(),
             https_url: String::new(),
             archived: false,
@@ -946,6 +961,32 @@ mod tests {
         assert_eq!(orphan.name, "stray");
         assert_eq!(orphan.detail, "on disk, not in acme's repo list");
         assert!(stray.join(".git").exists(), "orphans are never removed");
+    }
+
+    #[tokio::test]
+    async fn a_listing_that_loses_its_urls_is_a_loud_error_not_a_broken_clone() {
+        let _dir = tempfile::tempdir().unwrap();
+        let work = tempfile::tempdir().unwrap();
+        let cfg = cfg_with_timeout(work.path());
+
+        let org = org();
+        let mut repo = repo("urlless");
+        repo.ssh_url = String::new();
+        repo.https_url = String::new();
+        let plan = plan(&[repo], &[], &org);
+
+        let outcomes = execute(&org, &plan, &cfg, None).await;
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(outcomes[0].action, Action::Error);
+        assert!(
+            outcomes[0].detail.contains("no clone URL"),
+            "the error names the missing URL: {:?}",
+            outcomes[0]
+        );
+        assert!(
+            !work.path().join("urlless").exists(),
+            "nothing is cloned from an empty URL"
+        );
     }
 
     #[tokio::test]
