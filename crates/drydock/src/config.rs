@@ -57,6 +57,10 @@ pub struct Config {
     pub visibility: VisibilityConfig,
     pub release: ReleaseConfig,
     pub ui: UiConfig,
+    /// Registered owners to clone and update on demand. The whole section is
+    /// optional: existing configs load unchanged, and an empty list just means
+    /// nothing to sync.
+    pub orgs: Vec<OrgConfig>,
 }
 
 impl Default for Config {
@@ -80,6 +84,7 @@ impl Default for Config {
             visibility: VisibilityConfig::default(),
             release: ReleaseConfig::default(),
             ui: UiConfig::default(),
+            orgs: Vec::new(),
         }
     }
 }
@@ -281,6 +286,110 @@ impl Default for UiConfig {
     }
 }
 
+/// Which CLI an org's listing goes through. Everything downstream — URLs,
+/// filters, invocation shape — differs per provider, so the one thing config
+/// owes the rest of the feature is a definite answer to "who are we asking".
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum OrgProvider {
+    GitHub,
+    GitLab,
+    Gitea,
+}
+
+impl OrgProvider {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            OrgProvider::GitHub => "github",
+            OrgProvider::GitLab => "gitlab",
+            OrgProvider::Gitea => "gitea",
+        }
+    }
+
+    /// The hosted instances everyone shares. Anything else is self-hosted and
+    /// has to name its provider explicitly: guessing wrong there would send
+    /// the wrong CLI — with the wrong auth — at somebody's instance.
+    pub fn from_host(host: &str) -> Option<OrgProvider> {
+        match host.trim().to_ascii_lowercase().as_str() {
+            "github.com" => Some(OrgProvider::GitHub),
+            "gitlab.com" => Some(OrgProvider::GitLab),
+            "gitea.com" => Some(OrgProvider::Gitea),
+            _ => None,
+        }
+    }
+}
+
+/// How to build clone URLs. SSH is the default because it is what the
+/// provider APIs hand back and what a fleet of working checkouts wants; HTTPS
+/// is there for the places where credentials are cert-based or keys are a
+/// hassle.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CloneProtocol {
+    #[default]
+    Ssh,
+    Https,
+}
+
+/// One registered owner: an instance, who to list there, and where the
+/// checkouts live. Defaults exist so a hand-written `[[orgs]]` table can stay
+/// minimal — three lines is the common case, and every field beyond
+/// `host`/`owner` has a sensible answer.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct OrgConfig {
+    /// Unset means infer from the host; see [`OrgProvider::from_host`].
+    pub provider: Option<OrgProvider>,
+    /// Instance hostname: `github.com`, `gitlab.com`, or a self-hosted host.
+    pub host: String,
+    /// An organization or a single user — both list the same way.
+    pub owner: String,
+    /// Where checkouts live. Unset means `<first configured root>/<owner>`,
+    /// which is what drops the owner into the dashboard as a group for free.
+    pub path: Option<String>,
+    /// Gitea only: which `tea` login entry to use. Empty means tea's default.
+    pub login: String,
+    pub protocol: CloneProtocol,
+    pub include_forks: bool,
+    pub include_archived: bool,
+    /// GitLab groups only: whether to descend into subgroups when listing.
+    pub include_subgroups: bool,
+    /// Repo-name globs to skip.
+    pub exclude: Vec<String>,
+    /// Sync skips a disabled org without forgetting it, so parking one for a
+    /// while is a one-word edit instead of a delete-plus-retyping.
+    pub enabled: bool,
+}
+
+impl Default for OrgConfig {
+    fn default() -> Self {
+        Self {
+            provider: None,
+            host: String::new(),
+            owner: String::new(),
+            path: None,
+            login: String::new(),
+            protocol: CloneProtocol::Ssh,
+            include_forks: false,
+            include_archived: false,
+            include_subgroups: false,
+            exclude: Vec::new(),
+            enabled: true,
+        }
+    }
+}
+
+impl OrgConfig {
+    /// An unset provider falls back through host inference; a host nothing
+    /// knows reads as GitHub rather than panicking — [`Config::org_problems`]
+    /// is what reports the ambiguity to a human.
+    pub fn resolved_provider(&self) -> OrgProvider {
+        self.provider
+            .or(OrgProvider::from_host(&self.host))
+            .unwrap_or(OrgProvider::GitHub)
+    }
+}
+
 impl Config {
     pub fn root_paths(&self) -> Vec<PathBuf> {
         self.roots.iter().map(|r| paths::expand(r)).collect()
@@ -346,6 +455,93 @@ impl Config {
 
     pub fn visibility_timeout(&self) -> Duration {
         parse_duration(&self.visibility.timeout).unwrap_or(Duration::from_secs(10))
+    }
+
+    /// Where this org's checkouts belong, expanded to an absolute path. An
+    /// unset `path` lands under the first root so the owner shows up in the
+    /// dashboard as a group; with no roots at all there is nothing to resolve
+    /// against, and `None` says "don't check this one for overlap".
+    fn resolved_org_path(&self, org: &OrgConfig) -> Option<PathBuf> {
+        match &org.path {
+            Some(p) => Some(paths::expand(p)),
+            None => self
+                .root_paths()
+                .into_iter()
+                .next()
+                .map(|root| root.join(&org.owner)),
+        }
+    }
+
+    /// Everything wrong with the `[[orgs]]` section, one human-readable line
+    /// per problem; an empty vec means safe to sync against. This runs before
+    /// any sync so a typo'd config fails loudly instead of cloning a fleet
+    /// into the wrong tree — which is also why the checks are conservative:
+    /// overlapping paths and duplicate owners are refused even though sync
+    /// itself could probably cope.
+    pub fn org_problems(&self) -> Vec<String> {
+        let mut problems = Vec::new();
+
+        for (idx, org) in self.orgs.iter().enumerate() {
+            let tag = format!("orgs[{}]", idx + 1);
+            if org.owner.trim().is_empty() {
+                problems.push(format!("{tag}: owner is empty"));
+            }
+            if org.host.trim().is_empty() {
+                problems.push(format!("{tag}: host is empty"));
+            } else if org.provider.is_none() && OrgProvider::from_host(&org.host).is_none() {
+                problems.push(format!(
+                    "{tag}: host \"{}\" is not a known instance; set provider = \"github\" | \"gitlab\" | \"gitea\" explicitly",
+                    org.host
+                ));
+            }
+        }
+
+        // Two orgs listing the same owner would fight over the same
+        // checkouts, so the second registration is a mistake however you
+        // slice it. Lists this short don't justify a map.
+        for i in 0..self.orgs.len() {
+            for j in (i + 1)..self.orgs.len() {
+                let (a, b) = (&self.orgs[i], &self.orgs[j]);
+                if a.resolved_provider() == b.resolved_provider()
+                    && a.host.eq_ignore_ascii_case(&b.host)
+                    && a.owner == b.owner
+                {
+                    problems.push(format!(
+                        "orgs[{}] and orgs[{}]: duplicate org {} on {} for owner \"{}\"",
+                        i + 1,
+                        j + 1,
+                        a.resolved_provider().as_str(),
+                        a.host,
+                        a.owner,
+                    ));
+                }
+            }
+        }
+
+        // Nested paths mean one sync would fast-forward repos inside another
+        // org's directory — or report them as orphans. Either way it's a
+        // config bug worth catching before anything runs.
+        let resolved: Vec<Option<PathBuf>> =
+            self.orgs.iter().map(|org| self.resolved_org_path(org)).collect();
+        for i in 0..resolved.len() {
+            for j in (i + 1)..resolved.len() {
+                let pair = match (&resolved[i], &resolved[j]) {
+                    (Some(a), Some(b)) => (a, b),
+                    _ => continue,
+                };
+                if pair.0.starts_with(pair.1) || pair.1.starts_with(pair.0) {
+                    problems.push(format!(
+                        "orgs[{}] path {} overlaps orgs[{}] path {}",
+                        i + 1,
+                        pair.0.display(),
+                        j + 1,
+                        pair.1.display(),
+                    ));
+                }
+            }
+        }
+
+        problems
     }
 }
 
@@ -463,5 +659,139 @@ mod tests {
         let back: Config = toml::from_str(&body).unwrap();
         assert_eq!(back.roots, cfg.roots);
         assert_eq!(back.max_depth, cfg.max_depth);
+    }
+
+    #[test]
+    fn default_config_has_no_orgs() {
+        assert!(Config::default().orgs.is_empty());
+    }
+
+    // Lowercase TOML names are what a user writes, so they have to survive
+    // the trip into the enums — and the optional fields must fall back to
+    // defaults, since a minimal three-line `[[orgs]]` table is the common case.
+    #[test]
+    fn org_tables_parse_with_defaults() {
+        let cfg: Config = toml::from_str(
+            r#"
+            [[orgs]]
+            host = "github.com"
+            owner = "acme"
+
+            [[orgs]]
+            provider = "gitea"
+            host = "git.example.com"
+            owner = "otter"
+            path = "~/dev/gitea/otter"
+            login = "work"
+            protocol = "https"
+            include_forks = true
+            include_archived = true
+            include_subgroups = true
+            exclude = ["sandbox-*"]
+            enabled = false
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(cfg.orgs.len(), 2);
+
+        let github = &cfg.orgs[0];
+        assert_eq!(github.provider, None);
+        assert_eq!(github.resolved_provider(), OrgProvider::GitHub);
+        assert_eq!(github.host, "github.com");
+        assert_eq!(github.owner, "acme");
+        assert_eq!(github.path, None);
+        assert_eq!(github.login, "");
+        assert_eq!(github.protocol, CloneProtocol::Ssh);
+        assert!(github.exclude.is_empty());
+        assert!(github.enabled);
+
+        let gitea = &cfg.orgs[1];
+        assert_eq!(gitea.provider, Some(OrgProvider::Gitea));
+        assert_eq!(gitea.resolved_provider(), OrgProvider::Gitea);
+        assert_eq!(gitea.protocol, CloneProtocol::Https);
+        assert_eq!(gitea.exclude, vec!["sandbox-*"]);
+        assert!(!gitea.enabled);
+    }
+
+    #[test]
+    fn unknown_keys_inside_org_tables_are_rejected() {
+        let err = toml::from_str::<Config>(
+            r#"
+            [[orgs]]
+            host = "github.com"
+            owner = "acme"
+            bogon = true
+            "#,
+        );
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn from_host_knows_the_hosted_instances() {
+        assert_eq!(OrgProvider::from_host("github.com"), Some(OrgProvider::GitHub));
+        assert_eq!(OrgProvider::from_host("GitHub.Com"), Some(OrgProvider::GitHub));
+        assert_eq!(OrgProvider::from_host(" gitlab.com "), Some(OrgProvider::GitLab));
+        assert_eq!(OrgProvider::from_host("gitea.com"), Some(OrgProvider::Gitea));
+        assert_eq!(OrgProvider::from_host("git.example.com"), None);
+        assert_eq!(OrgProvider::from_host(""), None);
+    }
+
+    #[test]
+    fn org_problems_flags_duplicates_and_nested_paths() {
+        let cfg: Config = toml::from_str(
+            r#"
+            [[orgs]]
+            host = "github.com"
+            owner = "acme"
+
+            [[orgs]]
+            host = "github.com"
+            owner = "acme"
+
+            [[orgs]]
+            host = "github.com"
+            owner = "other"
+            path = "~/dev/github.com"
+
+            [[orgs]]
+            host = "github.com"
+            owner = "nested"
+            path = "~/dev/github.com/nested"
+            "#,
+        )
+        .unwrap();
+
+        let problems = cfg.org_problems();
+        assert!(problems.iter().any(|p| p.contains("duplicate")), "{problems:?}");
+        assert!(problems.iter().any(|p| p.contains("overlaps")), "{problems:?}");
+    }
+
+    #[test]
+    fn org_problems_accepts_a_valid_config() {
+        let cfg: Config = toml::from_str(
+            r#"
+            roots = ["~/Projects"]
+
+            [[orgs]]
+            host = "github.com"
+            owner = "acme"
+
+            [[orgs]]
+            provider = "gitlab"
+            host = "git.example.com"
+            owner = "platform"
+            path = "~/dev/gitlab/platform"
+
+            [[orgs]]
+            provider = "gitea"
+            host = "git.example.com"
+            owner = "otter"
+            path = "~/dev/gitea/otter"
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(cfg.org_problems(), Vec::<String>::new());
     }
 }

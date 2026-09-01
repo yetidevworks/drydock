@@ -9,10 +9,12 @@
 //! recognised for now; anything else is skipped rather than guessed at.
 
 use anyhow::{anyhow, Context, Result};
+use serde::Deserialize;
 use std::time::Duration;
 use tokio::process::Command;
 
 use crate::model::Visibility;
+use crate::provider::OrgRepo;
 
 /// Hosts whose repos `gh` can answer for.
 ///
@@ -86,35 +88,30 @@ pub fn github_slug(remote_url: &str) -> Option<String> {
     Some(format!("{owner}/{repo}"))
 }
 
-/// Ask `gh` for one repo's visibility. Errors — `gh` missing, not
-/// authenticated, repo not found, timeout — are the caller's to decide how to
-/// treat; this never guesses at a value.
-pub async fn visibility(slug: &str, timeout: Duration) -> Result<Visibility> {
+/// One `gh` invocation, with the safety rails applied. Stdin is closed so a
+/// credential prompt can never hang waiting for input (`GH_PROMPT_DISABLED`
+/// is the CLI's own version of the same refusal), a timed-out process is
+/// reaped rather than left running, and colour/locale are pinned so output
+/// parses identically everywhere.
+async fn run_gh(args: &[&str], timeout: Duration) -> Result<String> {
     let mut cmd = Command::new("gh");
-    cmd.args([
-        "repo",
-        "view",
-        slug,
-        "--json",
-        "visibility",
-        "--jq",
-        ".visibility",
-    ])
-    .env("GH_PROMPT_DISABLED", "1")
-    .env("NO_COLOR", "1")
-    .env("LC_ALL", "C")
-    .stdin(std::process::Stdio::null())
-    .kill_on_drop(true);
+    cmd.args(args)
+        .env("GH_PROMPT_DISABLED", "1")
+        .env("NO_COLOR", "1")
+        .env("LC_ALL", "C")
+        .stdin(std::process::Stdio::null())
+        .kill_on_drop(true);
 
     let output = tokio::time::timeout(timeout, cmd.output())
         .await
-        .map_err(|_| anyhow!("gh repo view timed out after {}s", timeout.as_secs()))?
-        .context("running gh repo view")?;
+        .map_err(|_| anyhow!("gh {} timed out after {}s", args.join(" "), timeout.as_secs()))?
+        .with_context(|| format!("running gh {}", args.join(" ")))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
         return Err(anyhow!(
-            "gh repo view failed: {}",
+            "gh {} failed: {}",
+            args.join(" "),
             if stderr.is_empty() {
                 "no output".to_string()
             } else {
@@ -122,10 +119,91 @@ pub async fn visibility(slug: &str, timeout: Duration) -> Result<Visibility> {
             }
         ));
     }
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
 
-    let raw = String::from_utf8_lossy(&output.stdout).trim().to_string();
+/// Ask `gh` for one repo's visibility. Errors — `gh` missing, not
+/// authenticated, repo not found, timeout — are the caller's to decide how to
+/// treat; this never guesses at a value.
+pub async fn visibility(slug: &str, timeout: Duration) -> Result<Visibility> {
+    let raw = run_gh(
+        &[
+            "repo",
+            "view",
+            slug,
+            "--json",
+            "visibility",
+            "--jq",
+            ".visibility",
+        ],
+        timeout,
+    )
+    .await?;
+    let raw = raw.trim();
     raw.parse::<Visibility>()
         .map_err(|_| anyhow!("unrecognised visibility {raw:?}"))
+}
+
+/// List every repo `owner` has that the authenticated account can see —
+/// private ones included, since filtering on visibility is the planner's
+/// business, not the listing's. `owner` may be a user or an organization:
+/// GitHub's API takes the same invocation for both, so no kind lookup is
+/// needed the way GitLab's needs one.
+pub async fn list_owner(owner: &str, timeout: Duration) -> Result<Vec<OrgRepo>> {
+    let body = run_gh(
+        &[
+            "repo",
+            "list",
+            owner,
+            "--limit",
+            "1000",
+            "--json",
+            "name,sshUrl,url,isArchived,isFork",
+        ],
+        timeout,
+    )
+    .await?;
+    parse_gh(&body)
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GhRepo {
+    name: String,
+    #[serde(default)]
+    ssh_url: String,
+    #[serde(default)]
+    url: String,
+    #[serde(default)]
+    is_archived: bool,
+    #[serde(default)]
+    is_fork: bool,
+}
+
+/// Map `gh repo list --json` output onto [`OrgRepo`]. Absent optional fields
+/// default rather than failing the whole listing: a repo missing one URL
+/// still has a name, and sync can still do something with it.
+fn parse_gh(body: &str) -> Result<Vec<OrgRepo>> {
+    let repos: Vec<GhRepo> = serde_json::from_str(body)
+        .with_context(|| format!("parsing gh repo list output: {}", preview(body)))?;
+    Ok(repos
+        .into_iter()
+        .map(|r| OrgRepo {
+            name: r.name,
+            ssh_url: r.ssh_url,
+            https_url: r.url,
+            archived: r.is_archived,
+            fork: r.is_fork,
+        })
+        .collect())
+}
+
+/// First line of a body, capped, for error messages. Error context has to
+/// survive a glance: enough to recognise what came back, never the whole
+/// response.
+fn preview(body: &str) -> String {
+    let head: String = body.trim().chars().take(120).collect();
+    head.lines().next().unwrap_or_default().to_string()
 }
 
 #[cfg(test)]
@@ -213,5 +291,45 @@ mod tests {
             github_slug("git@github.com:owner/repo.wiki.git").as_deref(),
             Some("owner/repo")
         );
+    }
+
+    #[test]
+    fn parses_gh_repo_list_output() {
+        let body = r#"[
+            {"name":"fleet","sshUrl":"git@github.com:acme/fleet.git","url":"https://github.com/acme/fleet.git","isArchived":false,"isFork":false},
+            {"name":"old-site","sshUrl":"git@github.com:acme/old-site.git","url":"https://github.com/acme/old-site.git","isArchived":true,"isFork":false},
+            {"name":"dotfiles","sshUrl":"git@github.com:acme/dotfiles.git","url":"https://github.com/acme/dotfiles.git","isArchived":false,"isFork":true}
+        ]"#;
+        let repos = parse_gh(body).expect("fixture should parse");
+        assert_eq!(repos.len(), 3);
+        assert_eq!(repos[0].name, "fleet");
+        assert_eq!(repos[0].ssh_url, "git@github.com:acme/fleet.git");
+        assert_eq!(repos[0].https_url, "https://github.com/acme/fleet.git");
+        assert!(!repos[0].archived);
+        assert!(!repos[0].fork);
+        assert!(repos[1].archived);
+        assert!(repos[2].fork);
+    }
+
+    // The optional fields genuinely are optional in the API's response, and
+    // one thin repo shouldn't take down the listing of an entire owner.
+    #[test]
+    fn parses_repos_missing_optional_fields() {
+        let body = r#"[{"name":"bare"}]"#;
+        let repos = parse_gh(body).expect("fixture should parse");
+        assert_eq!(repos.len(), 1);
+        assert_eq!(repos[0].name, "bare");
+        assert_eq!(repos[0].ssh_url, "");
+        assert!(!repos[0].archived);
+    }
+
+    #[test]
+    fn rejects_non_json_gh_output() {
+        assert!(parse_gh("not json at all").is_err());
+    }
+
+    #[test]
+    fn rejects_empty_gh_output() {
+        assert!(parse_gh("").is_err());
     }
 }

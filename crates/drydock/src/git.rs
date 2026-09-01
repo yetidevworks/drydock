@@ -37,8 +37,12 @@ const GIT_TIMEOUT: Duration = Duration::from_secs(30);
 /// picked, so the newest few hundred is plenty.
 const TAG_LIMIT: usize = 400;
 
-/// One `git` invocation against a repo, with the safety rails applied.
-async fn run_git(root: &Path, args: &[&str]) -> Result<String> {
+/// One `git` invocation run from `cwd`, with the safety rails applied.
+///
+/// `clone` has no repository to run in yet, so the working directory is the
+/// caller's to pick; everything else -- prompt refusal, no optional locks, the
+/// per-invocation timeout cap -- is identical wherever git is pointed.
+async fn run_git_in(cwd: &Path, args: &[&str], timeout: Duration) -> Result<String> {
     let mut cmd = Command::new("git");
     cmd.arg("--no-optional-locks")
         .arg("-c")
@@ -46,7 +50,7 @@ async fn run_git(root: &Path, args: &[&str]) -> Result<String> {
         .arg("-c")
         .arg("color.ui=false")
         .arg("-C")
-        .arg(root)
+        .arg(cwd)
         .args(args)
         .env("GIT_OPTIONAL_LOCKS", "0")
         .env("GIT_TERMINAL_PROMPT", "0")
@@ -55,7 +59,7 @@ async fn run_git(root: &Path, args: &[&str]) -> Result<String> {
         .stdin(std::process::Stdio::null())
         .kill_on_drop(true);
 
-    let output = tokio::time::timeout(GIT_TIMEOUT, cmd.output())
+    let output = tokio::time::timeout(timeout, cmd.output())
         .await
         .map_err(|_| anyhow!("git {} timed out", args.join(" ")))?
         .with_context(|| format!("Running git {}", args.join(" ")))?;
@@ -75,10 +79,53 @@ async fn run_git(root: &Path, args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
+/// One `git` invocation against a repo, at the module-wide timeout. Every
+/// scan-path caller goes through here so the cap stays defined in one place.
+async fn run_git(root: &Path, args: &[&str]) -> Result<String> {
+    run_git_in(root, args, GIT_TIMEOUT).await
+}
+
 /// Like [`run_git`], but a non-zero exit is an expected outcome rather than an
 /// error. `describe` on a repo with no tags is the motivating case.
 async fn try_git(root: &Path, args: &[&str]) -> Option<String> {
     run_git(root, args).await.ok()
+}
+
+/// Clone `url` into `dest`, which must not exist yet.
+///
+/// The cleanup lives here because a failed clone leaves a partial checkout
+/// behind: just enough of a repository that the next discovery sweep would
+/// count it, but not enough to work with. It only ever removes `dest` when
+/// sync itself was about to create it -- a directory that was already there
+/// belonged to something else, and whatever the clone complained about in it,
+/// deleting it is not this function's call.
+pub async fn clone(url: &str, dest: &Path, timeout: Duration) -> Result<()> {
+    let pre_existing = dest.exists();
+    let parent = dest
+        .parent()
+        .ok_or_else(|| anyhow!("{} has no parent directory", dest.display()))?;
+    std::fs::create_dir_all(parent).with_context(|| format!("Creating {}", parent.display()))?;
+
+    let dest_str = dest.to_string_lossy().into_owned();
+    let result = run_git_in(parent, &["clone", url, &dest_str], timeout).await;
+    if result.is_err() && !pre_existing {
+        // Best effort: a partial checkout that survives cleanup is annoying,
+        // but failing the sync over the rm would help nobody.
+        let _ = std::fs::remove_dir_all(dest);
+    }
+    result.map(|_| ())
+}
+
+/// Fast-forward a checkout to its upstream, returning git's stdout.
+///
+/// `--ff-only` is the whole safety story: the pull fetches, then refuses to
+/// merge or rewrite anything, so a diverged branch, a detached HEAD, or a
+/// missing upstream comes back as an ordinary error the caller turns into a
+/// skip with a reason. Nothing here can lose work, which is the bar for a
+/// tool that runs against a fleet while editors are open -- and a dirty tree
+/// is left exactly as dirty as it was found.
+pub async fn pull_ff(root: &Path, timeout: Duration) -> Result<String> {
+    run_git_in(root, &["pull", "--ff-only"], timeout).await
 }
 
 /// Resolve the real git directory for a checkout, following the `gitdir:`
@@ -1245,5 +1292,152 @@ mod tests {
         assert!(tag_eq_version("1.2.3", "1.2.3"));
         assert!(tag_eq_version("v1.2.3", "1.2.3"));
         assert!(!tag_eq_version("1.2.4", "1.2.3"));
+    }
+
+    // ---- org sync: clone and fast-forward ----------------------------------
+
+    /// A one-commit source repo to clone from. Every remote in these tests is
+    /// `file://`, so nothing here touches the network.
+    fn source_repo(dir: &Path, name: &str) -> PathBuf {
+        let src = dir.join(name);
+        std::fs::create_dir_all(&src).unwrap();
+        git(&src, &["init", "-q", "-b", "main", "."]);
+        std::fs::write(src.join("a.txt"), "base\n").unwrap();
+        git(&src, &["add", "-A"]);
+        git(&src, &["commit", "-qm", "init"]);
+        src
+    }
+
+    #[tokio::test]
+    async fn clone_from_a_local_remote_matches_the_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = source_repo(dir.path(), "src");
+
+        let dest = dir.path().join("work").join("repo");
+        clone(&format!("file://{}", src.display()), &dest, GIT_TIMEOUT)
+            .await
+            .unwrap();
+
+        assert!(dest.join(".git").is_dir(), "a real checkout landed");
+        let head = run_git(&dest, &["rev-parse", "HEAD"]).await.unwrap();
+        let origin = run_git(&src, &["rev-parse", "HEAD"]).await.unwrap();
+        assert_eq!(head.trim(), origin.trim());
+    }
+
+    // The clone target already holding something is not ours to clean up:
+    // whatever the clone complained about there, a pre-existing directory
+    // must come out of the attempt exactly as it went in.
+    #[tokio::test]
+    async fn a_failed_clone_leaves_an_occupied_directory_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = source_repo(dir.path(), "src");
+
+        let dest = dir.path().join("occupied");
+        std::fs::create_dir_all(&dest).unwrap();
+        std::fs::write(dest.join("keep.txt"), "keep\n").unwrap();
+
+        assert!(
+            clone(&format!("file://{}", src.display()), &dest, GIT_TIMEOUT)
+                .await
+                .is_err(),
+            "git refuses to clone into a non-empty directory"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dest.join("keep.txt")).unwrap(),
+            "keep\n"
+        );
+        assert!(!dest.join(".git").exists(), "nothing was cloned in");
+    }
+
+    // A partial checkout masquerading as a real repo is exactly what the
+    // cleanup exists to prevent, so a failed clone to a destination that did
+    // not exist must leave no directory behind at all.
+    #[tokio::test]
+    async fn a_failed_clone_to_a_fresh_destination_leaves_nothing_behind() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let dest = dir.path().join("fresh").join("repo");
+        assert!(
+            clone("file:///nonexistent/no-such-repo", &dest, GIT_TIMEOUT)
+                .await
+                .is_err()
+        );
+        assert!(!dest.exists(), "the partial checkout was removed");
+    }
+
+    #[tokio::test]
+    async fn pull_ff_fast_forwards_a_clone_that_is_behind() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = source_repo(dir.path(), "src");
+
+        let dest = dir.path().join("repo");
+        clone(&format!("file://{}", src.display()), &dest, GIT_TIMEOUT)
+            .await
+            .unwrap();
+
+        // New upstream work the clone has never seen.
+        std::fs::write(src.join("a.txt"), "updated\n").unwrap();
+        git(&src, &["add", "-A"]);
+        git(&src, &["commit", "-qm", "upstream work"]);
+
+        pull_ff(&dest, GIT_TIMEOUT).await.unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(dest.join("a.txt")).unwrap(),
+            "updated\n",
+            "the fast-forward brought the new commit"
+        );
+        let head = run_git(&dest, &["rev-parse", "HEAD"]).await.unwrap();
+        let origin = run_git(&src, &["rev-parse", "HEAD"]).await.unwrap();
+        assert_eq!(head.trim(), origin.trim());
+    }
+
+    // Both sides committed: --ff-only must refuse, and refusing is all it
+    // does. The local commit and its working tree survive the attempt
+    // byte-identical, which is the promise that makes auto-sync safe to run.
+    #[tokio::test]
+    async fn pull_ff_on_a_diverged_clone_errors_and_changes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = source_repo(dir.path(), "src");
+
+        let dest = dir.path().join("repo");
+        clone(&format!("file://{}", src.display()), &dest, GIT_TIMEOUT)
+            .await
+            .unwrap();
+
+        std::fs::write(src.join("a.txt"), "upstream\n").unwrap();
+        git(&src, &["add", "-A"]);
+        git(&src, &["commit", "-qm", "upstream work"]);
+
+        std::fs::write(dest.join("a.txt"), "local\n").unwrap();
+        git(&dest, &["add", "-A"]);
+        git(&dest, &["commit", "-qm", "local work"]);
+        let before = run_git(&dest, &["rev-parse", "HEAD"]).await.unwrap();
+
+        assert!(pull_ff(&dest, GIT_TIMEOUT).await.is_err());
+        assert_eq!(
+            run_git(&dest, &["rev-parse", "HEAD"]).await.unwrap(),
+            before,
+            "the local commit is still HEAD"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dest.join("a.txt")).unwrap(),
+            "local\n",
+            "the working tree is byte-identical"
+        );
+    }
+
+    #[tokio::test]
+    async fn pull_ff_on_an_up_to_date_clone_says_so() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = source_repo(dir.path(), "src");
+
+        let dest = dir.path().join("repo");
+        clone(&format!("file://{}", src.display()), &dest, GIT_TIMEOUT)
+            .await
+            .unwrap();
+
+        let out = pull_ff(&dest, GIT_TIMEOUT).await.unwrap();
+        assert!(out.contains("Already up to date"), "stdout was: {out}");
     }
 }

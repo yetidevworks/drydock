@@ -46,6 +46,20 @@ pub async fn check(provider: Provider, slug: &str, timeout: Duration) -> Result<
     }
 }
 
+/// The one shape every provider's listing maps into, so the org-sync engine
+/// (org.rs, wave 2) never sees provider-specific JSON. Each CLI names these
+/// fields differently (`sshUrl` vs `ssh_url_to_repo` vs `ssh_url`), and the
+/// engine has no business caring; the per-provider modules do the translation
+/// at the edge, right where the raw response is in hand.
+#[derive(Clone, Debug)]
+pub struct OrgRepo {
+    pub name: String,
+    pub ssh_url: String,
+    pub https_url: String,
+    pub archived: bool,
+    pub fork: bool,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
