@@ -1651,8 +1651,8 @@ mod tests {
         assert_eq!(rows.len(), Column::all().len(), "every column is listed");
         let shown: Vec<Column> = rows.iter().filter(|(_, on)| *on).map(|(c, _)| *c).collect();
         assert_eq!(shown, app.columns);
-        // Both visibility forms and FETCHED sit in the hidden section by
-        // default -- the three opt-in columns.
+        // Both visibility forms, STASH and FETCHED sit in the hidden section
+        // by default -- the four opt-in columns.
         let hidden: Vec<Column> = rows
             .iter()
             .filter(|(_, on)| !*on)
@@ -1660,7 +1660,12 @@ mod tests {
             .collect();
         assert_eq!(
             hidden,
-            vec![Column::Visibility, Column::VisibilityShort, Column::Fetched]
+            vec![
+                Column::Visibility,
+                Column::VisibilityShort,
+                Column::Stashes,
+                Column::Fetched
+            ]
         );
     }
 

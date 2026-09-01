@@ -166,8 +166,8 @@ pub struct ListArgs {
     #[arg(long, short = 'S', value_name = "TEXT")]
     pub search: Option<String>,
 
-    /// Sort key: activity, name, group, changes, unpushed, behind, since-tag,
-    /// state, visibility.
+    /// Sort key: activity, name, group, changes, stashes, unpushed, behind,
+    /// since-tag, state, visibility.
     #[arg(long, default_value = "activity")]
     pub sort: String,
 

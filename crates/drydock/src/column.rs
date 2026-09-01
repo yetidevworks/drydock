@@ -29,6 +29,8 @@ pub enum Column {
     /// buys back ten characters of every row for the repo name.
     VisibilityShort,
     Changes,
+    /// How many stash entries are parked on this repo.
+    Stashes,
     Ahead,
     Behind,
     /// How long since anything fetched this repo. The freshness date on the
@@ -63,6 +65,7 @@ impl Column {
             Column::Visibility,
             Column::VisibilityShort,
             Column::Changes,
+            Column::Stashes,
             Column::Ahead,
             Column::Behind,
             Column::Fetched,
@@ -74,8 +77,13 @@ impl Column {
 
     /// What's shown when nothing is configured. VISIBILITY is in here only
     /// when checking is actually on: it costs real width on every row, and
-    /// with checking off every cell would read "checking off" forever. Every
-    /// other column is free — it's already been probed.
+    /// with checking off every cell would read "checking off" forever.
+    ///
+    /// Every other column is free — it's already been probed — but free to
+    /// compute isn't free to show. FETCHED and STASH are held back too, not
+    /// because they cost anything to know but because on most fleets they'd
+    /// read the same on nearly every row while charging the repo name for
+    /// the privilege.
     pub fn defaults(visibility_enabled: bool) -> Vec<Column> {
         Column::all()
             .iter()
@@ -89,6 +97,11 @@ impl Column {
             // of the last fetch is for people who want to watch it, and it's
             // in the detail pane for everyone else.
             .filter(|c| *c != Column::Fetched)
+            // STASH is opt-in on the same reasoning: most repos have no
+            // stashes, so on most fleets it would be a column of `·` charging
+            // six characters a row to the repo name. The people who stash
+            // across a tree know they do, and `C` is where they say so.
+            .filter(|c| *c != Column::Stashes)
             .collect()
     }
 
@@ -103,6 +116,7 @@ impl Column {
             Column::Visibility => "visibility",
             Column::VisibilityShort => "visibility_short",
             Column::Changes => "changes",
+            Column::Stashes => "stashes",
             Column::Ahead => "ahead",
             Column::Behind => "behind",
             Column::Fetched => "fetched",
@@ -129,6 +143,7 @@ impl Column {
             Column::Visibility => "VISIBILITY",
             Column::VisibilityShort => "VIS",
             Column::Changes => "CHANGES",
+            Column::Stashes => "STASH",
             Column::Ahead => "AHEAD",
             Column::Behind => "BEHIND",
             Column::Fetched => "FETCHED",
@@ -149,6 +164,7 @@ impl Column {
             Column::Visibility => "public or private, asked of the host via `gh`",
             Column::VisibilityShort => "the same, as just its marker: ● public, ⊘ private",
             Column::Changes => "staged, unstaged and untracked counts",
+            Column::Stashes => "how many stash entries are parked here",
             Column::Ahead => "commits not pushed to the upstream",
             Column::Behind => "commits on the upstream and not here, ? if never fetched",
             Column::Fetched => "how long since anything fetched this repo",
@@ -160,9 +176,12 @@ impl Column {
 
     pub fn align(&self) -> Align {
         match self {
-            Column::Ahead | Column::Behind | Column::SinceTag | Column::Age | Column::Fetched => {
-                Align::Right
-            }
+            Column::Ahead
+            | Column::Behind
+            | Column::SinceTag
+            | Column::Age
+            | Column::Fetched
+            | Column::Stashes => Align::Right,
             _ => Align::Left,
         }
     }
@@ -184,6 +203,9 @@ impl Column {
             // marker underneath is one character.
             Column::VisibilityShort => Width::Fixed(4),
             Column::Changes => Width::Fixed(12),
+            // The header's own five characters plus a single-space gutter.
+            // Nobody has a five-digit stash.
+            Column::Stashes => Width::Fixed(6),
             Column::Ahead => Width::Fixed(6),
             Column::Behind => Width::Fixed(7),
             // "never" is 5, the header is 7, and one more leaves a gutter.
@@ -237,6 +259,13 @@ impl Column {
                         "?".into()
                     }
                 }),
+            // `?` means "not probed yet", the same as CHANGES. A bare repo
+            // isn't in that state: its stash reflog is read off disk like
+            // anyone else's, and simply isn't there, which is a real zero.
+            Column::Stashes => match repo.stash_count() {
+                Some(n) => fmt::count(n),
+                None => "?".into(),
+            },
             Column::Ahead => fmt::count(repo.unpushed_total()),
             // `?` rather than `·` when nothing has ever fetched: the count is
             // zero because there was nothing to compare against, not because
@@ -357,9 +386,13 @@ mod tests {
                 // flag, the short one on being asked for. FETCHED is opt-in
                 // for the same reason as the short form — BEHIND's `?` is
                 // what you have to know, and this is the detail behind it.
+                // STASH is opt-in because most repos have none.
                 if matches!(
                     column,
-                    Column::Visibility | Column::VisibilityShort | Column::Fetched
+                    Column::Visibility
+                        | Column::VisibilityShort
+                        | Column::Fetched
+                        | Column::Stashes
                 ) {
                     continue;
                 }
@@ -405,6 +438,60 @@ mod tests {
         repo.refs.as_mut().unwrap().fetched_at = None;
         assert_eq!(Column::Behind.cell(&repo, 0, false), "·");
         assert_eq!(Column::Fetched.cell(&repo, 0, false), "·");
+    }
+
+    // Six characters off every repo name to tell most fleets, on most rows,
+    // that nothing is stashed.
+    #[test]
+    fn stash_is_never_a_default_either_way() {
+        for enabled in [false, true] {
+            assert!(!Column::defaults(enabled).contains(&Column::Stashes));
+        }
+        assert!(Column::all().contains(&Column::Stashes));
+    }
+
+    // The same distinction CHANGES draws: a zero somebody checked reads `·`,
+    // and a repo nobody has looked at yet reads `?`. A bare repo is checked
+    // like any other -- its stash reflog just isn't there -- so it gets the
+    // real zero rather than the shrug.
+    #[test]
+    fn stash_says_unknown_only_until_something_has_probed() {
+        let mut repo = RepoStatus::new("/tmp/x".into(), "g".into(), "r".into());
+        assert_eq!(Column::Stashes.cell(&repo, 0, false), "?");
+        assert_eq!(repo.stash_count(), None);
+
+        repo.refs = Some(crate::model::RefsInfo {
+            head: crate::model::Head::Branch("main".into()),
+            branches: Vec::new(),
+            last_commit: None,
+            stashes: 0,
+            operation: None,
+            newest_tag: None,
+            described_tag: None,
+            commits_since_tag: None,
+            since_tag_subjects: Vec::new(),
+            tags_orphaned: false,
+            index_mtime: None,
+            fetched_at: None,
+            remote_url: None,
+            changelog: None,
+            is_bare: true,
+            is_shallow: false,
+        });
+        assert_eq!(Column::Stashes.cell(&repo, 0, false), "·");
+
+        repo.refs.as_mut().unwrap().stashes = 3;
+        assert_eq!(Column::Stashes.cell(&repo, 0, false), "3");
+    }
+
+    // Right-aligned like every other count, and no wider than its own header
+    // plus a gutter.
+    #[test]
+    fn stash_is_a_narrow_right_aligned_count() {
+        assert_eq!(Column::Stashes.header(false), "STASH");
+        assert_eq!(Column::Stashes.width(), Width::Fixed(6));
+        assert!(matches!(Column::Stashes.align(), Align::Right));
+        assert_eq!("stashes".parse::<Column>(), Ok(Column::Stashes));
     }
 
     // The short form is a column of bare glyphs -- worth having, but only

@@ -601,6 +601,18 @@ impl RepoStatus {
         }
     }
 
+    /// How many stash entries this repo has, or `None` if nothing has probed
+    /// it yet.
+    ///
+    /// Optional rather than a bare count for the same reason CHANGES draws
+    /// the distinction: zero stashes is a fact worth reporting, and a repo
+    /// nobody has looked at yet is not that fact. A bare repo does come back
+    /// `Some(0)` -- the stash reflog is read straight off disk, so its absence
+    /// there is a real answer rather than a missing one.
+    pub fn stash_count(&self) -> Option<u32> {
+        self.refs.as_ref().map(|r| r.stashes)
+    }
+
     pub fn commits_since_tag(&self) -> u32 {
         self.refs
             .as_ref()

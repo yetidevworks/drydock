@@ -167,6 +167,7 @@ pub enum Sort {
     Name,
     Group,
     Dirty,
+    Stashes,
     Ahead,
     Behind,
     SinceTag,
@@ -181,6 +182,7 @@ impl Sort {
             Sort::Name => "name",
             Sort::Group => "group",
             Sort::Dirty => "changes",
+            Sort::Stashes => "stashes",
             Sort::Ahead => "unpushed",
             Sort::Behind => "behind",
             Sort::SinceTag => "since-tag",
@@ -195,6 +197,7 @@ impl Sort {
             Sort::Name,
             Sort::Group,
             Sort::Dirty,
+            Sort::Stashes,
             Sort::Ahead,
             Sort::Behind,
             Sort::SinceTag,
@@ -379,6 +382,16 @@ pub fn sort_repos(repos: &mut [&RepoStatus], sort: Sort, reverse: bool) {
                         .cmp(&b.name.to_ascii_lowercase())
                 }),
             Sort::Dirty => a.dirty_total().cmp(&b.dirty_total()),
+            // A repo nothing has probed yet sorts with the empty ones: this
+            // key exists to bring stashes to the top, and "no answer" isn't
+            // a stash. Unlike `visibility`, it isn't gated out of the `s`
+            // cycle -- the count is always probed, so the ordering is always
+            // real, and `changes` isn't gated on CHANGES being on the screen
+            // either.
+            Sort::Stashes => a
+                .stash_count()
+                .unwrap_or(0)
+                .cmp(&b.stash_count().unwrap_or(0)),
             Sort::Ahead => a.unpushed_total().cmp(&b.unpushed_total()),
             Sort::Behind => a.behind_total().cmp(&b.behind_total()),
             Sort::SinceTag => a.commits_since_tag().cmp(&b.commits_since_tag()),
@@ -605,6 +618,32 @@ mod tests {
             out.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(),
             vec!["high", "mid", "low"]
         );
+    }
+
+    // Biggest pile of stashes first, and a repo nothing has probed sinks in
+    // with the empty ones rather than floating up as an unknown.
+    #[test]
+    fn sort_stashes_is_descending_and_unprobed_sinks() {
+        let mut repos = vec![
+            repo("a", "one", 0, 0, 0),
+            repo("b", "many", 0, 0, 0),
+            repo("c", "none", 0, 0, 0),
+            repo("d", "unprobed", 0, 0, 0),
+        ];
+        repos[0].refs.as_mut().unwrap().stashes = 1;
+        repos[1].refs.as_mut().unwrap().stashes = 7;
+        repos[3].refs = None;
+
+        let q = Query {
+            sort: Sort::Stashes,
+            ..Query::default()
+        };
+        let out = q.apply(&repos, 10_000);
+        let names: Vec<&str> = out.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(&names[..2], &["many", "one"]);
+        // The two zeroes tie on the key and fall back to activity, so only
+        // their being last is the claim here.
+        assert!(names[2..].contains(&"none") && names[2..].contains(&"unprobed"));
     }
 
     #[test]
@@ -851,6 +890,7 @@ mod tests {
             Sort::Name,
             Sort::Group,
             Sort::Dirty,
+            Sort::Stashes,
             Sort::Ahead,
             Sort::Behind,
             Sort::SinceTag,
@@ -871,6 +911,7 @@ mod tests {
             Sort::Name,
             Sort::Group,
             Sort::Dirty,
+            Sort::Stashes,
             Sort::Ahead,
             Sort::Behind,
             Sort::SinceTag,

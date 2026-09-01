@@ -318,8 +318,15 @@ columns = ["group", "repo", "branch", "state", "changes", "age"]
 ```
 
 Leave it unset and you get the defaults, which are every column except
-VISIBILITY and FETCHED, and VISIBILITY as well when `visibility.enabled` is on.
-Set it and you get exactly what you list, in the order you list it.
+VISIBILITY, STASH and FETCHED, and VISIBILITY as well when `visibility.enabled`
+is on. Set it and you get exactly what you list, in the order you list it.
+
+STASH is off by default rather than absent: the count is already read as part of
+every sweep, so it costs nothing to know, but most repos have no stashes and a
+column of `·` is six characters an entire row wide taken off the repo name. Turn
+it on if you park work across a tree, or leave it off and press `s` to `stashes`
+when you want to find it — the sort key works whether or not the column is
+showing.
 
 Turning VISIBILITY on in the picker turns `visibility.enabled` on with it and
 kicks off a sweep — otherwise the column could only ever say "checking off".

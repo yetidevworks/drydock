@@ -467,6 +467,18 @@ fn repo_line(repo: &RepoStatus, layout: &TableLayout, now: i64, selected: bool) 
                         base.fg(if flags.dirty { DIRTY } else { DIM }),
                     )
                 }
+                Column::Stashes => {
+                    // Stashed work isn't a warning -- it's work you put down
+                    // on purpose. It gets DIRTY's yellow because that's what
+                    // it is, uncommitted work, but no bold: the row's real
+                    // state is in STATE and CHANGES, and this shouldn't
+                    // out-shout them.
+                    match repo.stash_count() {
+                        Some(n) if n > 0 => Span::styled(rpad(&n.to_string(), w), base.fg(DIRTY)),
+                        Some(_) => Span::styled(rpad("·", w), base.fg(DIM)),
+                        None => Span::styled(rpad("?", w), base.fg(DIM)),
+                    }
+                }
                 Column::Ahead => Span::styled(
                     rpad(&fmt::count(repo.unpushed_total()), w),
                     base.fg(if repo.unpushed_total() > 0 {

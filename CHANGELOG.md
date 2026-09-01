@@ -1,3 +1,13 @@
+# 1.1.1
+
+## 09/01/2026
+
+1. [](#new)
+    * **A `STASH` column**, off by default, showing how many stash entries are parked on each repo. The count was already read on every sweep — stash entries are reflog lines, so it's the line count of `logs/refs/stash` and no process is spawned for it — and it was already in the detail pane, `--json` and the `--stashed` filter. The one thing you couldn't do was see it across the fleet without selecting each repo in turn. Turn it on with `C`, or `"stashes"` in `[ui] columns`. It's off by default because most repos have no stashes, and a column of `·` still charges six characters of every row to the repo name.
+    * A `stashes` sort key, so `s` in the dashboard and `--sort stashes` bring the deepest piles to the top. It works whether or not the column is showing, which is the point if you'd rather not spend the width: press `s` when you want to find parked work, and leave the table as it was the rest of the time.
+2. [](#improved)
+    * `STASH` reads `?` for a repo nothing has probed yet and `·` for one with no stashes, the same distinction `CHANGES` and `BEHIND` already draw. A bare repo gets the real zero rather than the shrug — its stash reflog is read off disk like anyone else's and simply isn't there.
+
 # 1.1.0
 
 ## 08/30/2026
