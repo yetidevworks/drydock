@@ -1052,9 +1052,13 @@ async fn run_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut A
 
     // Filesystem watcher, so edits show up without waiting for the next sweep.
     // The handle lives until the loop exits; dropping it stops the watcher.
-    let _watcher = if app.cfg.refresh.watch {
+    // The roots known at startup come from the cache, which is usually most of
+    // the fleet already; whatever a sweep discovers later lands through
+    // reconcile instead of restarting the watcher.
+    let watcher = if app.cfg.refresh.watch {
         let tx = tx.clone();
-        match watch::spawn(app.cfg.clone(), move |paths| {
+        let roots: Vec<PathBuf> = app.repos.iter().map(|r| r.root.clone()).collect();
+        match watch::spawn(app.cfg.clone(), roots, move |paths| {
             let _ = tx.send(Input::Changed(paths));
         }) {
             Ok(handle) => {
@@ -1152,11 +1156,11 @@ async fn run_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut A
             }
             Input::Term(_) => {}
             Input::Probe(event) => {
-                handle_probe_event(app, event);
+                handle_probe_event(app, event, watcher.as_ref());
                 dirty = true;
             }
             Input::Changed(paths) => {
-                reprobe_paths(app, paths, &tx);
+                reprobe_paths(app, storm_filter(app.org_sync.is_some(), paths), &tx);
                 dirty = true;
             }
             Input::Resweep => {
@@ -1230,7 +1234,7 @@ fn draw(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) -> Res
     Ok(())
 }
 
-fn handle_probe_event(app: &mut App, event: probe::Event) {
+fn handle_probe_event(app: &mut App, event: probe::Event, watcher: Option<&watch::Handle>) {
     match event {
         probe::Event::Discovered { roots } => {
             app.progress = (0, roots.len());
@@ -1255,6 +1259,15 @@ fn handle_probe_event(app: &mut App, event: probe::Event) {
             app.sweep_started = None;
             app.reindex();
             let _ = cache::save(&app.repos);
+            // The post-sweep repo list is the authoritative picture of what
+            // exists on disk, so this is the moment to teach the watcher about
+            // repos that appeared (a sync, a manual clone) or went away.
+            // Reconcile diffs against what it already watches, so on a settled
+            // fleet this is a cheap no-op.
+            if let Some(handle) = watcher {
+                let roots: Vec<PathBuf> = app.repos.iter().map(|r| r.root.clone()).collect();
+                handle.reconcile(&roots);
+            }
         }
     }
     app.recompute();
@@ -1293,6 +1306,30 @@ fn start_sweep(app: &mut App, tx: &mpsc::UnboundedSender<Input>, tier: Tier) {
         }
         let _ = forward.await;
     });
+}
+
+/// How many changed paths one watcher batch will re-probe. A human edit
+/// touches a handful of files in one or two repos; anything past this is the
+/// residue of a mass clone, not a person at a keyboard.
+const STORM_BATCH: usize = 64;
+
+/// Decide what a watcher batch is worth re-probing. While an org sync is
+/// running, nothing is: a 500-repo sync produces continuous events for every
+/// clone over tens of minutes, and re-probing repos mid-clone spawns git
+/// against work in progress and competes with the sync for the same disk and
+/// CPU. The sync ends with its own full sweep, which is the authoritative
+/// refresh anyway. Without a sync, an oversized batch is clone-storm residue;
+/// the periodic backstop sweep and the post-sync sweep cover what we drop,
+/// and unbounded re-probing is what made a freshly synced fleet sluggish.
+/// Small batches pass through untouched, since that is what watching is for.
+fn storm_filter(syncing: bool, paths: Vec<PathBuf>) -> Vec<PathBuf> {
+    if syncing {
+        return Vec::new();
+    }
+    if paths.len() > STORM_BATCH {
+        return paths.into_iter().take(STORM_BATCH).collect();
+    }
+    paths
 }
 
 /// Re-probe just the repos the watcher flagged. This is the whole point of
@@ -3460,5 +3497,42 @@ mod tests {
         handle_org_form_key(&mut app, key(KeyCode::Right), &tx);
         assert_eq!(app.org_form.provider, "github");
         assert_eq!(app.org_form.login, "");
+    }
+
+    // While a sync runs, every watcher event is dropped: the clones still in
+    // flight are not worth probing, and the sync's own final sweep refreshes
+    // everything once it can actually be read.
+    #[test]
+    fn a_sync_in_flight_drops_every_watcher_event() {
+        let paths = vec![PathBuf::from("/p/g/r0"), PathBuf::from("/p/g/r1")];
+        assert!(storm_filter(true, paths).is_empty());
+    }
+
+    // A batch bigger than the cap is clone-storm residue, so only the first
+    // slice is probed and the rest waits for the backstop sweep.
+    #[test]
+    fn an_oversized_batch_is_truncated_to_the_cap() {
+        let paths: Vec<PathBuf> = (0..1000)
+            .map(|i| PathBuf::from(format!("/p/g/r{i}")))
+            .collect();
+        let kept = storm_filter(false, paths);
+        assert_eq!(kept.len(), STORM_BATCH);
+        assert_eq!(kept[0], PathBuf::from("/p/g/r0"));
+        assert_eq!(
+            kept[STORM_BATCH - 1],
+            PathBuf::from(format!("/p/g/r{}", STORM_BATCH - 1))
+        );
+    }
+
+    // Small batches are the ordinary case the watcher exists for, so they
+    // reach re-probing exactly as the kernel reported them.
+    #[test]
+    fn a_small_batch_passes_through_untouched() {
+        let paths = vec![
+            PathBuf::from("/p/g/r0"),
+            PathBuf::from("/p/g/r1"),
+            PathBuf::from("/p/g/r2"),
+        ];
+        assert_eq!(storm_filter(false, paths.clone()), paths);
     }
 }

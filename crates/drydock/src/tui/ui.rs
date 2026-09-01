@@ -866,7 +866,10 @@ fn render_help(f: &mut Frame, app: &App, area: Rect) -> u16 {
                 ("enter", "next row; owner list on owner; saves on the last"),
                 ("space, ← →", "cycle provider, host, login and protocol"),
                 ("space", "flip a toggle"),
-                ("owner row", "user or org on the host: type, or enter to pick"),
+                (
+                    "owner row",
+                    "user or org on the host: type, or enter to pick",
+                ),
                 ("path row", "empty means <first root>/<owner>"),
                 ("esc", "cancel"),
             ],
