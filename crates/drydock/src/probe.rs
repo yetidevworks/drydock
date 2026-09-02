@@ -1158,6 +1158,42 @@ mod tests {
         );
     }
 
+    /// The regression behind "two git processes running forever": an expired
+    /// `status.max_age` used to re-run `git status` across the whole fleet
+    /// every sweep, even when nothing had changed. The fingerprint gate
+    /// outranks the age — an unchanged checkout is skipped whatever the
+    /// cache says about its age — and this test pins that precedence.
+    #[tokio::test]
+    async fn an_expired_max_age_does_not_override_the_fingerprint_gate() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = gate_source_repo(dir.path(), "repo");
+        let d = Discovered {
+            root: root.clone(),
+            group: "acme".into(),
+            name: "repo".into(),
+        };
+        let cfg = with_max_age("1s");
+
+        let first = probe_one(&d, &cfg, None, Tier::Full, false).await;
+        let fp = first.fingerprint.expect("recorded");
+        assert!(first.work.is_some());
+
+        // Outlive the 1s max_age without touching the checkout.
+        std::thread::sleep(std::time::Duration::from_millis(1300));
+
+        let second = probe_one(&d, &cfg, Some(&first), Tier::Full, false).await;
+        assert_eq!(
+            second.refs_probed_at, first.refs_probed_at,
+            "an expired max_age must not re-probe an unchanged checkout"
+        );
+        assert_eq!(second.fingerprint, Some(fp));
+        assert_eq!(
+            second.work.as_ref().map(|w| w.untracked),
+            first.work.as_ref().map(|w| w.untracked),
+            "the cached scan is still true"
+        );
+    }
+
     #[tokio::test]
     async fn a_commit_after_the_last_probe_re_probes() {
         let dir = tempfile::tempdir().unwrap();
