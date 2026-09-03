@@ -402,20 +402,26 @@ pub struct RepoView<'a> {
     pub visibility_error: Option<&'a str>,
     pub branch: String,
     pub upstream: Option<String>,
-    /// Commits `branch` hasn't pushed -- the checked-out branch alone, so it
-    /// reads against the `branch` and `upstream` above it. `ahead_total` is
-    /// the every-branch sum this used to carry.
+    /// Commits unpushed across *every* local branch, not just `branch`. What
+    /// `--unpushed` and `--sort ahead` work from.
+    ///
+    /// This reads oddly next to `branch` and `upstream`, and the AHEAD column
+    /// it used to feed was wrong for exactly that reason. It stays repo-wide
+    /// anyway: 1.0 promised the `--json` fields wouldn't change incompatibly
+    /// without a major version, and quietly redefining a number is the one
+    /// break a script can't notice. `branch_ahead` is the per-branch reading.
     pub ahead: u32,
-    /// Commits `upstream` has that `branch` doesn't. Per-branch, like
-    /// `ahead`; see `behind_total` for the every-branch sum.
-    pub behind: u32,
-    /// Commits unpushed across *every* local branch. What `--unpushed` and
-    /// `--sort ahead` work from, and what a repo-level "is there anything
-    /// here" check wants.
-    pub ahead_total: u32,
     /// Commits behind across *every* local branch, the counterpart to
-    /// `ahead_total`. `--behind` and `--sort behind` work from this.
-    pub behind_total: u32,
+    /// `ahead`. `--behind` and `--sort behind` work from this, and
+    /// `branch_behind` is the per-branch reading.
+    pub behind: u32,
+    /// Commits the checked-out branch hasn't pushed. The one that reads
+    /// against the `branch` and `upstream` above it, and what the AHEAD
+    /// column shows.
+    pub branch_ahead: u32,
+    /// Commits `upstream` has that `branch` doesn't. Per-branch, like
+    /// `branch_ahead`, and what the BEHIND column shows.
+    pub branch_behind: u32,
     /// When anything last fetched this repo, from `FETCH_HEAD`. `null` means
     /// nothing ever has, which is what makes `behind: 0` a number nobody
     /// checked rather than a repo in sync.
@@ -487,10 +493,10 @@ pub fn view<'a>(repo: &'a RepoStatus, now: i64) -> RepoView<'a> {
         upstream: refs
             .and_then(|r| r.current_branch())
             .and_then(|b| b.upstream.clone()),
-        ahead: repo.branch_unpushed(),
-        behind: repo.branch_behind(),
-        ahead_total: repo.unpushed_total(),
-        behind_total: repo.behind_total(),
+        ahead: repo.unpushed_total(),
+        behind: repo.behind_total(),
+        branch_ahead: repo.branch_unpushed(),
+        branch_behind: repo.branch_behind(),
         fetched_at: repo.fetched_at(),
         never_fetched: repo.never_fetched(),
         staged: work.map(|w| w.staged).unwrap_or(0),
@@ -564,5 +570,58 @@ mod tests {
         assert_eq!(lines[2], "longer  22");
         // Every line ends at the same column.
         assert!(lines.iter().all(|l| l.chars().count() == 10));
+    }
+
+    // 1.0 promised the `--json` fields wouldn't change incompatibly without a
+    // major version, and `ahead`/`behind` have always been repo-wide sums. The
+    // columns needed the per-branch reading (#8), but taking these two names
+    // for it would have redefined a number under every script already reading
+    // them, which is the one break nobody notices. The per-branch pair got new
+    // names instead, and this pins which is which.
+    #[test]
+    fn json_keeps_ahead_and_behind_repo_wide_and_adds_the_branch_pair() {
+        let mut repo = RepoStatus::new("/tmp/x".into(), "g".into(), "r".into());
+        repo.refs = Some(crate::model::RefsInfo {
+            head: crate::model::Head::Branch("master".into()),
+            branches: vec![
+                branch("master", 0, 0),
+                // The abandoned topic branch from #8, still tracking master.
+                branch("topic", 2, 128),
+            ],
+            last_commit: None,
+            stashes: 0,
+            operation: None,
+            newest_tag: None,
+            described_tag: None,
+            commits_since_tag: None,
+            since_tag_subjects: Vec::new(),
+            tags_orphaned: false,
+            index_mtime: None,
+            fetched_at: Some(1_000),
+            remote_url: Some("git@github.com:owner/repo.git".into()),
+            changelog: None,
+            is_bare: false,
+            is_shallow: false,
+        });
+
+        let v = view(&repo, 1_000);
+        assert_eq!(v.branch, "master");
+        // Unchanged from every release before this one.
+        assert_eq!((v.ahead, v.behind), (2, 128));
+        // What the table shows, and what reads correctly against `branch`.
+        assert_eq!((v.branch_ahead, v.branch_behind), (0, 0));
+    }
+
+    fn branch(name: &str, ahead: u32, behind: u32) -> crate::model::BranchInfo {
+        crate::model::BranchInfo {
+            name: name.into(),
+            upstream: Some("origin/master".into()),
+            ahead,
+            behind,
+            gone: false,
+            committed_at: 1_000,
+            sha: "abc1234".into(),
+            subject: "s".into(),
+        }
     }
 }

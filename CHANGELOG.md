@@ -1,3 +1,14 @@
+# 1.1.2
+
+## 09/03/2026
+
+1. [](#bugfix)
+    * **AHEAD and BEHIND now report the branch you have checked out**, the one BRANCH names in the same row, rather than every local branch summed. A topic branch abandoned a month ago and left tracking `origin/master` made a perfectly up-to-date `master` read as 128 behind: a number true of the repo and false of every branch the row mentioned. On my own tree that was 14 rows of 580, one of them claiming 1391 behind on a branch that was in sync. Thanks to @nick4eva for the report and the fix.
+    * When another local branch is ahead or behind on its own, the cell picks up a `*`, so `·*` is "this branch is in sync, some other one isn't". Select the repo to see which, in the per-branch table. Only the checked-out branch's own count colours the cell.
+2. [](#improved)
+    * `--unpushed`, `--behind`, both sort keys and the header counts still work from the repo-wide totals. "Does this repo need attention anywhere" is the right question for a filter, even where it's the wrong one for a column.
+    * `--json` gains `branch_ahead` and `branch_behind`, the per-branch pair the columns show. `ahead` and `behind` keep the repo-wide meaning they have always had: 1.0 promised those fields wouldn't change incompatibly without a major version, and quietly redefining a number is the one break a script can't notice.
+
 # 1.1.1
 
 ## 09/01/2026

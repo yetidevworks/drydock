@@ -208,8 +208,13 @@ local branch is ahead or behind on its own, the cell picks up a `*`: `·*` is
 "this branch is in sync, some other one isn't". Select the repo to see which,
 in the per-branch table. `--unpushed`, `--behind` and both sort keys still work
 from the repo-wide totals, so a repo with only a stale side branch still turns
-up in those; `--json` carries all four numbers as `ahead`, `behind`,
-`ahead_total` and `behind_total`.
+up in those.
+
+`--json` carries all four numbers. `ahead` and `behind` are the repo-wide sums
+they have always been, because 1.0 promised those fields wouldn't change
+incompatibly and quietly redefining a number is the one break a script can't
+notice. The per-branch pair the columns show is `branch_ahead` and
+`branch_behind`.
 
 Which is why a repo nothing has ever fetched shows `?` in BEHIND rather than
 `·`. Zero there would say "in sync", and for a repo that has never fetched
