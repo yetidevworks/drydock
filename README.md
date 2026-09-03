@@ -200,6 +200,17 @@ Ahead and behind counts come from remote-tracking refs you have **already
 fetched**, so no network access is involved and they are safe to recompute
 constantly. That also means **"behind" is only as fresh as your last fetch**.
 
+Both columns report **the branch you have checked out** — the one BRANCH names
+in the same row — not every local branch summed. A topic branch you abandoned
+a month ago being 128 commits behind is not your `main` being 128 behind, and
+the row said so with a number next to the wrong branch's name. When another
+local branch is ahead or behind on its own, the cell picks up a `*`: `·*` is
+"this branch is in sync, some other one isn't". Select the repo to see which,
+in the per-branch table. `--unpushed`, `--behind` and both sort keys still work
+from the repo-wide totals, so a repo with only a stale side branch still turns
+up in those; `--json` carries all four numbers as `ahead`, `behind`,
+`ahead_total` and `behind_total`.
+
 Which is why a repo nothing has ever fetched shows `?` in BEHIND rather than
 `·`. Zero there would say "in sync", and for a repo that has never fetched
 that's a claim nobody checked — the count is zero because there was nothing to
