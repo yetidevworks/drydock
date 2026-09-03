@@ -402,8 +402,20 @@ pub struct RepoView<'a> {
     pub visibility_error: Option<&'a str>,
     pub branch: String,
     pub upstream: Option<String>,
+    /// Commits `branch` hasn't pushed -- the checked-out branch alone, so it
+    /// reads against the `branch` and `upstream` above it. `ahead_total` is
+    /// the every-branch sum this used to carry.
     pub ahead: u32,
+    /// Commits `upstream` has that `branch` doesn't. Per-branch, like
+    /// `ahead`; see `behind_total` for the every-branch sum.
     pub behind: u32,
+    /// Commits unpushed across *every* local branch. What `--unpushed` and
+    /// `--sort ahead` work from, and what a repo-level "is there anything
+    /// here" check wants.
+    pub ahead_total: u32,
+    /// Commits behind across *every* local branch, the counterpart to
+    /// `ahead_total`. `--behind` and `--sort behind` work from this.
+    pub behind_total: u32,
     /// When anything last fetched this repo, from `FETCH_HEAD`. `null` means
     /// nothing ever has, which is what makes `behind: 0` a number nobody
     /// checked rather than a repo in sync.
@@ -475,8 +487,10 @@ pub fn view<'a>(repo: &'a RepoStatus, now: i64) -> RepoView<'a> {
         upstream: refs
             .and_then(|r| r.current_branch())
             .and_then(|b| b.upstream.clone()),
-        ahead: repo.unpushed_total(),
-        behind: repo.behind_total(),
+        ahead: repo.branch_unpushed(),
+        behind: repo.branch_behind(),
+        ahead_total: repo.unpushed_total(),
+        behind_total: repo.behind_total(),
         fetched_at: repo.fetched_at(),
         never_fetched: repo.never_fetched(),
         staged: work.map(|w| w.staged).unwrap_or(0),

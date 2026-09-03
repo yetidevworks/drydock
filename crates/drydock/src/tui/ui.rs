@@ -479,26 +479,30 @@ fn repo_line(repo: &RepoStatus, layout: &TableLayout, now: i64, selected: bool) 
                         None => Span::styled(rpad("?", w), base.fg(DIM)),
                     }
                 }
-                Column::Ahead => Span::styled(
-                    rpad(&fmt::count(repo.unpushed_total()), w),
-                    base.fg(if repo.unpushed_total() > 0 {
-                        UNPUSHED
-                    } else {
-                        DIM
-                    }),
-                ),
+                // Both counts are the checked-out branch's, matching BRANCH
+                // next door; `*` means another local branch has some too.
+                // Only the branch's own count colours the cell -- a stale
+                // side branch is a footnote, not a call to action on the row.
+                Column::Ahead => {
+                    let ahead = repo.branch_unpushed();
+                    let text = fmt::marked(fmt::count(ahead), repo.other_branches_unpushed());
+                    Span::styled(
+                        rpad(&text, w),
+                        base.fg(if ahead > 0 { UNPUSHED } else { DIM }),
+                    )
+                }
                 Column::Behind => {
-                    let behind = repo.behind_total();
+                    let behind = repo.branch_behind();
                     // `?`, not `·`: zero here means nothing was ever compared
                     // against a remote, which is not the same as in sync.
                     if behind > 0 {
-                        Span::styled(
-                            rpad(&fmt::count(behind), w),
-                            base.fg(BEHIND).add_modifier(Modifier::BOLD),
-                        )
+                        let text = fmt::marked(fmt::count(behind), repo.other_branches_behind());
+                        Span::styled(rpad(&text, w), base.fg(BEHIND).add_modifier(Modifier::BOLD))
+                    } else if repo.never_fetched() && repo.behind_total() == 0 {
+                        Span::styled(rpad("?", w), base.fg(DIM))
                     } else {
-                        let text = if repo.never_fetched() { "?" } else { "·" };
-                        Span::styled(rpad(text, w), base.fg(DIM))
+                        let text = fmt::marked("·".to_string(), repo.other_branches_behind());
+                        Span::styled(rpad(&text, w), base.fg(DIM))
                     }
                 }
                 Column::Fetched => {

@@ -67,6 +67,19 @@ pub fn count(n: u32) -> String {
     }
 }
 
+/// Appends `*` to a count when the number shown is only part of the story --
+/// the AHEAD/BEHIND cells report the checked-out branch, and `*` says another
+/// local branch has some of its own. Cheap enough to read past when it isn't
+/// what you're looking for, and the columns are wide enough for the extra
+/// glyph.
+pub fn marked(cell: String, marked: bool) -> String {
+    if marked {
+        format!("{cell}*")
+    } else {
+        cell
+    }
+}
+
 pub fn duration(d: std::time::Duration) -> String {
     let ms = d.as_millis();
     if ms < 1_000 {

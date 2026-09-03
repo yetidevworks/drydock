@@ -165,8 +165,10 @@ impl Column {
             Column::VisibilityShort => "the same, as just its marker: ● public, ⊘ private",
             Column::Changes => "staged, unstaged and untracked counts",
             Column::Stashes => "how many stash entries are parked here",
-            Column::Ahead => "commits not pushed to the upstream",
-            Column::Behind => "commits on the upstream and not here, ? if never fetched",
+            Column::Ahead => "commits this branch hasn't pushed, * if another branch has some too",
+            Column::Behind => {
+                "commits the upstream has and this branch doesn't, ? if never fetched"
+            }
             Column::Fetched => "how long since anything fetched this repo",
             Column::Tag => "the newest tag",
             Column::SinceTag => "commits since that tag",
@@ -266,7 +268,14 @@ impl Column {
                 Some(n) => fmt::count(n),
                 None => "?".into(),
             },
-            Column::Ahead => fmt::count(repo.unpushed_total()),
+            // The checked-out branch, not every branch summed: this cell sits
+            // next to BRANCH and has to mean the branch BRANCH names. `*`
+            // marks a repo where some *other* local branch is unpushed too,
+            // so a stale side branch still shows up in the table.
+            Column::Ahead => fmt::marked(
+                fmt::count(repo.branch_unpushed()),
+                repo.other_branches_unpushed(),
+            ),
             // `?` rather than `·` when nothing has ever fetched: the count is
             // zero because there was nothing to compare against, not because
             // the remote has nothing new. Same reading as CHANGES' `?`.
@@ -274,7 +283,10 @@ impl Column {
                 if repo.behind_total() == 0 && repo.never_fetched() {
                     "?".into()
                 } else {
-                    fmt::count(repo.behind_total())
+                    fmt::marked(
+                        fmt::count(repo.branch_behind()),
+                        repo.other_branches_behind(),
+                    )
                 }
             }
             Column::Fetched => fetched_label(repo, now),
@@ -438,6 +450,71 @@ mod tests {
         repo.refs.as_mut().unwrap().fetched_at = None;
         assert_eq!(Column::Behind.cell(&repo, 0, false), "·");
         assert_eq!(Column::Fetched.cell(&repo, 0, false), "·");
+    }
+
+    // The bug this pair of columns used to have: BRANCH named the checked-out
+    // branch while AHEAD and BEHIND summed every branch, so a stale side
+    // branch made a perfectly up-to-date checkout read as 128 behind.
+    #[test]
+    fn ahead_and_behind_report_the_checked_out_branch() {
+        let mut repo = RepoStatus::new("/tmp/x".into(), "g".into(), "r".into());
+        repo.refs = Some(crate::model::RefsInfo {
+            head: crate::model::Head::Branch("master".into()),
+            branches: vec![
+                branch("master", 0, 0),
+                // A month-old topic branch, left tracking origin/master.
+                branch("topic", 2, 128),
+            ],
+            last_commit: None,
+            stashes: 0,
+            operation: None,
+            newest_tag: None,
+            described_tag: None,
+            commits_since_tag: None,
+            since_tag_subjects: Vec::new(),
+            tags_orphaned: false,
+            index_mtime: None,
+            fetched_at: Some(1_000),
+            remote_url: Some("git@github.com:owner/repo.git".into()),
+            changelog: None,
+            is_bare: false,
+            is_shallow: false,
+        });
+
+        // master is in sync, and says so -- with `*` so the topic branch
+        // isn't silently dropped from the table.
+        assert_eq!(Column::Behind.cell(&repo, 1_000, false), "·*");
+        assert_eq!(Column::Ahead.cell(&repo, 1_000, false), "·*");
+        // The repo-wide sums are still there for the filters and sorts.
+        assert_eq!(repo.behind_total(), 128);
+        assert_eq!(repo.unpushed_total(), 2);
+
+        // Check out the topic branch and the same numbers surface, unmarked:
+        // there is no *other* branch with anything of its own now.
+        repo.refs.as_mut().unwrap().head = crate::model::Head::Branch("topic".into());
+        assert_eq!(Column::Behind.cell(&repo, 1_000, false), "128");
+        assert_eq!(Column::Ahead.cell(&repo, 1_000, false), "2");
+
+        // Detached HEAD has no branch to be ahead or behind, but the marker
+        // still points at the branches that do.
+        repo.refs.as_mut().unwrap().head = crate::model::Head::Detached {
+            sha: "abc1234".into(),
+        };
+        assert_eq!(Column::Behind.cell(&repo, 1_000, false), "·*");
+        assert_eq!(Column::Ahead.cell(&repo, 1_000, false), "·*");
+    }
+
+    fn branch(name: &str, ahead: u32, behind: u32) -> crate::model::BranchInfo {
+        crate::model::BranchInfo {
+            name: name.into(),
+            upstream: Some("origin/master".into()),
+            ahead,
+            behind,
+            gone: false,
+            committed_at: 1_000,
+            sha: "abc1234".into(),
+            subject: "s".into(),
+        }
     }
 
     // Six characters off every repo name to tell most fleets, on most rows,

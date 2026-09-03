@@ -580,6 +580,41 @@ impl RepoStatus {
         self.refs.as_ref().map(|r| r.unpulled()).unwrap_or(0)
     }
 
+    /// Commits the checked-out branch hasn't pushed. What the AHEAD column
+    /// shows, because it sits next to BRANCH and has to mean the same branch
+    /// BRANCH names. Zero on a detached HEAD: there is no branch to be ahead.
+    pub fn branch_unpushed(&self) -> u32 {
+        self.refs
+            .as_ref()
+            .and_then(|r| r.current_branch())
+            .map(|b| b.ahead)
+            .unwrap_or(0)
+    }
+
+    /// Commits the checked-out branch's upstream has and it doesn't. The
+    /// per-branch half of [`Self::behind_total`], for the same reason as
+    /// [`Self::branch_unpushed`].
+    pub fn branch_behind(&self) -> u32 {
+        self.refs
+            .as_ref()
+            .and_then(|r| r.current_branch())
+            .map(|b| b.behind)
+            .unwrap_or(0)
+    }
+
+    /// True when a branch you don't have checked out is ahead of its upstream.
+    /// The columns show the current branch, so this is what keeps a stale side
+    /// branch from vanishing out of the table entirely -- it earns the cell a
+    /// trailing `*`.
+    pub fn other_branches_unpushed(&self) -> bool {
+        self.unpushed_total() > self.branch_unpushed()
+    }
+
+    /// True when a branch you don't have checked out is behind its upstream.
+    pub fn other_branches_behind(&self) -> bool {
+        self.behind_total() > self.branch_behind()
+    }
+
     /// When anything last fetched this repo, or `None` if nothing ever has.
     pub fn fetched_at(&self) -> Option<i64> {
         self.refs.as_ref().and_then(|r| r.fetched_at)
