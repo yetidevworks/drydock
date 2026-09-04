@@ -64,6 +64,12 @@ brew install yetidevworks/drydock/drydock
 cargo install drydock
 ```
 
+**[X-CMD](https://www.x-cmd.com/)**
+
+```sh
+x eget use yetidevworks/drydock
+```
+
 **From source**
 
 ```sh
