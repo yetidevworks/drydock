@@ -15,8 +15,12 @@
 
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 const APP: &str = "drydock";
+
+/// Set when the roots came from `--root`, so that run gets its own cache file.
+static CACHE_SUFFIX: OnceLock<String> = OnceLock::new();
 
 /// Pick between an XDG-style location and the platform default.
 ///
@@ -72,17 +76,65 @@ pub fn cache_dir() -> Result<PathBuf> {
 }
 
 pub fn cache_file() -> Result<PathBuf> {
-    Ok(cache_dir()?.join("state.json"))
+    Ok(cache_dir()?.join(cache_file_name(CACHE_SUFFIX.get().map(String::as_str))))
+}
+
+fn cache_file_name(suffix: Option<&str>) -> String {
+    match suffix {
+        Some(suffix) => format!("state-{suffix}.json"),
+        None => "state.json".to_string(),
+    }
+}
+
+/// Give a run over `--root` trees its own cache file.
+///
+/// The cache is keyed by repo path and written wholesale at the end of a
+/// sweep, so one `drydock --root ~/scratch list` would otherwise replace the
+/// fleet's cache with those few repos and leave the next dashboard start
+/// painting an empty table. A file per set of roots keeps both warm, and each
+/// set gets the same file every time so a repeated `--root` run is still
+/// instant.
+pub fn set_cache_namespace(roots: &[String]) {
+    if roots.is_empty() {
+        return;
+    }
+    let mut expanded: Vec<String> = roots
+        .iter()
+        .map(|r| expand(r).display().to_string())
+        .collect();
+    expanded.sort();
+    expanded.dedup();
+    let _ = CACHE_SUFFIX.set(short_hash(&expanded.join("\u{0}")));
+}
+
+/// FNV-1a. Not cryptographic and not meant to be — it only has to name a
+/// disposable file, and being written out by hand means the name can't shift
+/// under a toolchain upgrade and orphan everyone's cache.
+fn short_hash(input: &str) -> String {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in input.as_bytes() {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{hash:016x}")
 }
 
 pub fn log_file() -> Result<PathBuf> {
     Ok(cache_dir()?.join("drydock.log"))
 }
 
-/// Expand a leading `~` and make the path absolute.
+/// Expand a leading `~` and any `$VAR` references.
+///
+/// Environment variables matter here because the roots are the one setting
+/// people want to state indirectly: `$GHQ_ROOT` in a config file is the same
+/// config on every machine, whereas the path it resolves to isn't. An
+/// undefined variable falls back to tilde-only expansion, which leaves the
+/// text alone rather than silently turning `~/$NOPE` into `~/`.
 pub fn expand(input: &str) -> PathBuf {
-    let expanded = shellexpand::tilde(input);
-    PathBuf::from(expanded.as_ref())
+    match shellexpand::full(input) {
+        Ok(expanded) => PathBuf::from(expanded.as_ref()),
+        Err(_) => PathBuf::from(shellexpand::tilde(input).as_ref()),
+    }
 }
 
 /// Render a path with `$HOME` collapsed back to `~`, for display.
@@ -173,5 +225,41 @@ mod tests {
     #[test]
     fn nothing_at_all_is_reported_rather_than_guessed_at() {
         assert_eq!(resolve_dir(None, None, ".config", None), None);
+    }
+
+    // Someone who never passes `--root` keeps the file they already have.
+    #[test]
+    fn the_default_cache_file_is_unsuffixed() {
+        assert_eq!(cache_file_name(None), "state.json");
+        assert_eq!(cache_file_name(Some("abc")), "state-abc.json");
+    }
+
+    // The same roots have to name the same file every time, or a repeated
+    // `--root` run would cold-start and leave a new file behind each time.
+    #[test]
+    fn the_cache_name_is_stable_and_order_independent() {
+        assert_eq!(short_hash("~/a\u{0}~/b"), short_hash("~/a\u{0}~/b"));
+        assert_ne!(short_hash("~/a"), short_hash("~/b"));
+    }
+
+    #[test]
+    fn env_vars_expand_in_paths() {
+        std::env::set_var("DRYDOCK_TEST_ROOT", "/somewhere/ghq");
+        assert_eq!(
+            expand("$DRYDOCK_TEST_ROOT/github.com"),
+            PathBuf::from("/somewhere/ghq/github.com")
+        );
+        std::env::remove_var("DRYDOCK_TEST_ROOT");
+    }
+
+    // An unset variable leaves the text as written, which shows up in the
+    // "not a directory" warning instead of silently scanning `/github.com`.
+    #[test]
+    fn an_undefined_var_is_left_alone() {
+        std::env::remove_var("DRYDOCK_TEST_MISSING");
+        assert_eq!(
+            expand("$DRYDOCK_TEST_MISSING/github.com"),
+            PathBuf::from("$DRYDOCK_TEST_MISSING/github.com")
+        );
     }
 }

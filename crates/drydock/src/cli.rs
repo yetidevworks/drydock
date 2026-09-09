@@ -11,6 +11,13 @@ use clap::{Args, Parser, Subcommand};
     long_about = None
 )]
 pub struct Cli {
+    /// Directory to scan, repeatable. Given even once this replaces the
+    /// `roots` in your config, so `drydock --root ~/work --root "$GHQ_ROOT"`
+    /// looks at exactly those two trees. A leading `~` and any `$VAR` are
+    /// expanded. Works before or after a subcommand.
+    #[arg(long = "root", value_name = "PATH", global = true)]
+    pub roots: Vec<String>,
+
     #[command(subcommand)]
     pub command: Option<Commands>,
 }
