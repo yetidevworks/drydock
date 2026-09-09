@@ -490,8 +490,9 @@ enum Input {
     Tick,
 }
 
-pub async fn run() -> Result<()> {
-    let (cfg, warning) = crate::config::load_or_default();
+pub async fn run(roots: Vec<String>) -> Result<()> {
+    let (cfg, warning) = crate::config::load_or_default(&roots);
+    let missing = crate::config::missing_roots(&roots);
     let cfg = Arc::new(cfg);
 
     let mut app = App::new(cfg.clone());
@@ -499,6 +500,12 @@ pub async fn run() -> Result<()> {
         app.notify(format!(
             "Config could not be read, using defaults: {warning}"
         ));
+    }
+    // The dashboard owns the terminal, so a stderr warning would be wiped by
+    // the first frame. An empty table is the symptom of a mistyped `--root`,
+    // and this is the only place left to say why.
+    if !missing.is_empty() {
+        app.notify(format!("Not a directory: {}", missing.join(", ")));
     }
 
     let (mut terminal, modifier_events) = setup_terminal()?;
@@ -1419,8 +1426,8 @@ fn restore_terminal(
 
 /// Render one frame to plain text. Lets layout be checked without a terminal,
 /// which is the only practical way to review a TUI from a script.
-pub async fn snapshot(width: u16, height: u16, view: &str) -> Result<String> {
-    let (cfg, _) = crate::config::load_or_default();
+pub async fn snapshot(width: u16, height: u16, view: &str, roots: Vec<String>) -> Result<String> {
+    let (cfg, _) = crate::config::load_or_default(&roots);
     let cfg = Arc::new(cfg);
     let mut app = App::new(cfg.clone());
 

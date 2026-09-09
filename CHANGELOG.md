@@ -1,3 +1,12 @@
+# 1.1.3
+
+## 09/09/2026
+
+1. [](#new)
+    * **`--root` scans somewhere else for one run**, repeatable, and works on every command: `drydock --root ~/work --root ~/oss`, or `drydock list --root ~/clients --dirty`. Given even once it replaces the roots in your config rather than adding to them, which is the point — one flag and you're looking at a tree drydock has never heard of. Each set of roots gets its own cache file, so a one-off `--root` run doesn't leave your real fleet cold on its next start.
+    * **Roots expand `$VAR` as well as `~`**, in the config file and on the command line. That's what makes [ghq](https://github.com/x-motemen/ghq) work out of the box: `drydock --root "$GHQ_ROOT/github.com"` puts every cloned repo in the table with the owner as its group, and `roots = ["$GHQ_ROOT/github.com"]` is the same config on every machine, whatever the path resolves to there. An undefined variable is left as written, so it turns up in the warning below instead of quietly scanning `/github.com`. Thanks to @fresh2dev for the suggestion.
+    * A `--root` that isn't a directory says so, on stderr for the commands and as a notification in the dashboard. An empty table looks exactly the same whether you have a clean fleet or a typo in a path.
+
 # 1.1.2
 
 ## 09/03/2026

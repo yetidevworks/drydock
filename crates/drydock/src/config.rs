@@ -392,11 +392,33 @@ pub fn load() -> Result<Config> {
 /// Load config, falling back to defaults with a warning rather than failing.
 /// A dashboard that refuses to open because of one bad key is worse than one
 /// that opens with defaults and says so.
-pub fn load_or_default() -> (Config, Option<String>) {
-    match load() {
+///
+/// `root_override` is what `--root` was given, and replaces `roots` outright
+/// rather than adding to it. Adding would mean there's no way to look at one
+/// tree without also walking whatever the config already lists, which is the
+/// main thing you'd reach for the flag to do.
+pub fn load_or_default(root_override: &[String]) -> (Config, Option<String>) {
+    let (mut cfg, warning) = match load() {
         Ok(cfg) => (cfg, None),
         Err(err) => (Config::default(), Some(format!("{err:#}"))),
+    };
+    if !root_override.is_empty() {
+        cfg.roots = root_override.to_vec();
     }
+    (cfg, warning)
+}
+
+/// Which of these roots aren't directories, rendered as given.
+///
+/// Worth saying out loud for anything typed on the command line: a mistyped
+/// `--root`, or a `$GHQ_ROOT` that isn't set in this shell, produces an empty
+/// table that looks exactly like a fleet with nothing in it.
+pub fn missing_roots(roots: &[String]) -> Vec<String> {
+    roots
+        .iter()
+        .filter(|r| !paths::expand(r).is_dir())
+        .cloned()
+        .collect()
 }
 
 pub fn save(cfg: &Config) -> Result<PathBuf> {
@@ -454,6 +476,22 @@ mod tests {
         let back: Config = toml::from_str(&body).unwrap();
         assert_eq!(back.ui.columns, None);
         assert_eq!(back.columns(), Column::defaults(false));
+    }
+
+    // `--root` replaces the configured roots rather than adding to them, so
+    // one flag is enough to look at a tree the config has never heard of.
+    #[test]
+    fn a_root_override_replaces_the_configured_roots() {
+        let (cfg, _) = load_or_default(&["/one".to_string(), "/two".to_string()]);
+        assert_eq!(cfg.roots, vec!["/one".to_string(), "/two".to_string()]);
+    }
+
+    #[test]
+    fn missing_roots_are_reported_and_real_ones_are_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().display().to_string();
+        let fake = dir.path().join("nope").display().to_string();
+        assert_eq!(missing_roots(&[real, fake.clone()]), vec![fake],);
     }
 
     #[test]

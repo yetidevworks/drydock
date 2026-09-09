@@ -83,6 +83,43 @@ drydock
 It scans the directories in your config (`~/Projects` by default), *not* the
 current directory, so it behaves the same wherever you invoke it.
 
+`--root` overrides that for one run, and takes as many as you like:
+
+```sh
+drydock --root ~/work --root ~/oss          # the dashboard, over those two trees
+drydock list --root ~/clients --dirty       # any command, before or after it
+```
+
+Given even once it replaces the configured roots rather than adding to them, so
+one flag is enough to look at a tree drydock has never heard of. Each set of
+roots gets its own cache file, so a `--root` run doesn't cost your main fleet
+its warm start, and repeating the same one is still instant.
+
+Roots expand `~` and `$VAR`, in the config file as well as on the command line,
+which is what makes [ghq](https://github.com/x-motemen/ghq) checkouts work:
+
+```sh
+drydock --root "$GHQ_ROOT"                  # everything ghq has cloned
+drydock --root "$GHQ_ROOT/github.com"       # groups become the owner names
+```
+
+ghq's layout is `$GHQ_ROOT/<host>/<owner>/<repo>`, and the group is the first
+segment below a root — so point drydock at `$GHQ_ROOT` and every repo lands in
+a `github.com` group, or point it a level deeper and the groups are the owners,
+which is usually what you want. Either way it's worth putting in the config
+once:
+
+```toml
+roots = ["$GHQ_ROOT/github.com", "~/Projects"]
+```
+
+Or, since it works as a git alias:
+
+```
+[alias]
+    projects = !drydock --root \"$GHQ_ROOT/github.com\"
+```
+
 ### Dashboard keys
 
 | | |
@@ -122,6 +159,7 @@ everything.
 
 ```sh
 drydock list --dirty --since 1d              # a table, then exit
+drydock list --root ~/work                   # scan somewhere else for one run
 drydock list --unpushed --group acme --json  # machine-readable
 drydock list --cached                        # last known state, no probing (~5ms)
 drydock list --behind --fetch                # check every remote, then show what's behind
@@ -366,6 +404,7 @@ nothing keeps the platform default.
 
 ```toml
 roots = ["~/Projects"]       # each immediate subdirectory becomes a "group"
+                             # `~` and `$VAR` expand; `--root` overrides them
 max_depth = 4
 follow_nested_repos = false  # keeps submodules and vendored checkouts out
                              # (bare repos always descend — see "Worktrees")

@@ -30,29 +30,33 @@ use probe::{Fetch, Tier};
 async fn main() -> Result<()> {
     let cli = Cli::parse();
     init_tracing(cli.command.is_none());
+    // Before anything reads or writes the cache, so a `--root` run doesn't
+    // overwrite the fleet's.
+    paths::set_cache_namespace(&cli.roots);
+    let roots = cli.roots;
 
     match cli.command {
-        None => tui::run().await,
-        Some(Commands::List(args)) => cmd_list(args).await,
-        Some(Commands::Status { path, json }) => cmd_status(path, json).await,
+        None => tui::run(roots).await,
+        Some(Commands::List(args)) => cmd_list(args, &roots).await,
+        Some(Commands::Status { path, json }) => cmd_status(path, json, &roots).await,
         Some(Commands::Releasable {
             min_commits,
             include_changelog,
             json,
-        }) => cmd_releasable(min_commits, include_changelog, json).await,
+        }) => cmd_releasable(min_commits, include_changelog, json, &roots).await,
         Some(Commands::Scan {
             fast,
             no_cache,
             fetch,
-        }) => cmd_scan(fast, no_cache, fetch).await,
-        Some(Commands::Groups { json }) => cmd_groups(json).await,
-        Some(Commands::Config(c)) => cmd_config(c),
+        }) => cmd_scan(fast, no_cache, fetch, &roots).await,
+        Some(Commands::Groups { json }) => cmd_groups(json, &roots).await,
+        Some(Commands::Config(c)) => cmd_config(c, &roots),
         Some(Commands::TuiSnapshot {
             width,
             height,
             view,
         }) => {
-            print!("{}", tui::snapshot(width, height, &view).await?);
+            print!("{}", tui::snapshot(width, height, &view, roots).await?);
             Ok(())
         }
     }
@@ -96,10 +100,13 @@ fn init_tracing(dashboard: bool) {
 }
 
 /// Load config, reporting a bad config file rather than dying on it.
-fn load_config() -> Arc<config::Config> {
-    let (cfg, warning) = config::load_or_default();
+fn load_config(roots: &[String]) -> Arc<config::Config> {
+    let (cfg, warning) = config::load_or_default(roots);
     if let Some(warning) = warning {
         eprintln!("drydock: using defaults, config could not be read: {warning}");
+    }
+    for root in config::missing_roots(roots) {
+        eprintln!("drydock: --root {root} is not a directory");
     }
     Arc::new(cfg)
 }
@@ -222,8 +229,8 @@ fn list_fetch(args: &ListArgs) -> Fetch {
     }
 }
 
-async fn cmd_list(args: ListArgs) -> Result<()> {
-    let cfg = load_config();
+async fn cmd_list(args: ListArgs, roots: &[String]) -> Result<()> {
+    let cfg = load_config(roots);
     let query = build_query(&args)?;
     // Resolved before `cfg` is handed to the sweep, which takes ownership.
     let columns = cfg.columns();
@@ -268,8 +275,8 @@ async fn cmd_list(args: ListArgs) -> Result<()> {
     Ok(())
 }
 
-async fn cmd_status(path: Option<String>, json: bool) -> Result<()> {
-    let cfg = load_config();
+async fn cmd_status(path: Option<String>, json: bool, roots: &[String]) -> Result<()> {
+    let cfg = load_config(roots);
     let start = match path {
         Some(p) => paths::expand(&p),
         None => std::env::current_dir().context("Reading the current directory")?,
@@ -298,8 +305,13 @@ async fn cmd_status(path: Option<String>, json: bool) -> Result<()> {
     Ok(())
 }
 
-async fn cmd_releasable(min_commits: u32, include_changelog: bool, json: bool) -> Result<()> {
-    let cfg = load_config();
+async fn cmd_releasable(
+    min_commits: u32,
+    include_changelog: bool,
+    json: bool,
+    roots: &[String],
+) -> Result<()> {
+    let cfg = load_config(roots);
     let repos = gather(cfg, Tier::Full, false, Fetch::Skip).await?;
     let now = git::now_unix();
 
@@ -412,8 +424,8 @@ async fn cmd_releasable(min_commits: u32, include_changelog: bool, json: bool) -
     Ok(())
 }
 
-async fn cmd_scan(fast: bool, no_cache: bool, fetch: bool) -> Result<()> {
-    let cfg = load_config();
+async fn cmd_scan(fast: bool, no_cache: bool, fetch: bool, roots: &[String]) -> Result<()> {
+    let cfg = load_config(roots);
     if no_cache {
         let _ = cache::clear();
     }
@@ -439,8 +451,8 @@ async fn cmd_scan(fast: bool, no_cache: bool, fetch: bool) -> Result<()> {
     Ok(())
 }
 
-async fn cmd_groups(json: bool) -> Result<()> {
-    let cfg = load_config();
+async fn cmd_groups(json: bool, roots: &[String]) -> Result<()> {
+    let cfg = load_config(roots);
     let repos = gather(cfg, Tier::Full, false, Fetch::Skip).await?;
     if json {
         let now = git::now_unix();
@@ -454,7 +466,7 @@ async fn cmd_groups(json: bool) -> Result<()> {
     Ok(())
 }
 
-fn cmd_config(command: ConfigCommands) -> Result<()> {
+fn cmd_config(command: ConfigCommands, roots: &[String]) -> Result<()> {
     match command {
         ConfigCommands::Path => {
             println!("config  {}", paths::config_file()?.display());
@@ -475,7 +487,7 @@ fn cmd_config(command: ConfigCommands) -> Result<()> {
             Ok(())
         }
         ConfigCommands::Show => {
-            let (cfg, warning) = config::load_or_default();
+            let (cfg, warning) = config::load_or_default(roots);
             if let Some(warning) = warning {
                 eprintln!("drydock: showing defaults, config could not be read: {warning}");
             }
