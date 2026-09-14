@@ -83,6 +83,10 @@ pub fn summary(repos: &[RepoStatus], timings: Option<&Timings>) -> String {
         .iter()
         .filter(|r| !r.flags().clean() || r.release_state() == ReleaseState::NeedsRelease)
         .count();
+    let held = repos
+        .iter()
+        .filter(|r| r.release_state() == ReleaseState::Held)
+        .count();
     let errors = repos.iter().filter(|r| r.error.is_some()).count();
 
     let mut parts = vec![
@@ -93,6 +97,11 @@ pub fn summary(repos: &[RepoStatus], timings: Option<&Timings>) -> String {
         format!("{never} unreleased"),
         format!("{attention} need attention"),
     ];
+    // Only when there are any. A permanent "0 held" would be a line about a
+    // feature nobody is using taking up room in every summary.
+    if held > 0 {
+        parts.push(format!("{held} held"));
+    }
     if errors > 0 {
         parts.push(format!("{errors} errored"));
     }
@@ -188,6 +197,25 @@ pub fn detail(repo: &RepoStatus, now: i64) -> String {
         "  release      {}\n",
         repo.release_state().label()
     ));
+    if let Some(hold) = &repo.hold {
+        if repo.hold_active() {
+            out.push_str(&format!(
+                "  hold         placed {} ago at {}; without it this reads \"{}\"\n",
+                fmt::age(hold.at, now),
+                hold.label(),
+                repo.release_state_raw().label()
+            ));
+            out.push_str("               the next commit lifts it\n");
+        } else {
+            out.push_str(&format!(
+                "  hold         lifted: it was placed at {} and HEAD has moved since\n",
+                hold.label()
+            ));
+        }
+        if let Some(note) = &hold.note {
+            out.push_str(&format!("               \u{201c}{note}\u{201d}\n"));
+        }
+    }
     if let Some(v) = &repo.visibility {
         use crate::model::VisibilityStatus;
         match &v.status {
@@ -383,6 +411,20 @@ fn indent(text: &str, spaces: usize) -> String {
 // JSON
 // ---------------------------------------------------------------------------
 
+/// A hold, as `--json` reports it.
+#[derive(Serialize)]
+pub struct HoldView<'a> {
+    /// The commit the hold was placed at, short.
+    pub sha: &'a str,
+    pub branch: Option<&'a str>,
+    pub tag: Option<&'a str>,
+    pub at: i64,
+    pub note: Option<&'a str>,
+    /// True while that commit is still what's checked out. False means the
+    /// hold has lifted itself and the repo is back in the needs-release list.
+    pub active: bool,
+}
+
 /// A flattened view for scripting. Derived values are computed here rather than
 /// left for the consumer to work out.
 #[derive(Serialize)]
@@ -392,7 +434,16 @@ pub struct RepoView<'a> {
     pub name: &'a str,
     pub slug: String,
     pub state: &'a str,
+    /// `"held"` for a repo under a hold that still covers HEAD — see `hold`.
+    /// A hold is opt-in and placed by hand, so nothing reads as held unless
+    /// somebody said so.
     pub release_state: &'static str,
+    /// What `release_state` would be with no hold on this repo. Identical to
+    /// it unless the repo is held.
+    pub release_state_raw: &'static str,
+    /// The hold on this repo, whether or not it still covers HEAD. `active`
+    /// says which.
+    pub hold: Option<HoldView<'a>>,
     /// `"public"`, `"private"`, `"internal"`, `"unsupported"` (a remote on a
     /// host nothing recognises), `"no remote configured"`, `"checking
     /// disabled"`, `"check failed"`, or `null` before the repo has been
@@ -484,6 +535,15 @@ pub fn view<'a>(repo: &'a RepoStatus, now: i64) -> RepoView<'a> {
         slug: repo.slug(),
         state: repo.state_label(),
         release_state: repo.release_state().key(),
+        release_state_raw: repo.release_state_raw().key(),
+        hold: repo.hold.as_ref().map(|hold| HoldView {
+            sha: &hold.sha,
+            branch: hold.branch.as_deref(),
+            tag: hold.tag.as_deref(),
+            at: hold.at,
+            note: hold.note.as_deref(),
+            active: repo.hold_active(),
+        }),
         visibility: repo.visibility.as_ref().map(|v| v.status.label()),
         visibility_error: repo.visibility.as_ref().and_then(|v| match &v.status {
             crate::model::VisibilityStatus::CheckFailed(reason) => Some(reason.as_str()),
@@ -610,6 +670,58 @@ mod tests {
         assert_eq!((v.ahead, v.behind), (2, 128));
         // What the table shows, and what reads correctly against `branch`.
         assert_eq!((v.branch_ahead, v.branch_behind), (0, 0));
+    }
+
+    // A held repo has to report both readings: `release_state` is what the
+    // table and the counts use, `release_state_raw` is what it would say
+    // without the hold. A script that wants the unfiltered list can still
+    // have it.
+    #[test]
+    fn json_reports_a_hold_and_what_it_is_covering() {
+        let mut repo = RepoStatus::new("/tmp/x".into(), "grav".into(), "cors".into());
+        let tag = crate::model::TagInfo {
+            name: "1.0.3".into(),
+            at: 500,
+        };
+        repo.refs = Some(crate::model::RefsInfo {
+            head: crate::model::Head::Branch("develop".into()),
+            branches: vec![branch("develop", 0, 0)],
+            last_commit: None,
+            stashes: 0,
+            operation: None,
+            newest_tag: Some(tag.clone()),
+            described_tag: Some(tag),
+            commits_since_tag: Some(1),
+            since_tag_subjects: vec!["Update the changelog".into()],
+            tags_orphaned: false,
+            index_mtime: None,
+            fetched_at: Some(1_000),
+            remote_url: None,
+            changelog: None,
+            is_bare: false,
+            is_shallow: false,
+        });
+        repo.hold = Some(crate::hold::Hold {
+            // What `branch()` puts on the fixture's only branch.
+            sha: "abc1234".into(),
+            branch: Some("develop".into()),
+            tag: Some("1.0.3".into()),
+            at: 900,
+            note: Some("changelog only".into()),
+        });
+
+        let v = view(&repo, 1_000);
+        assert_eq!(v.release_state, "held");
+        assert_eq!(v.release_state_raw, "needs-release");
+        let hold = v.hold.expect("the hold is reported");
+        assert!(hold.active);
+        assert_eq!(hold.note, Some("changelog only"));
+
+        // And it comes out of the counts, which is the whole point.
+        let summary = summary(std::slice::from_ref(&repo), None);
+        assert!(summary.contains("0 need release"), "{summary}");
+        assert!(summary.contains("0 need attention"), "{summary}");
+        assert!(summary.contains("1 held"), "{summary}");
     }
 
     fn branch(name: &str, ahead: u32, behind: u32) -> crate::model::BranchInfo {

@@ -33,6 +33,7 @@ use crate::column::Column;
 use crate::config::Config;
 use crate::filter::{Filter, MatchMode, Query, Sort};
 use crate::git;
+use crate::hold::{self, Holds};
 use crate::model::RepoStatus;
 use crate::probe::{self, Tier, Timings};
 use crate::watch;
@@ -77,6 +78,10 @@ pub struct App {
     /// Every known repo, keyed for updates by path.
     pub repos: Vec<RepoStatus>,
     pub by_root: HashMap<PathBuf, usize>,
+    /// Every manual release hold, as last read from disk. Held here so a
+    /// row arriving mid-sweep can be stamped on the way in and the `h` key
+    /// has something to toggle against.
+    pub holds: Holds,
     pub query: Query,
     /// Indices into `repos`, after filtering and sorting.
     pub visible: Vec<usize>,
@@ -131,6 +136,10 @@ impl App {
     pub fn new(cfg: Arc<Config>) -> Self {
         let mut repos: Vec<RepoStatus> = cache::load().into_values().collect();
         repos.sort_by(|a, b| a.root.cmp(&b.root));
+        // The cache has whatever holds were on these rows when it was written.
+        // The holds file is the authority, and it may have moved since.
+        let holds = hold::load();
+        hold::apply(&mut repos, &holds);
 
         let mut query = Query::default();
         for name in &cfg.ui.default_filters {
@@ -149,6 +158,7 @@ impl App {
         let mut app = Self {
             cfg,
             repos,
+            holds,
             by_root: HashMap::new(),
             query,
             visible: Vec::new(),
@@ -219,7 +229,11 @@ impl App {
         self.clamp_scroll();
     }
 
-    pub fn upsert(&mut self, status: RepoStatus) {
+    pub fn upsert(&mut self, mut status: RepoStatus) {
+        // A sweep reads the holds file when it starts. Anything held since
+        // then would arrive without its hold and flicker back into the
+        // needs-release list, so the row is stamped from what's in hand.
+        status.hold = self.holds.get(&status.root).cloned();
         match self.by_root.get(&status.root) {
             Some(&idx) => self.repos[idx] = status,
             None => {
@@ -1066,6 +1080,8 @@ fn handle_normal_key(app: &mut App, key: KeyEvent, tx: &mpsc::UnboundedSender<In
         KeyCode::Char('u') => toggle(app, Filter::Unpushed),
         KeyCode::Char('r') => toggle(app, Filter::NeedsRelease),
         KeyCode::Char('N') => toggle(app, Filter::Unreleased),
+        KeyCode::Char('H') => toggle(app, Filter::Held),
+        KeyCode::Char('h') => toggle_hold(app),
         KeyCode::Char('b') => toggle(app, Filter::Behind),
         KeyCode::Char('c') => toggle(app, Filter::Conflicted),
         KeyCode::Char('i') => toggle(app, Filter::InProgress),
@@ -1241,6 +1257,109 @@ fn spawn_fetch(app: &App, tx: &mpsc::UnboundedSender<Input>, roots: Vec<PathBuf>
         }
         while set.join_next().await.is_some() {}
     });
+}
+
+/// What pressing `h` on a repo should do. Split out from the keypress itself
+/// so the decision can be tested without a holds file to write.
+#[derive(Debug, PartialEq, Eq)]
+enum HoldAction {
+    /// Lift the hold covering what's checked out.
+    Lift,
+    /// Place one at the commit that's checked out.
+    Place(Box<hold::Hold>),
+    /// Nothing worth doing, and what to say about it.
+    Refuse(String),
+}
+
+fn hold_action(repo: &RepoStatus, now: i64) -> HoldAction {
+    // A hold whose commit has already been left behind is spent, so `h` there
+    // places a fresh one at the new HEAD rather than clearing the old one --
+    // which is what someone pressing it on a row that reads "needs release"
+    // is asking for.
+    if repo.hold_active() {
+        return HoldAction::Lift;
+    }
+    if repo.release_state_raw() == crate::model::ReleaseState::Released {
+        return HoldAction::Refuse(format!(
+            "{} is released, with nothing past its tag",
+            repo.slug()
+        ));
+    }
+    let Some(sha) = repo.head_sha() else {
+        return HoldAction::Refuse(format!("{} hasn't been probed yet", repo.slug()));
+    };
+    HoldAction::Place(Box::new(hold::Hold {
+        sha: sha.to_string(),
+        branch: repo
+            .refs
+            .as_ref()
+            .and_then(|r| r.head.branch().map(|b| b.to_string())),
+        tag: repo.refs.as_ref().and_then(|r| {
+            r.described_tag
+                .as_ref()
+                .or(r.newest_tag.as_ref())
+                .map(|t| t.name.clone())
+        }),
+        at: now,
+        note: None,
+    }))
+}
+
+/// Hold the selected repo out of "needs release", or lift the hold it's
+/// under.
+///
+/// The hold is pinned to the commit that's checked out right now, which is
+/// what makes this safe to press freely: it says "not this, not today", not
+/// "never tell me about this repo again".
+fn toggle_hold(app: &mut App) {
+    let Some(repo) = app.current() else { return };
+    let root = repo.root.clone();
+    let slug = repo.slug();
+    let since = repo.commits_since_tag();
+
+    match hold_action(repo, git::now_unix()) {
+        HoldAction::Refuse(why) => app.notify(why),
+        HoldAction::Lift => {
+            let previous = app.holds.remove(&root);
+            if let Err(err) = hold::save(&app.holds) {
+                if let Some(previous) = previous {
+                    app.holds.set(&root, previous);
+                }
+                app.notify(format!("Could not write the holds file: {err:#}"));
+                return;
+            }
+            stamp_hold(app, &root);
+            app.notify(format!("Lifted the hold on {slug}"));
+            app.recompute();
+        }
+        HoldAction::Place(held) => {
+            let at = match &held.tag {
+                Some(tag) => format!("{tag} +{since}"),
+                None => held.sha.clone(),
+            };
+            let sha = held.sha.clone();
+            app.holds.set(&root, *held);
+            if let Err(err) = hold::save(&app.holds) {
+                app.holds.remove(&root);
+                app.notify(format!("Could not write the holds file: {err:#}"));
+                return;
+            }
+            stamp_hold(app, &root);
+            app.notify(format!(
+                "Holding {slug} at {at} ({sha}) — the next commit lifts it"
+            ));
+            app.recompute();
+        }
+    }
+}
+
+/// Put the current hold, or the absence of one, back on a row after the file
+/// has been written.
+fn stamp_hold(app: &mut App, root: &std::path::Path) {
+    let hold = app.holds.get(root).cloned();
+    if let Some(&idx) = app.by_root.get(root) {
+        app.repos[idx].hold = hold;
+    }
 }
 
 fn toggle(app: &mut App, filter: Filter) {
@@ -1643,6 +1762,80 @@ mod tests {
             roots,
             vec![PathBuf::from("/p/g/r0"), PathBuf::from("/p/g/r1")]
         );
+    }
+
+    /// One repo a commit past its tag: the row `h` is for.
+    fn releasable_repo() -> RepoStatus {
+        let mut repo = RepoStatus::new(PathBuf::from("/p/g/r0"), "g".into(), "r0".into());
+        let tag = crate::model::TagInfo {
+            name: "1.0.3".into(),
+            at: 500,
+        };
+        repo.refs = Some(crate::model::RefsInfo {
+            head: crate::model::Head::Branch("develop".into()),
+            branches: vec![crate::model::BranchInfo {
+                name: "develop".into(),
+                upstream: None,
+                ahead: 0,
+                behind: 0,
+                gone: false,
+                committed_at: 1_000,
+                sha: "abc1234".into(),
+                subject: "Update the changelog".into(),
+            }],
+            last_commit: None,
+            stashes: 0,
+            operation: None,
+            newest_tag: Some(tag.clone()),
+            described_tag: Some(tag),
+            commits_since_tag: Some(1),
+            since_tag_subjects: vec!["Update the changelog".into()],
+            tags_orphaned: false,
+            index_mtime: None,
+            fetched_at: None,
+            remote_url: None,
+            changelog: None,
+            is_bare: false,
+            is_shallow: false,
+        });
+        repo
+    }
+
+    /// `h` reads the row it's pressed on: it places a hold on work past a
+    /// tag, lifts one that's still covering HEAD, and re-places rather than
+    /// clears when the commit it covered has been left behind.
+    #[test]
+    fn the_hold_key_places_lifts_and_re_places() {
+        let mut repo = releasable_repo();
+
+        let placed = match hold_action(&repo, 2_000) {
+            HoldAction::Place(held) => *held,
+            other => panic!("expected a hold, got {other:?}"),
+        };
+        assert_eq!(placed.sha, "abc1234");
+        assert_eq!(placed.tag.as_deref(), Some("1.0.3"));
+        assert_eq!(placed.branch.as_deref(), Some("develop"));
+
+        repo.hold = Some(placed);
+        assert_eq!(hold_action(&repo, 2_000), HoldAction::Lift);
+
+        // A commit lands. The hold is spent, so pressing h again holds the
+        // new state rather than clearing the old one.
+        repo.refs.as_mut().unwrap().branches[0].sha = "9999999".into();
+        match hold_action(&repo, 3_000) {
+            HoldAction::Place(held) => assert_eq!(held.sha, "9999999"),
+            other => panic!("expected a fresh hold, got {other:?}"),
+        }
+    }
+
+    // Holding a repo with nothing past its tag would pin a commit that is
+    // already released: the first commit to make it releasable is the same
+    // one that lifts the hold, so it could never suppress anything.
+    #[test]
+    fn the_hold_key_refuses_a_repo_with_nothing_past_its_tag() {
+        let mut repo = releasable_repo();
+        repo.refs.as_mut().unwrap().commits_since_tag = Some(0);
+        assert!(matches!(hold_action(&repo, 2_000), HoldAction::Refuse(_)));
     }
 
     fn cursor_on(app: &App) -> Column {

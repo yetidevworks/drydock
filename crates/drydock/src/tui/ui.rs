@@ -206,6 +206,20 @@ fn render_title(f: &mut Frame, app: &App, area: Rect) {
             Style::default().fg(BEHIND).add_modifier(Modifier::BOLD),
         ));
     }
+    // Only when something is actually held. Like behind and never-fetched,
+    // this is a count that is zero for most people most of the time.
+    let held = app
+        .repos
+        .iter()
+        .filter(|r| r.release_state() == ReleaseState::Held)
+        .count();
+    if held > 0 {
+        spans.push(Span::raw(" · "));
+        spans.push(Span::styled(
+            format!("{held} held"),
+            Style::default().fg(DIM),
+        ));
+    }
     let never = app.repos.iter().filter(|r| r.never_fetched()).count();
     if never > 0 {
         spans.push(Span::raw(" · "));
@@ -439,6 +453,10 @@ fn repo_line(repo: &RepoStatus, layout: &TableLayout, now: i64, selected: bool) 
                         ReleaseState::NeedsRelease => Style::default().fg(UNRELEASED),
                         ReleaseState::Unreleased => base.fg(DIM),
                         ReleaseState::Released => base.fg(CLEAN),
+                        // Grey on purpose: a held repo is one you have already
+                        // dealt with, and the column exists to draw the eye to
+                        // the ones you haven't.
+                        ReleaseState::Held => base.fg(DIM),
                     },
                 ),
                 Column::Visibility => {
@@ -584,6 +602,9 @@ fn release_cell(repo: &RepoStatus) -> String {
         ReleaseState::NeedsRelease => "◆",
         ReleaseState::Unreleased => "·",
         ReleaseState::Released => "✓",
+        // The hollow of the same diamond: whatever ◆ was going to say about
+        // this repo is still true, and has been answered.
+        ReleaseState::Held => "◇",
     };
     format!("{marker} {}", state.label())
 }
@@ -624,6 +645,7 @@ pub(super) fn key_hints(app: &App) -> &'static [(&'static str, &'static str)] {
             ("T", "terminal"),
             ("F", "fetch screen"),
             ("N", "unreleased"),
+            ("H", "held"),
             ("S", "reverse sort"),
             ("C", "columns"),
             ("R", "rescan"),
@@ -634,6 +656,7 @@ pub(super) fn key_hints(app: &App) -> &'static [(&'static str, &'static str)] {
             ("d", "dirty"),
             ("u", "unpushed"),
             ("r", "needs release"),
+            ("h", "hold"),
             ("a", "clear"),
             ("s", "sort"),
             ("/", "search"),
@@ -750,6 +773,11 @@ pub fn marker_legend(app: &App) -> Vec<MarkerGroup> {
             "RELEASE",
             vec![
                 ("◆", UNRELEASED, "commits or changes past the newest tag"),
+                (
+                    "◇",
+                    DIM,
+                    "held: this commit was marked as not worth a release",
+                ),
                 ("✓", CLEAN, "tagged, with nothing since"),
                 ("·", DIM, "no tags at all"),
             ],
@@ -806,6 +834,7 @@ fn render_help(f: &mut Frame, app: &App, area: Rect) -> u16 {
                 ("u", "commits not pushed"),
                 ("r", "needs a release: commits or changes past the tag"),
                 ("N", "never released: no tags at all"),
+                ("H", "held out of needs-release by hand"),
                 ("b", "behind the upstream"),
                 ("c / i", "conflicts / operation in progress"),
                 ("x / e", "detached HEAD / probe errors"),
@@ -816,6 +845,15 @@ fn render_help(f: &mut Frame, app: &App, area: Rect) -> u16 {
                 ("[ / ]", "step through groups"),
                 ("1 2 3 4", "touched in the last hour, day, week, month"),
                 ("0", "any age"),
+            ],
+        ),
+        (
+            "Holding a release",
+            &[
+                ("h", "hold this repo, or lift the hold it's under"),
+                ("", "a hold covers the commit it was placed at, so the next"),
+                ("", "commit lifts it and the repo comes back into the list"),
+                ("H", "show what's held"),
             ],
         ),
         (
@@ -995,6 +1033,32 @@ fn render_detail(f: &mut Frame, app: &App, area: Rect) -> u16 {
             Style::default().add_modifier(Modifier::BOLD),
         ),
     ]));
+
+    if let Some(hold) = &repo.hold {
+        let text = if repo.hold_active() {
+            format!(
+                "held at {}, placed {} ago — without it this reads \"{}\"",
+                hold.label(),
+                fmt::age(hold.at, app.now),
+                repo.release_state_raw().label()
+            )
+        } else {
+            format!(
+                "lifted: it was placed at {} and HEAD has moved since",
+                hold.label()
+            )
+        };
+        lines.push(Line::from(vec![
+            label("hold"),
+            Span::styled(text, Style::default().fg(DIM)),
+        ]));
+        if let Some(note) = &hold.note {
+            lines.push(Line::from(vec![
+                label(""),
+                Span::styled(format!("\u{201c}{note}\u{201d}"), Style::default().fg(DIM)),
+            ]));
+        }
+    }
 
     if let Some(v) = &repo.visibility {
         let mut spans = vec![

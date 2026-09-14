@@ -1,3 +1,16 @@
+# 1.1.4
+
+## 09/13/2026
+
+1. [](#new)
+    * **Hold a repo out of "needs release".** Press `h` on a row, or run `drydock hold <path>`, and that repo reads `◇ held` instead of `◆ needs release` — out of the header count, out of the `r` filter, out of `--needs-release`, out of "need attention". It's for the rows that are past a tag and not worth a version: a changelog line, a merge of a branch that already shipped, a README fix. Across a few hundred repos those are most of what's in the list, and a list that's mostly noise is one you stop reading.
+    * **A hold is pinned to the commit it was placed at, so the next commit lifts it.** That's the part that makes it safe to press freely: you're saying "not this, not today", never "stop telling me about this repo", and there's no stale hold left behind to hide real work six weeks later. Press `h` again to lift one by hand, and `H` (or `--held`) to see everything you've held.
+    * `drydock hold`, `drydock unhold` and `drydock holds` do the same from the command line, with `--note "changelog only"` if you want to say why. `drydock holds` lists every hold with whether it still covers `HEAD`, and `--prune` forgets the ones that have lifted.
+    * Holds live in `holds.toml` beside your config rather than in the cache, because a hold is something you decided and `scan --no-cache` shouldn't be able to throw it away. `drydock config path` now prints where it is.
+2. [](#improved)
+    * `--json` reports a held repo as `release_state: "held"`, and gains `release_state_raw` — what it would say with no hold on it — plus the hold itself, with `active` saying whether it still covers `HEAD`. A script that wants the unfiltered list never lost it.
+    * The detail view and `drydock status` say what a hold is covering, when it was placed, what the repo would otherwise read as, and the note if there is one. A held row never becomes a row you can't explain.
+
 # 1.1.3
 
 ## 09/09/2026

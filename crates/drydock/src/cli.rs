@@ -48,6 +48,34 @@ pub enum Commands {
         json: bool,
     },
 
+    /// Hold a repo out of "needs release" for the commit it's on.
+    ///
+    /// The hold is pinned to that commit: land another one and it lifts
+    /// itself, so this is "not this batch" rather than "never again".
+    Hold {
+        /// Repo path. Defaults to the current directory.
+        path: Option<String>,
+        /// Why it's held. Shown by `drydock holds` and in the detail view.
+        #[arg(long, value_name = "TEXT")]
+        note: Option<String>,
+    },
+
+    /// Lift a hold, putting the repo back in the needs-release list.
+    Unhold {
+        /// Repo path. Defaults to the current directory.
+        path: Option<String>,
+    },
+
+    /// List every held repo and whether its hold still covers HEAD.
+    Holds {
+        /// Forget holds whose commit is no longer checked out, and any whose
+        /// repo has gone away.
+        #[arg(long)]
+        prune: bool,
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Walk the roots, probe everything, and refresh the cache.
     Scan {
         /// Skip working-tree scans. Much faster, but no change counts.
@@ -118,6 +146,9 @@ pub struct ListArgs {
     /// Repos tagged with nothing since.
     #[arg(long)]
     pub released: bool,
+    /// Repos held out of "needs release" by hand, for the commit they're on.
+    #[arg(long)]
+    pub held: bool,
     /// Repos whose upstream is ahead. Only as fresh as your last fetch, so
     /// pair it with --fetch to check the remotes now.
     #[arg(long)]

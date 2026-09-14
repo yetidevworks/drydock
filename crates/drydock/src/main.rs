@@ -7,6 +7,7 @@ mod filter;
 mod fmt;
 mod gh;
 mod git;
+mod hold;
 mod model;
 mod paths;
 mod probe;
@@ -50,6 +51,9 @@ async fn main() -> Result<()> {
             fetch,
         }) => cmd_scan(fast, no_cache, fetch, &roots).await,
         Some(Commands::Groups { json }) => cmd_groups(json, &roots).await,
+        Some(Commands::Hold { path, note }) => cmd_hold(path, note, &roots).await,
+        Some(Commands::Unhold { path }) => cmd_unhold(path, &roots).await,
+        Some(Commands::Holds { prune, json }) => cmd_holds(prune, json, &roots).await,
         Some(Commands::Config(c)) => cmd_config(c, &roots),
         Some(Commands::TuiSnapshot {
             width,
@@ -190,6 +194,7 @@ fn build_query(args: &ListArgs) -> Result<Query> {
         (args.unreleased, Filter::Unreleased),
         (args.needs_release, Filter::NeedsRelease),
         (args.released, Filter::Released),
+        (args.held, Filter::Held),
         (args.behind, Filter::Behind),
         (args.conflicted, Filter::Conflicted),
         (args.in_progress, Filter::InProgress),
@@ -238,6 +243,10 @@ async fn cmd_list(args: ListArgs, roots: &[String]) -> Result<()> {
     let repos: Vec<RepoStatus> = if args.cached {
         let mut repos: Vec<RepoStatus> = cache::load().into_values().collect();
         repos.sort_by(|a, b| a.root.cmp(&b.root));
+        // The cache carries whatever holds were on these rows when it was
+        // written, which is one `drydock hold` out of date the moment one is
+        // placed. The file is the authority, so re-stamp from it.
+        hold::apply(&mut repos, &hold::load());
         if repos.is_empty() {
             eprintln!("drydock: no cache yet, run `drydock scan` first");
         }
@@ -277,13 +286,7 @@ async fn cmd_list(args: ListArgs, roots: &[String]) -> Result<()> {
 
 async fn cmd_status(path: Option<String>, json: bool, roots: &[String]) -> Result<()> {
     let cfg = load_config(roots);
-    let start = match path {
-        Some(p) => paths::expand(&p),
-        None => std::env::current_dir().context("Reading the current directory")?,
-    };
-    let start = start.canonicalize().unwrap_or(start);
-    let root = find_repo_root(&start)
-        .ok_or_else(|| anyhow!("No git repo at or above {}", paths::contract(&start)))?;
+    let root = resolve_repo(path)?;
 
     let (group, name) = split_for_display(&cfg, &root);
     let discovered = discover::Discovered {
@@ -294,7 +297,8 @@ async fn cmd_status(path: Option<String>, json: bool, roots: &[String]) -> Resul
     let cached = cache::load();
     // Forced: one repo asked about by name is worth the scan, and a cached
     // "clean" for a tree the caller just edited is the wrong answer.
-    let status = probe::probe_one(&discovered, &cfg, cached.get(&root), Tier::Full, true).await;
+    let mut status = probe::probe_one(&discovered, &cfg, cached.get(&root), Tier::Full, true).await;
+    hold::apply(std::slice::from_mut(&mut status), &hold::load());
 
     let now = git::now_unix();
     if json {
@@ -466,10 +470,260 @@ async fn cmd_groups(json: bool, roots: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// Find a repo the way `status` does, so every command that takes a path
+/// agrees about what "." means and about which root a hold is filed under.
+fn resolve_repo(path: Option<String>) -> Result<PathBuf> {
+    let start = match path {
+        Some(p) => paths::expand(&p),
+        None => std::env::current_dir().context("Reading the current directory")?,
+    };
+    let start = start.canonicalize().unwrap_or(start);
+    find_repo_root(&start)
+        .ok_or_else(|| anyhow!("No git repo at or above {}", paths::contract(&start)))
+}
+
+/// Probe one repo's refs. Tier 1 only: a hold is about commits and tags, and
+/// nothing here needs a working-tree scan.
+async fn probe_refs_only(cfg: &config::Config, root: &Path) -> RepoStatus {
+    let (group, name) = split_for_display(cfg, root);
+    let discovered = discover::Discovered {
+        root: root.to_path_buf(),
+        group,
+        name,
+    };
+    probe::probe_one(&discovered, cfg, None, Tier::Refs, true).await
+}
+
+async fn cmd_hold(path: Option<String>, note: Option<String>, roots: &[String]) -> Result<()> {
+    let cfg = load_config(roots);
+    let root = resolve_repo(path)?;
+    let status = probe_refs_only(&cfg, &root).await;
+
+    let Some(sha) = status.head_sha().map(|s| s.to_string()) else {
+        return Err(anyhow!("{} has no commits to hold", paths::contract(&root)));
+    };
+    // Holding a repo with nothing past its tag would place something that can
+    // never suppress anything: the first commit to make it releasable is also
+    // the one that lifts the hold.
+    if status.release_state_raw() == model::ReleaseState::Released {
+        println!(
+            "{} is released, with nothing past {}. Nothing to hold.",
+            status.slug(),
+            status.tag_label()
+        );
+        return Ok(());
+    }
+
+    let mut holds = hold::load();
+    let previous = holds.get(&root).cloned();
+    holds.set(
+        &root,
+        hold::Hold {
+            sha: sha.clone(),
+            branch: status
+                .refs
+                .as_ref()
+                .and_then(|r| r.head.branch().map(|b| b.to_string())),
+            tag: status.refs.as_ref().and_then(|r| {
+                r.described_tag
+                    .as_ref()
+                    .or(r.newest_tag.as_ref())
+                    .map(|t| t.name.clone())
+            }),
+            at: git::now_unix(),
+            note,
+        },
+    );
+    let file = hold::save(&holds)?;
+
+    let what = match previous {
+        Some(prev) if prev.sha == sha => "Still holding",
+        Some(_) => "Re-held at the current commit:",
+        None => "Held",
+    };
+    println!(
+        "{what} {} at {} ({} past {}).",
+        status.slug(),
+        sha,
+        commits_note(status.commits_since_tag()),
+        status.tag_label()
+    );
+    println!("The next commit lifts it. Written to {}", file.display());
+    Ok(())
+}
+
+fn commits_note(count: u32) -> String {
+    format!("{count} commit{}", if count == 1 { "" } else { "s" })
+}
+
+async fn cmd_unhold(path: Option<String>, _roots: &[String]) -> Result<()> {
+    let root = resolve_repo(path)?;
+    let mut holds = hold::load();
+    match holds.remove(&root) {
+        Some(held) => {
+            hold::save(&holds)?;
+            println!(
+                "Lifted the hold on {} (placed at {}).",
+                paths::contract(&root),
+                held.label()
+            );
+        }
+        None => println!("Nothing is holding {}.", paths::contract(&root)),
+    }
+    Ok(())
+}
+
+/// What one held repo is doing right now. Probing is the only way to know
+/// whether a hold still covers HEAD, and there are only ever a handful of
+/// these, so each one is asked directly rather than run through a sweep.
+struct HeldRepo {
+    root: PathBuf,
+    hold: hold::Hold,
+    /// `None` when the repo is no longer on disk.
+    status: Option<RepoStatus>,
+}
+
+impl HeldRepo {
+    fn active(&self) -> bool {
+        match &self.status {
+            Some(status) => self.hold.covers(status.head_sha()),
+            None => false,
+        }
+    }
+
+    fn state(&self) -> &'static str {
+        match &self.status {
+            None => "repo is gone",
+            Some(status) if self.hold.covers(status.head_sha()) => "holding",
+            Some(_) => "lifted, HEAD moved",
+        }
+    }
+}
+
+async fn cmd_holds(prune: bool, json: bool, roots: &[String]) -> Result<()> {
+    let cfg = load_config(roots);
+    let holds = hold::load();
+    if holds.is_empty() {
+        if json {
+            println!("[]");
+        } else {
+            println!("Nothing is held. Press h in the dashboard, or run `drydock hold <path>`.");
+        }
+        return Ok(());
+    }
+
+    let mut held: Vec<HeldRepo> = Vec::new();
+    for (root, hold) in holds.iter() {
+        let status = if root.is_dir() {
+            Some(probe_refs_only(&cfg, root).await)
+        } else {
+            None
+        };
+        held.push(HeldRepo {
+            root: root.clone(),
+            hold: hold.clone(),
+            status,
+        });
+    }
+
+    let now = git::now_unix();
+    if json {
+        #[derive(serde::Serialize)]
+        struct Row<'a> {
+            path: &'a Path,
+            sha: &'a str,
+            branch: Option<&'a str>,
+            tag: Option<&'a str>,
+            at: i64,
+            note: Option<&'a str>,
+            active: bool,
+            state: &'a str,
+            head_sha: Option<&'a str>,
+        }
+        let rows: Vec<Row> = held
+            .iter()
+            .map(|h| Row {
+                path: &h.root,
+                sha: &h.hold.sha,
+                branch: h.hold.branch.as_deref(),
+                tag: h.hold.tag.as_deref(),
+                at: h.hold.at,
+                note: h.hold.note.as_deref(),
+                active: h.active(),
+                state: h.state(),
+                head_sha: h.status.as_ref().and_then(|s| s.head_sha()),
+            })
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&rows)?);
+        return Ok(());
+    }
+
+    let rows: Vec<Vec<String>> = held
+        .iter()
+        .map(|h| {
+            vec![
+                h.status
+                    .as_ref()
+                    .map(|s| s.slug())
+                    .unwrap_or_else(|| paths::contract(&h.root)),
+                h.hold.branch.clone().unwrap_or_else(|| "·".into()),
+                h.hold.tag.clone().unwrap_or_else(|| "·".into()),
+                h.hold.sha.clone(),
+                fmt::age(h.hold.at, now),
+                h.state().to_string(),
+                h.hold.note.clone().unwrap_or_else(|| "·".into()),
+            ]
+        })
+        .collect();
+
+    print!(
+        "{}",
+        report::table(
+            &["REPO", "BRANCH", "TAG", "COMMIT", "HELD", "STATE", "NOTE"],
+            &[
+                report::Align::Left,
+                report::Align::Left,
+                report::Align::Left,
+                report::Align::Left,
+                report::Align::Right,
+                report::Align::Left,
+                report::Align::Left,
+            ],
+            &rows,
+        )
+    );
+
+    let live = held.iter().filter(|h| h.active()).count();
+    let spent = held.len() - live;
+    println!();
+    println!(
+        "{live} holding, {spent} lifted{}.",
+        if spent > 0 && !prune {
+            " — `drydock holds --prune` forgets the lifted ones"
+        } else {
+            ""
+        }
+    );
+
+    if prune && spent > 0 {
+        let mut holds = holds;
+        let keep: Vec<PathBuf> = held
+            .iter()
+            .filter(|h| h.active())
+            .map(|h| h.root.clone())
+            .collect();
+        holds.retain(|path, _| keep.iter().any(|k| k == path));
+        hold::save(&holds)?;
+        println!("Pruned {spent}.");
+    }
+    Ok(())
+}
+
 fn cmd_config(command: ConfigCommands, roots: &[String]) -> Result<()> {
     match command {
         ConfigCommands::Path => {
             println!("config  {}", paths::config_file()?.display());
+            println!("holds   {}", paths::holds_file()?.display());
             println!("cache   {}", paths::cache_file()?.display());
             Ok(())
         }

@@ -65,6 +65,13 @@ pub fn config_file() -> Result<PathBuf> {
     Ok(config_dir()?.join("config.toml"))
 }
 
+/// Where manual release holds are kept. Config rather than cache: a hold is
+/// something a person decided, not something a probe observed, and `drydock
+/// scan --no-cache` must not throw it away.
+pub fn holds_file() -> Result<PathBuf> {
+    Ok(config_dir()?.join("holds.toml"))
+}
+
 pub fn cache_dir() -> Result<PathBuf> {
     resolve_dir(
         std::env::var_os("XDG_CACHE_HOME").map(PathBuf::from),

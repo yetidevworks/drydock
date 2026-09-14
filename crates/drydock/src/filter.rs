@@ -21,6 +21,8 @@ pub enum Filter {
     NeedsRelease,
     /// Tagged, with nothing since.
     Released,
+    /// Held out of "needs release" by hand, for the commit that's checked out.
+    Held,
     Behind,
     Conflicted,
     InProgress,
@@ -45,6 +47,7 @@ impl Filter {
             Filter::Unreleased => repo.release_state() == ReleaseState::Unreleased,
             Filter::NeedsRelease => repo.release_state() == ReleaseState::NeedsRelease,
             Filter::Released => repo.release_state() == ReleaseState::Released,
+            Filter::Held => repo.release_state() == ReleaseState::Held,
             Filter::Behind => repo.behind_total() > 0,
             Filter::Conflicted => f.conflicted,
             Filter::InProgress => f.in_progress,
@@ -73,6 +76,7 @@ impl Filter {
             Filter::Unreleased => "unreleased",
             Filter::NeedsRelease => "needs-release",
             Filter::Released => "released",
+            Filter::Held => "held",
             Filter::Behind => "behind",
             Filter::Conflicted => "conflicted",
             Filter::InProgress => "in-progress",
@@ -94,6 +98,7 @@ impl Filter {
             Filter::Unreleased,
             Filter::NeedsRelease,
             Filter::Released,
+            Filter::Held,
             Filter::Behind,
             Filter::Conflicted,
             Filter::InProgress,
@@ -515,7 +520,8 @@ fn is_subsequence(needle: &str, haystack: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{BranchInfo, Head, RefsInfo, VisibilityInfo, WorkInfo};
+    use crate::hold::Hold;
+    use crate::model::{BranchInfo, Head, RefsInfo, TagInfo, VisibilityInfo, WorkInfo};
     use std::path::PathBuf;
 
     fn repo(group: &str, name: &str, ahead: u32, dirty: u32, since_tag: u32) -> RepoStatus {
@@ -561,6 +567,63 @@ mod tests {
             truncated: false,
         });
         r
+    }
+
+    /// Put a tag on a fixture, reachable from HEAD, so its release state is
+    /// something other than "never released".
+    fn tag(repo: &mut RepoStatus, name: &str) {
+        let info = TagInfo {
+            name: name.into(),
+            at: 500,
+        };
+        let refs = repo.refs.as_mut().unwrap();
+        refs.newest_tag = Some(info.clone());
+        refs.described_tag = Some(info);
+    }
+
+    fn held_at(sha: &str) -> Hold {
+        Hold {
+            sha: sha.into(),
+            branch: Some("main".into()),
+            tag: Some("1.0.3".into()),
+            at: 1_000,
+            note: None,
+        }
+    }
+
+    /// The point of a hold: the repo leaves the needs-release list without
+    /// leaving the table, and the next commit puts it back with nobody having
+    /// to remember it was held.
+    #[test]
+    fn a_held_repo_leaves_the_needs_release_list_until_its_next_commit() {
+        let mut r = repo("grav", "cors", 0, 0, 3);
+        tag(&mut r, "1.0.3");
+        assert_eq!(r.release_state(), ReleaseState::NeedsRelease);
+
+        r.hold = Some(held_at("abc1234"));
+        assert_eq!(r.release_state(), ReleaseState::Held);
+        assert!(!Filter::NeedsRelease.matches(&r));
+        assert!(Filter::Held.matches(&r));
+        // What it would say without the hold is never lost.
+        assert_eq!(r.release_state_raw(), ReleaseState::NeedsRelease);
+
+        // One more commit, and the hold is describing a commit nobody is on.
+        r.refs.as_mut().unwrap().branches[0].sha = "9999999".into();
+        assert_eq!(r.release_state(), ReleaseState::NeedsRelease);
+        assert!(Filter::NeedsRelease.matches(&r));
+        assert!(!Filter::Held.matches(&r));
+    }
+
+    // Holding a repo with nothing past its tag would pin a commit that is
+    // already released, so it stays released rather than reading as a
+    // decision somebody made.
+    #[test]
+    fn a_hold_never_makes_a_released_repo_read_as_held() {
+        let mut r = repo("grav", "quiet", 0, 0, 0);
+        tag(&mut r, "1.0.3");
+        r.hold = Some(held_at("abc1234"));
+        assert_eq!(r.release_state(), ReleaseState::Released);
+        assert!(!Filter::Held.matches(&r));
     }
 
     #[test]

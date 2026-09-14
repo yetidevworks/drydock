@@ -10,6 +10,8 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+use crate::hold::Hold;
+
 /// Where HEAD is pointing.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub enum Head {
@@ -265,6 +267,10 @@ pub enum ReleaseState {
     Released,
     /// Tagged, but there are commits or uncommitted changes past the tag.
     NeedsRelease,
+    /// Held: someone looked at this exact commit and said it doesn't warrant a
+    /// release. Not a fact about the repo — a decision about it, pinned to the
+    /// commit it was made at, so the next commit lifts it. See [`crate::hold`].
+    Held,
 }
 
 impl ReleaseState {
@@ -273,6 +279,7 @@ impl ReleaseState {
             ReleaseState::Unreleased => "unreleased",
             ReleaseState::Released => "released",
             ReleaseState::NeedsRelease => "needs release",
+            ReleaseState::Held => "held",
         }
     }
 
@@ -281,6 +288,7 @@ impl ReleaseState {
             ReleaseState::Unreleased => "unreleased",
             ReleaseState::Released => "released",
             ReleaseState::NeedsRelease => "needs-release",
+            ReleaseState::Held => "held",
         }
     }
 }
@@ -429,6 +437,13 @@ pub struct RepoStatus {
     /// same "hasn't run yet" state, so no cache version bump was needed).
     #[serde(default)]
     pub visibility: Option<VisibilityInfo>,
+
+    /// The manual hold on this repo, if one was placed. Stamped on from the
+    /// holds file rather than probed (see [`crate::hold::apply`]), and kept
+    /// here so every reader of a `RepoStatus` — table, filter, `--json` —
+    /// agrees about the release state without going back to disk.
+    #[serde(default)]
+    pub hold: Option<Hold>,
 }
 
 impl RepoStatus {
@@ -444,6 +459,7 @@ impl RepoStatus {
             work_probed_at: 0,
             work_key: None,
             visibility: None,
+            hold: None,
         }
     }
 
@@ -552,6 +568,21 @@ impl RepoStatus {
     /// released even though some other one has. Orphaned tags are the
     /// exception, and read as never released: see `tags_orphaned`.
     pub fn release_state(&self) -> ReleaseState {
+        let state = self.release_state_raw();
+        // A hold can't make a released repo any more released, and a stale
+        // one covers a commit that is no longer checked out, so neither
+        // suppresses anything.
+        if state != ReleaseState::Released && self.hold_active() {
+            return ReleaseState::Held;
+        }
+        state
+    }
+
+    /// The release state as the tags and the working tree have it, before any
+    /// manual hold is taken into account. What the detail views report
+    /// alongside a hold, so holding a repo never means losing sight of what it
+    /// would otherwise say.
+    pub fn release_state_raw(&self) -> ReleaseState {
         let Some(refs) = self.refs.as_ref() else {
             return ReleaseState::Unreleased;
         };
@@ -646,6 +677,26 @@ impl RepoStatus {
     /// there is a real answer rather than a missing one.
     pub fn stash_count(&self) -> Option<u32> {
         self.refs.as_ref().map(|r| r.stashes)
+    }
+
+    /// The commit HEAD is on, as the short sha everything else here uses.
+    /// `None` for a repo nothing has probed, or one with no commits at all.
+    pub fn head_sha(&self) -> Option<&str> {
+        let refs = self.refs.as_ref()?;
+        refs.last_commit
+            .as_ref()
+            .map(|c| c.sha.as_str())
+            .or_else(|| refs.current_branch().map(|b| b.sha.as_str()))
+    }
+
+    /// Whether the hold on this repo still covers what's checked out. A hold
+    /// placed at a commit that HEAD has since moved past is spent: it stays in
+    /// the file so `drydock holds` can say it lifted, and suppresses nothing.
+    pub fn hold_active(&self) -> bool {
+        match &self.hold {
+            Some(hold) => hold.covers(self.head_sha()),
+            None => false,
+        }
     }
 
     pub fn commits_since_tag(&self) -> u32 {

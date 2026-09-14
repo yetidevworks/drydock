@@ -20,6 +20,7 @@ use crate::cache;
 use crate::config::Config;
 use crate::discover::{self, Discovered};
 use crate::git;
+use crate::hold::{self, Holds};
 use crate::model::{RepoStatus, VisibilityInfo};
 use crate::provider;
 
@@ -510,7 +511,20 @@ pub async fn sweep(
     }
 
     let cached = cache::load();
-    let repos = sweep_repos(cfg.clone(), discovered, cached, tier, &tx, &mut timings).await;
+    // Read once per sweep rather than once per repo: holds are a handful of
+    // lines, and a repo's hold has to be on it before the row is emitted or
+    // the dashboard paints "needs release" for a moment first.
+    let holds = Arc::new(hold::load());
+    let repos = sweep_repos(
+        cfg.clone(),
+        discovered,
+        cached,
+        holds,
+        tier,
+        &tx,
+        &mut timings,
+    )
+    .await;
 
     timings.total = started.elapsed();
     emit(
@@ -538,6 +552,7 @@ pub async fn sweep_repos(
     cfg: Arc<Config>,
     discovered: Vec<Discovered>,
     cached: HashMap<PathBuf, RepoStatus>,
+    holds: Arc<Holds>,
     tier: Tier,
     tx: &Option<mpsc::UnboundedSender<Event>>,
     timings: &mut Timings,
@@ -572,11 +587,13 @@ pub async fn sweep_repos(
         let refs_ms = refs_ms.clone();
         let scanned = scanned.clone();
         let from_cache = from_cache.clone();
+        let holds = holds.clone();
         let tx = tx.clone();
 
         set.spawn(async move {
             let previous = cached.get(&d.root);
             let mut status = RepoStatus::new(d.root.clone(), d.group.clone(), d.name.clone());
+            status.hold = holds.get(&d.root).cloned();
 
             let ok = {
                 let _permit = refs_sem.acquire().await;

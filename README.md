@@ -35,7 +35,7 @@ dimmed out of the way.
 - **What have I not pushed?** Across *every* local branch, not just the one
   that happens to be checked out. Side branches are exactly where work goes
   missing.
-- **What's worth releasing?** Every repo sits in one of three release states,
+- **What's worth releasing?** Every repo sits in one of four release states,
   in their own column:
 
   | | |
@@ -43,6 +43,7 @@ dimmed out of the way.
   | `· unreleased` | no tags at all, never been released |
   | `✓ released` | tagged, with nothing since |
   | `◆ needs release` | tagged, but with commits or uncommitted changes past the tag |
+  | `◇ held` | past the tag, and you've said this commit isn't worth a release |
 
   Plus the commits since the last tag with their actual subjects, and whether
   `CHANGELOG.md` has run ahead of the newest tag.
@@ -129,7 +130,8 @@ Or, since it works as a git alias:
 | `⏎` | detail view: branches, commits since the last tag, changed files |
 | mouse | wheel scrolls the help and detail panes, and moves the column picker |
 | `d` `u` `b` | filter to dirty, unpushed, behind |
-| `r` `N` | filter to needs-release, never-released |
+| `r` `N` `H` | filter to needs-release, never-released, held |
+| `h` | hold this repo out of needs-release, or lift the hold it's under |
 | `c` `i` `x` `e` | conflicts, operation in progress, detached HEAD, probe errors |
 | `n` | only repos with nothing outstanding |
 | `&` | switch between matching **any** active filter and **all** of them |
@@ -165,6 +167,9 @@ drydock list --cached                        # last known state, no probing (~5m
 drydock list --behind --fetch                # check every remote, then show what's behind
 drydock list --behind --fetch -g acme        # ...just that group's remotes
 drydock releasable --min-commits 3           # what's worth a release pass
+drydock hold . --note "changelog only"       # not this commit, thanks
+drydock unhold .                             # back into the list
+drydock holds                                # what's held, and what has lifted
 drydock status .                             # everything about one repo
 drydock scan                                 # refresh the cache
 drydock scan --fetch                         # ...checking the remotes as it goes
@@ -183,7 +188,8 @@ to drive a status line.
 `--behind` reads what your last fetch left behind; add `--fetch` to check the
 remotes first.
 
-Release state: `--unreleased` (never tagged), `--needs-release`, `--released`.
+Release state: `--unreleased` (never tagged), `--needs-release`, `--released`,
+`--held`.
 
 Several filters **widen** the result by default: `--dirty --unpushed` means
 "either". Pass `--match all` (or press `&`) to require all of them instead.
@@ -453,7 +459,39 @@ root, so point them at whatever you actually use — `["open", "-a", "iTerm",
 "{path}"]` for iTerm2, `["open", "-a", "Ghostty", "{path}"]` for Ghostty.
 
 `drydock config show` prints the effective config; `drydock config path` says
-where things live.
+where things live — config, holds and cache.
+
+### Holding a repo out of needs-release
+
+Plenty of what lands past a tag isn't worth a version: a changelog line, a merge
+of a branch that already shipped, a README fix. Across a few hundred repos those
+add up until the needs-release list is mostly noise, which is the one thing a
+list like that can't afford to be.
+
+Press `h` on a row — or run `drydock hold <path>` — and that repo drops out of
+`needs release` and reads `◇ held` instead. It comes out of the header count,
+out of the `r` filter and out of `--needs-release`, and `H` or `--held` shows
+what you've put there.
+
+The hold is pinned to the commit it was placed at, and that's the whole point:
+**the next commit lifts it**. You're saying "not this, not today", not "never
+tell me about this repo again", so there's no hold left behind to hide real work
+later. Press `h` again to lift one by hand.
+
+Holds live in `holds.toml` next to your config, not in the cache, so
+`drydock scan --no-cache` doesn't throw them away. `drydock holds` lists every
+one with whether it still covers `HEAD`, and `drydock holds --prune` forgets the
+ones that have lifted.
+
+```sh
+drydock hold ~/Projects/grav/grav-plugin-cors --note "changelog only"
+drydock list --held
+drydock holds --prune
+```
+
+`--json` reports a held repo as `release_state: "held"`, alongside
+`release_state_raw` — what it would say without the hold — and the hold itself,
+so a script can still see the unfiltered list.
 
 ### Tags, and a note on git-flow
 
