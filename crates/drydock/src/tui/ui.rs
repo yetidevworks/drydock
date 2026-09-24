@@ -21,11 +21,11 @@ use crate::model::{ChangeKind, ReleaseState, RepoStatus, Visibility, VisibilityS
 use crate::paths;
 use crate::report::Align;
 
-const ACCENT: Color = Color::Cyan;
-const DIM: Color = Color::DarkGray;
-const DIRTY: Color = Color::Yellow;
-const UNPUSHED: Color = Color::Cyan;
-const UNRELEASED: Color = Color::Magenta;
+pub(super) const ACCENT: Color = Color::Cyan;
+pub(super) const DIM: Color = Color::DarkGray;
+pub(super) const DIRTY: Color = Color::Yellow;
+pub(super) const UNPUSHED: Color = Color::Cyan;
+pub(super) const UNRELEASED: Color = Color::Magenta;
 /// Commits waiting on the remote. Its own colour because it's its own axis:
 /// unpushed is work you have that the remote doesn't, behind is work the
 /// remote has that you don't, and rendering the second in the grey reserved
@@ -36,9 +36,9 @@ const UNRELEASED: Color = Color::Magenta;
 /// hands, but commits sitting on the remote block anything you do next until
 /// you pull them. Near TROUBLE's red without being it — the two never appear
 /// in the same column, and this is the same order of "deal with me first".
-const BEHIND: Color = Color::LightRed;
-const TROUBLE: Color = Color::Red;
-const CLEAN: Color = Color::Green;
+pub(super) const BEHIND: Color = Color::LightRed;
+pub(super) const TROUBLE: Color = Color::Red;
+pub(super) const CLEAN: Color = Color::Green;
 // Private isn't a warning state -- it's the one most repos should be in -- so
 // it gets a colour of its own rather than the grey reserved for cells that
 // hold no answer at all. Internal is half of each, and reads as such.
@@ -135,6 +135,10 @@ pub fn render(f: &mut Frame, app: &App) -> u16 {
         Mode::Detail => render_detail(f, app, f.area()),
         Mode::Columns => {
             render_columns(f, app, f.area());
+            0
+        }
+        Mode::History => {
+            super::history::render(f, app);
             0
         }
         _ => 0,
@@ -639,6 +643,17 @@ pub(super) fn key_hints(app: &App) -> &'static [(&'static str, &'static str)] {
             ("y", "copy path"),
         ],
         Mode::Search => &[("esc", "cancel"), ("enter", "keep"), ("type", "to filter")],
+        Mode::History if shift => &[("J/K", "scroll diff"), ("O", "editor"), ("T", "terminal")],
+        Mode::History => &[
+            ("space", "close"),
+            ("j/k", "commit"),
+            ("J/K", "scroll"),
+            ("^d/^u", "half page"),
+            ("n/p", "next/prev file"),
+            ("a", "all branches"),
+            ("y", "copy hash"),
+            ("t", "client"),
+        ],
         Mode::Columns if shift => &[("J/K", "move column"), ("C", "close")],
         _ if shift => &[
             ("O", "editor"),
@@ -653,6 +668,7 @@ pub(super) fn key_hints(app: &App) -> &'static [(&'static str, &'static str)] {
         _ => &[
             ("j/k", "move"),
             ("⏎", "detail"),
+            ("space", "history"),
             ("d", "dirty"),
             ("u", "unpushed"),
             ("r", "needs release"),
@@ -824,6 +840,10 @@ fn render_help(f: &mut Frame, app: &App, area: Rect) -> u16 {
                 ("click", "select that row"),
                 ("wheel", "move the selection, or scroll the detail view"),
                 ("enter", "open the detail view"),
+                (
+                    "space",
+                    "recent commits and their diffs, space again to close",
+                ),
                 ("q", "quit"),
             ],
         ),
@@ -854,6 +874,19 @@ fn render_help(f: &mut Frame, app: &App, area: Rect) -> u16 {
                 ("", "a hold covers the commit it was placed at, so the next"),
                 ("", "commit lifts it and the repo comes back into the list"),
                 ("H", "show what's held"),
+            ],
+        ),
+        (
+            "The history view",
+            &[
+                ("j / k", "step through the commits"),
+                ("J / K, pgdn / pgup", "scroll the diff"),
+                ("ctrl-d / ctrl-u", "half a page of diff"),
+                ("n / p", "next and previous file in the diff"),
+                ("a", "every branch, or back to this one and its upstream"),
+                ("y", "copy the commit hash"),
+                ("t, o, O, T, w", "hand off, as in the table"),
+                ("space / esc", "back to the table"),
             ],
         ),
         (
@@ -1323,7 +1356,7 @@ fn render_detail(f: &mut Frame, app: &App, area: Rect) -> u16 {
 
 // ---------------------------------------------------------------------------
 
-fn pad(text: &str, width: usize) -> String {
+pub(super) fn pad(text: &str, width: usize) -> String {
     let len = text.chars().count();
     if len >= width {
         fmt::truncate(text, width)

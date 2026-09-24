@@ -1,3 +1,17 @@
+# 1.2.0
+
+## 09/23/2026
+
+1. [](#new)
+    * **`space` opens a repo's history.** The recent commits run down the left with git's graph beside them, and the right side shows what the selected one changed: author, date, the full message, the files with their line counts, and the diff with line numbers. `space` or `esc` puts you back on the table. It's for the times you only want to see what's been going on in a repo, which used to mean opening a git client window for each one. It's read-only, and `t` still opens the git client when you want to do something about it.
+    * The list is the checked-out branch plus its upstream, so commits you haven't pulled yet are there too, with their hashes in the BEHIND colour and a `↓ incoming` count in the title. Unpushed commits get the AHEAD colour. `a` switches to every branch and tag and back.
+    * A dirty repo gets an `uncommitted changes` entry at the top of the list, with staged and unstaged work diffed together against `HEAD` and untracked files listed by name, and the view opens on it.
+    * `j`/`k` step through the commits, `J`/`K`, `pgdn`/`pgup` and `ctrl-d`/`ctrl-u` scroll the diff, `n`/`p` jump between files, and `y` copies the commit hash. The mouse wheel moves through whichever side it's over, and a click selects a commit.
+2. [](#improved)
+    * A merge is diffed against its first parent, so it reads as what the merge brought in rather than git's combined diff, which is usually empty.
+    * The history view follows the repo while it's open: a commit, a pull or a fetch reloads the list and keeps the cursor on the commit it was on, and the uncommitted diff is read again whenever the watcher sees a change.
+    * It reads the newest 400 commits and stops a diff at a couple of megabytes, so a commit that vendored a dependency can't stall the dashboard or fill memory. Diffs load in the background, and holding `j` through a long list cancels each one as the cursor moves past it.
+
 # 1.1.4
 
 ## 09/13/2026

@@ -37,8 +37,8 @@ const GIT_TIMEOUT: Duration = Duration::from_secs(30);
 /// picked, so the newest few hundred is plenty.
 const TAG_LIMIT: usize = 400;
 
-/// One `git` invocation against a repo, with the safety rails applied.
-async fn run_git(root: &Path, args: &[&str]) -> Result<String> {
+/// A `git` command against a repo with the safety rails applied, ready to run.
+fn git_command(root: &Path, args: &[&str]) -> Command {
     let mut cmd = Command::new("git");
     cmd.arg("--no-optional-locks")
         .arg("-c")
@@ -54,7 +54,12 @@ async fn run_git(root: &Path, args: &[&str]) -> Result<String> {
         .env("LC_ALL", "C")
         .stdin(std::process::Stdio::null())
         .kill_on_drop(true);
+    cmd
+}
 
+/// One `git` invocation against a repo, with the safety rails applied.
+pub(crate) async fn run_git(root: &Path, args: &[&str]) -> Result<String> {
+    let mut cmd = git_command(root, args);
     let output = tokio::time::timeout(GIT_TIMEOUT, cmd.output())
         .await
         .map_err(|_| anyhow!("git {} timed out", args.join(" ")))?
@@ -79,6 +84,70 @@ async fn run_git(root: &Path, args: &[&str]) -> Result<String> {
 /// error. `describe` on a repo with no tags is the motivating case.
 async fn try_git(root: &Path, args: &[&str]) -> Option<String> {
     run_git(root, args).await.ok()
+}
+
+/// Like [`run_git`], but stops reading after `cap` bytes and says whether it
+/// had to. For output with no natural bound -- a diff of a commit that vendored
+/// a dependency can run to hundreds of megabytes -- where the first couple of
+/// megabytes are all anyone is going to read on a screen anyway.
+///
+/// A cut output is trimmed back to the last whole line, so a parser never sees
+/// half of one.
+pub(crate) async fn run_git_capped(
+    root: &Path,
+    args: &[&str],
+    cap: usize,
+) -> Result<(String, bool)> {
+    use tokio::io::AsyncReadExt;
+
+    let mut cmd = git_command(root, args);
+    cmd.stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let mut child = cmd
+        .spawn()
+        .with_context(|| format!("Running git {}", args.join(" ")))?;
+    let mut stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow!("git {} gave no output", args.join(" ")))?;
+
+    let mut buf = Vec::new();
+    tokio::time::timeout(
+        GIT_TIMEOUT,
+        (&mut stdout).take(cap as u64 + 1).read_to_end(&mut buf),
+    )
+    .await
+    .map_err(|_| anyhow!("git {} timed out", args.join(" ")))?
+    .with_context(|| format!("Reading git {}", args.join(" ")))?;
+
+    if buf.len() > cap {
+        // Git is still writing. Killing it is the whole point of the cap, and
+        // what it would have said on the way out no longer matters.
+        let _ = child.kill().await;
+        buf.truncate(cap);
+        if let Some(end) = buf.iter().rposition(|b| *b == b'\n') {
+            buf.truncate(end + 1);
+        }
+        return Ok((String::from_utf8_lossy(&buf).to_string(), true));
+    }
+
+    drop(stdout);
+    let output = tokio::time::timeout(GIT_TIMEOUT, child.wait_with_output())
+        .await
+        .map_err(|_| anyhow!("git {} timed out", args.join(" ")))??;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(anyhow!(
+            "git {} failed: {}",
+            args.join(" "),
+            if stderr.is_empty() {
+                "no output".into()
+            } else {
+                stderr
+            }
+        ));
+    }
+    Ok((String::from_utf8_lossy(&buf).to_string(), false))
 }
 
 /// Resolve the real git directory for a checkout, following the `gitdir:`

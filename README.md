@@ -128,6 +128,7 @@ Or, since it works as a git alias:
 | `j` `k` `↑` `↓` | move · `ctrl-d` / `ctrl-u` half a page · `home` / `end` ends |
 | mouse | click a row to select it · wheel moves the selection |
 | `⏎` | detail view: branches, commits since the last tag, changed files |
+| `space` | history: recent commits and what each one changed, `space` again to close |
 | mouse | wheel scrolls the help and detail panes, and moves the column picker |
 | `d` `u` `b` | filter to dirty, unpushed, behind |
 | `r` `N` `H` | filter to needs-release, never-released, held |
@@ -156,6 +157,24 @@ of its row. That needs a terminal which reports a modifier being held on its
 own (the kitty keyboard protocol: kitty, Ghostty, WezTerm, iTerm2 3.5+, foot).
 Anywhere else the footer is the static list it always was, and `?` still lists
 everything.
+
+### History
+
+`space` on a row opens that repo's recent history, full screen. The commits run down the left with git's graph beside them, and the right side shows what the selected one changed: author and date, the full message, the files with their line counts, then the diff itself with line numbers. It's for checking what's been going on in a repo without opening a git client window for it, so nothing in here writes anything; `space` or `esc` puts you back on the table where you were.
+
+The list is the branch you have checked out plus its upstream, so commits you haven't pulled yet appear too, with their hashes in the BEHIND colour and a `↓ incoming` count in the title. Unpushed commits get the AHEAD colour. A dirty repo gets an `uncommitted changes` entry at the top, and that's where the view opens, since uncommitted work is usually what you wanted to see. A merge is diffed against its first parent, so it reads as what the merge brought in.
+
+| | |
+|---|---|
+| `j` `k` | step through the commits · `home` / `end` for the ends |
+| `J` `K` `pgdn` `pgup` | scroll the diff · `ctrl-d` / `ctrl-u` by half a page |
+| `n` `p` | jump to the next or previous file in the diff |
+| `a` | every branch and tag, or back to this branch and its upstream |
+| `y` | copy the commit hash |
+| `t` `o` `O` `T` `w` | hand off, the same as from the table |
+| mouse | wheel over the list moves through it, over the diff scrolls it · click a commit to select it |
+
+It reads the newest 400 commits and stops a diff at a couple of megabytes, which is far past what anyone scrolls in a terminal; `t` opens the repo in your git client for anything bigger. The view follows the repo while it's open, so a commit, a pull or a fetch shows up without closing it.
 
 ### Commands
 

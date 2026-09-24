@@ -1,6 +1,7 @@
 mod cache;
 mod cli;
 mod column;
+mod commits;
 mod config;
 mod discover;
 mod filter;

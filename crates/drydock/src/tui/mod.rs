@@ -4,6 +4,7 @@
 //! streams in fresh results as a sweep runs behind it. Key handling and
 //! rendering are split: this module owns state and events, `ui` owns pixels.
 
+mod history;
 mod ui;
 
 use anyhow::Result;
@@ -62,6 +63,8 @@ pub enum Mode {
     Help,
     /// The column picker: toggle columns on and off, and reorder them.
     Columns,
+    /// The selected repo's recent commits, and what each one changed.
+    History,
 }
 
 /// The `since` presets, cycled with the number keys.
@@ -129,6 +132,12 @@ pub struct App {
     /// iTerm2 3.5+, foot). Apple Terminal doesn't, and there the footer stays
     /// the static list it always was.
     pub modifier_events: bool,
+    /// The history view, while it's open. It belongs to one repo, and keeps
+    /// hold of which even if the table's selection moves under it.
+    pub history: Option<history::HistoryView>,
+    /// The whole terminal, as of the last frame, so key handlers can size
+    /// their steps to what's on screen.
+    pub area: Rect,
     pub should_quit: bool,
 }
 
@@ -184,6 +193,8 @@ impl App {
             spinner: 0,
             now: git::now_unix(),
             rows_on_screen: 20,
+            history: None,
+            area: Rect::new(0, 0, 120, 40),
             should_quit: false,
         };
         app.reindex();
@@ -501,6 +512,8 @@ enum Input {
     Resweep,
     /// The periodic fetch is due, if one is configured.
     AutoFetch,
+    /// Git answering the history view.
+    History(Box<history::Loaded>),
     Tick,
 }
 
@@ -638,7 +651,8 @@ async fn run_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut A
                 // enough to leave open all day.
                 app.spinner = app.spinner.wrapping_add(1);
                 idle_ticks += 1;
-                if app.sweeping || idle_ticks >= 4 {
+                let loading = app.history.as_ref().is_some_and(|h| h.loading());
+                if app.sweeping || loading || idle_ticks >= 4 {
                     idle_ticks = 0;
                     dirty = true;
                 }
@@ -665,12 +679,16 @@ async fn run_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut A
                 dirty = true;
             }
             Input::Term(TermEvent::Mouse(ev)) => {
-                handle_mouse(app, ev, terminal.size().ok());
+                handle_mouse(app, ev, terminal.size().ok(), &tx);
                 dirty = true;
             }
             Input::Term(_) => {}
             Input::Probe(event) => {
-                handle_probe_event(app, event);
+                handle_probe_event(app, event, &tx);
+                dirty = true;
+            }
+            Input::History(loaded) => {
+                history::on_loaded(app, *loaded, &tx);
                 dirty = true;
             }
             Input::Changed(paths) => {
@@ -712,23 +730,27 @@ async fn run_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut A
 fn draw(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) -> Result<()> {
     app.now = git::now_unix();
     terminal.draw(|f| {
+        app.area = f.area();
         app.rows_on_screen = ui::table_rows(f.area());
         app.overlay_max_scroll = ui::render(f, app);
     })?;
     Ok(())
 }
 
-fn handle_probe_event(app: &mut App, event: probe::Event) {
+fn handle_probe_event(app: &mut App, event: probe::Event, tx: &mpsc::UnboundedSender<Input>) {
+    let mut updated = None;
     match event {
         probe::Event::Discovered { roots } => {
             app.progress = (0, roots.len());
             app.retain_roots(&roots);
         }
         probe::Event::Refs(status) => {
+            updated = Some(status.root.clone());
             app.upsert(*status);
             app.progress.0 += 1;
         }
         probe::Event::Work(status) => {
+            updated = Some(status.root.clone());
             app.upsert(*status);
         }
         probe::Event::Phase { name, elapsed } => {
@@ -746,6 +768,9 @@ fn handle_probe_event(app: &mut App, event: probe::Event) {
         }
     }
     app.recompute();
+    if let Some(root) = updated {
+        history::on_repo_update(app, &root, tx);
+    }
 }
 
 /// Kick off a sweep in the background, streaming results into the loop.
@@ -835,10 +860,19 @@ fn reprobe_paths(app: &mut App, paths: Vec<PathBuf>, tx: &mpsc::UnboundedSender<
 /// Mouse input. The wheel moves the selection rather than scrolling the
 /// viewport under it, so it lands in the same place as `j` and `k` and the
 /// selected row never drifts off screen.
-fn handle_mouse(app: &mut App, ev: MouseEvent, size: Option<Size>) {
+fn handle_mouse(
+    app: &mut App,
+    ev: MouseEvent,
+    size: Option<Size>,
+    tx: &mpsc::UnboundedSender<Input>,
+) {
     // The detail and help panes cover the table, so a click there has nothing
     // to hit and the wheel belongs to the pane.
     match app.mode {
+        Mode::History => {
+            history::handle_mouse(app, ev, tx);
+            return;
+        }
         // Both panes scroll on the same state, and the wheel is what people
         // reach for before they find j/k.
         Mode::Detail | Mode::Help => {
@@ -958,6 +992,11 @@ fn handle_key(app: &mut App, key: KeyEvent, tx: &mpsc::UnboundedSender<Input>) {
                 open_terminal(app);
                 return;
             }
+            // In the history view the diff is what's long enough to page.
+            KeyCode::Char('d') | KeyCode::Char('u') if app.mode == Mode::History => {
+                history::half_page(app, key.code == KeyCode::Char('d'));
+                return;
+            }
             KeyCode::Char('d') => {
                 let page = app.rows_on_screen as isize / 2;
                 app.move_selection(page);
@@ -1021,8 +1060,13 @@ fn handle_key(app: &mut App, key: KeyEvent, tx: &mpsc::UnboundedSender<Input>) {
             KeyCode::Char('T') => open_terminal(app),
             KeyCode::Char('t') => open_git_client(app),
             KeyCode::Char('y') => copy_path(app),
+            KeyCode::Char(' ') => {
+                app.detail_scroll = 0;
+                history::open(app, tx);
+            }
             _ => {}
         },
+        Mode::History => history::handle_key(app, key, tx),
         Mode::Normal => handle_normal_key(app, key, tx),
     }
 }
@@ -1067,6 +1111,9 @@ fn handle_normal_key(app: &mut App, key: KeyEvent, tx: &mpsc::UnboundedSender<In
                 app.detail_scroll = 0;
             }
         }
+        // Quick Look's key: a look at what's been happening, and the same key
+        // again to put it away.
+        KeyCode::Char(' ') => history::open(app, tx),
 
         KeyCode::Char('j') | KeyCode::Down => app.move_selection(1),
         KeyCode::Char('k') | KeyCode::Up => app.move_selection(-1),
@@ -1397,8 +1444,18 @@ fn spawn_command(app: &mut App, template: &[String], path: &std::path::Path, wha
     }
 }
 
+/// The repo a hand-off acts on: the one the history view is showing while
+/// it's open, which a sweep can re-sort out from under the table's cursor,
+/// and otherwise the table's selection.
+fn handoff_repo(app: &App) -> Option<&RepoStatus> {
+    match &app.history {
+        Some(view) => app.by_root.get(&view.root).map(|&i| &app.repos[i]),
+        None => app.current(),
+    }
+}
+
 fn open_editor(app: &mut App) {
-    let Some(path) = app.current().map(|r| r.root.clone()) else {
+    let Some(path) = handoff_repo(app).map(|r| r.root.clone()) else {
         return;
     };
     let template = app.cfg.ui.editor_command.clone();
@@ -1406,7 +1463,7 @@ fn open_editor(app: &mut App) {
 }
 
 fn open_git_client(app: &mut App) {
-    let Some(path) = app.current().map(|r| r.root.clone()) else {
+    let Some(path) = handoff_repo(app).map(|r| r.root.clone()) else {
         return;
     };
     let template = app.cfg.ui.git_client_command.clone();
@@ -1414,7 +1471,7 @@ fn open_git_client(app: &mut App) {
 }
 
 fn open_terminal(app: &mut App) {
-    let Some(path) = app.current().map(|r| r.root.clone()) else {
+    let Some(path) = handoff_repo(app).map(|r| r.root.clone()) else {
         return;
     };
     let template = app.cfg.ui.terminal_command.clone();
@@ -1422,7 +1479,7 @@ fn open_terminal(app: &mut App) {
 }
 
 fn open_file_manager(app: &mut App) {
-    let Some(path) = app.current().map(|r| r.root.clone()) else {
+    let Some(path) = handoff_repo(app).map(|r| r.root.clone()) else {
         return;
     };
     let template = app.cfg.ui.file_manager_command.clone();
@@ -1432,8 +1489,7 @@ fn open_file_manager(app: &mut App) {
 /// Open the repo's remote in a browser, converting an SSH remote to its https
 /// equivalent first.
 fn open_remote(app: &mut App) {
-    let Some(url) = app
-        .current()
+    let Some(url) = handoff_repo(app)
         .and_then(|r| r.refs.as_ref())
         .and_then(|refs| refs.remote_url.clone())
     else {
@@ -1462,10 +1518,14 @@ pub fn web_url(remote: &str) -> String {
 }
 
 fn copy_path(app: &mut App) {
-    let Some(path) = app.current().map(|r| r.root.clone()) else {
+    let Some(path) = handoff_repo(app).map(|r| r.root.clone()) else {
         return;
     };
     let text = path.to_string_lossy().to_string();
+    copy_text(app, &text);
+}
+
+fn copy_text(app: &mut App, text: &str) {
     let result = (|| -> std::io::Result<()> {
         use std::io::Write;
         let mut child = std::process::Command::new("pbcopy")
@@ -1584,6 +1644,16 @@ pub async fn snapshot(width: u16, height: u16, view: &str, roots: Vec<String>) -
         "help" => app.mode = Mode::Help,
         "detail" => app.mode = Mode::Detail,
         "columns" => app.mode = Mode::Columns,
+        // `history`, or `history:<name>` to open it on a particular repo.
+        v if v == "history" || v.starts_with("history:") => {
+            app.area = Rect::new(0, 0, width, height);
+            if let Some(name) = v.strip_prefix("history:") {
+                if let Some(pos) = app.visible.iter().position(|i| app.repos[*i].name == name) {
+                    app.selected = pos;
+                }
+            }
+            history::open_now(&mut app).await;
+        }
         "search" => {
             app.mode = Mode::Search;
             app.search_input = "grav-plugin".into();
