@@ -104,7 +104,12 @@ pub struct HistoryView {
     /// is one, then the log's own rows, graph-only lines included.
     cursor: usize,
     list_scroll: usize,
+    /// The logical line at the top of the diff pane. Logical rather than
+    /// screen rows, so turning wrapping on or off keeps the same line there.
     diff_scroll: usize,
+    /// Long diff lines wrap rather than run off the right edge. Seeded from
+    /// `[ui] history_wrap`, and `W` writes it back.
+    wrap: bool,
     changes: HashMap<Entry, Result<Arc<Changes>, String>>,
     log_seq: u64,
     log_task: Option<JoinHandle<()>>,
@@ -153,6 +158,7 @@ impl HistoryView {
             cursor: 0,
             list_scroll: 0,
             diff_scroll: 0,
+            wrap: false,
             changes: HashMap::new(),
             log_seq: 0,
             log_task: None,
@@ -361,6 +367,7 @@ pub fn panes(area: Rect) -> (Rect, Rect) {
 pub fn open(app: &mut App, tx: &mpsc::UnboundedSender<Input>) {
     let Some(repo) = app.current() else { return };
     let mut view = HistoryView::new(repo);
+    view.wrap = app.cfg.ui.history_wrap;
     request_log(&mut view, tx);
     request_changes(&mut view, tx);
     app.history = Some(view);
@@ -500,9 +507,10 @@ pub fn on_repo_update(app: &mut App, root: &Path, tx: &mpsc::UnboundedSender<Inp
 }
 
 /// Load everything synchronously, for `tui-snapshot`.
-pub async fn open_now(app: &mut App) {
+pub async fn open_now(app: &mut App, wrap: bool) {
     let Some(repo) = app.current() else { return };
     let mut view = HistoryView::new(repo);
+    view.wrap = wrap || app.cfg.ui.history_wrap;
     let log = commits::load_log(&view.root, view.upstream.as_deref(), view.scope)
         .await
         .map_err(|e| format!("{e:#}"));
@@ -520,8 +528,6 @@ pub async fn open_now(app: &mut App) {
 // ---------------------------------------------------------------------------
 
 pub fn handle_key(app: &mut App, key: KeyEvent, tx: &mpsc::UnboundedSender<Input>) {
-    let diff_h = panes(app.area).1.height as usize;
-
     match key.code {
         KeyCode::Char(' ') | KeyCode::Esc | KeyCode::Char('q') => close(app),
         KeyCode::Char('j') | KeyCode::Down => move_cursor(app, 1, tx),
@@ -530,8 +536,9 @@ pub fn handle_key(app: &mut App, key: KeyEvent, tx: &mpsc::UnboundedSender<Input
         KeyCode::End => move_cursor(app, isize::MAX / 2, tx),
         KeyCode::Char('J') => scroll_diff(app, 1),
         KeyCode::Char('K') => scroll_diff(app, -1),
-        KeyCode::PageDown => scroll_diff(app, diff_h.saturating_sub(2).max(1) as isize),
-        KeyCode::PageUp => scroll_diff(app, -(diff_h.saturating_sub(2).max(1) as isize)),
+        KeyCode::PageDown => page(app, true, false),
+        KeyCode::PageUp => page(app, false, false),
+        KeyCode::Char('W') => toggle_wrap(app),
         KeyCode::Char('n') => jump_file(app, true),
         KeyCode::Char('p') => jump_file(app, false),
         KeyCode::Char('a') => {
@@ -573,8 +580,49 @@ pub fn handle_key(app: &mut App, key: KeyEvent, tx: &mpsc::UnboundedSender<Input
 
 /// Half a page of diff, for ctrl-d and ctrl-u.
 pub fn half_page(app: &mut App, down: bool) {
-    let half = (panes(app.area).1.height as isize / 2).max(1);
-    scroll_diff(app, if down { half } else { -half });
+    page(app, down, true);
+}
+
+/// A page of diff, or half of one. A page is however many lines are on
+/// screen, less two kept for context, so with wrapping on it's fewer lines.
+fn page(app: &mut App, down: bool, half: bool) {
+    let Some(g) = diff_geometry(app) else {
+        return;
+    };
+    let step = if half {
+        g.fits / 2
+    } else {
+        g.fits.saturating_sub(2)
+    }
+    .max(1) as isize;
+    scroll_diff(app, if down { step } else { -step });
+}
+
+/// Wrap long lines, or stop, and remember which for next time.
+fn toggle_wrap(app: &mut App) {
+    let Some(view) = app.history.as_mut() else {
+        return;
+    };
+    view.wrap = !view.wrap;
+    let wrap = view.wrap;
+    // The line at the top stays at the top, but wrapping changes how far
+    // down the pane can go.
+    scroll_diff(app, 0);
+
+    let mut cfg = (*app.cfg).clone();
+    cfg.ui.history_wrap = wrap;
+    let what = if wrap {
+        "Wrapping long lines"
+    } else {
+        "Not wrapping long lines"
+    };
+    match crate::config::update(|file| file.ui.history_wrap = wrap) {
+        Ok(_) => {
+            app.cfg = Arc::new(cfg);
+            app.notify(what);
+        }
+        Err(err) => app.notify(format!("{what}, but could not save it: {err:#}")),
+    }
 }
 
 fn move_cursor(app: &mut App, delta: isize, tx: &mpsc::UnboundedSender<Input>) {
@@ -587,20 +635,17 @@ fn move_cursor(app: &mut App, delta: isize, tx: &mpsc::UnboundedSender<Input>) {
 }
 
 fn scroll_diff(app: &mut App, delta: isize) {
-    let height = panes(app.area).1.height as usize;
-    let Some((total, _)) = diff_metrics(app) else {
+    let Some(g) = diff_geometry(app) else {
         return;
     };
     if let Some(view) = app.history.as_mut() {
-        let max = total.saturating_sub(height) as isize;
-        view.diff_scroll = (view.diff_scroll as isize + delta).clamp(0, max.max(0)) as usize;
+        view.diff_scroll = (view.diff_scroll as isize + delta).clamp(0, g.max as isize) as usize;
     }
 }
 
 /// Put the next (or previous) file's header at the top of the pane.
 fn jump_file(app: &mut App, forward: bool) {
-    let height = panes(app.area).1.height as usize;
-    let Some((total, starts)) = diff_metrics(app) else {
+    let Some(g) = diff_geometry(app) else {
         return;
     };
     let Some(view) = app.history.as_mut() else {
@@ -608,12 +653,12 @@ fn jump_file(app: &mut App, forward: bool) {
     };
     let at = view.diff_scroll;
     let target = if forward {
-        starts.iter().copied().find(|s| *s > at)
+        g.starts.iter().copied().find(|s| *s > at)
     } else {
-        starts.iter().copied().rev().find(|s| *s < at)
+        g.starts.iter().copied().rev().find(|s| *s < at)
     };
     if let Some(target) = target {
-        view.diff_scroll = target.min(total.saturating_sub(height));
+        view.diff_scroll = target.min(g.max);
     } else if !forward {
         view.diff_scroll = 0;
     }
@@ -692,16 +737,21 @@ pub fn render(f: &mut Frame, app: &App) {
             Style::default().fg(DIM),
         ));
     }
-    if let Some((total, _)) = diff_metrics(app) {
-        if total > diff.height as usize {
-            let first = view.diff_scroll + 1;
-            let last = (view.diff_scroll + diff.height as usize).min(total);
+    if let Some(g) = diff_geometry(app) {
+        let wrap = if view.wrap { "wrapped · " } else { "" };
+        if g.max > 0 {
+            let first = g.scroll + 1;
+            let last = g.scroll + g.fits;
             block = block.title_bottom(
                 Line::from(Span::styled(
-                    format!(" lines {first}–{last} of {total} "),
+                    format!(" {wrap}lines {first}–{last} of {} ", g.len),
                     Style::default().fg(DIM),
                 ))
                 .right_aligned(),
+            );
+        } else if view.wrap {
+            block = block.title_bottom(
+                Line::from(Span::styled(" wrapped ", Style::default().fg(DIM))).right_aligned(),
             );
         }
     }
@@ -935,30 +985,220 @@ fn graph_spans(graph: &str, commit: Option<&Commit>, width: usize) -> Vec<Span<'
     spans
 }
 
-/// How long the diff pane's content is, and where each file's header sits in
-/// it, for scrolling and for `n`/`p`. `None` while there's nothing loaded.
-fn diff_metrics(app: &App) -> Option<(usize, Vec<usize>)> {
+/// The diff pane's content: the lines above the patch, then the patch, then
+/// a note if it was cut short. Lines are built only when asked for, since a
+/// patch can run to tens of thousands of them and a frame shows forty.
+struct Doc<'a> {
+    prefix: Vec<Line<'static>>,
+    changes: &'a Changes,
+}
+
+impl<'a> Doc<'a> {
+    fn new(view: &HistoryView, changes: &'a Changes, now: i64) -> Self {
+        Self {
+            prefix: prefix_lines(view, changes, now),
+            changes,
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.prefix.len() + self.changes.patch.len() + usize::from(self.changes.truncated)
+    }
+
+    fn line(&self, i: usize) -> Line<'static> {
+        if let Some(line) = self.prefix.get(i) {
+            return line.clone();
+        }
+        match self.changes.patch.get(i - self.prefix.len()) {
+            Some(line) => patch_line(line),
+            None => Line::from(Span::styled(
+                " … the diff stops here, a couple of megabytes in. t opens it in your git client.",
+                Style::default().fg(DIM),
+            )),
+        }
+    }
+
+    /// How far in a wrapped row starts: under the text rather than under
+    /// the line numbers, for a line of the patch. `None` for a line that is
+    /// never wrapped -- a file's header, whose rule is meant to run off the
+    /// edge.
+    fn indent(&self, i: usize) -> Option<usize> {
+        if i < self.prefix.len() {
+            return Some(1);
+        }
+        match self
+            .changes
+            .patch
+            .get(i - self.prefix.len())
+            .map(|l| l.kind)
+        {
+            Some(LineKind::File) => None,
+            Some(LineKind::Hunk | LineKind::Note) => Some(GUTTER),
+            Some(_) => Some(GUTTER + 1),
+            None => Some(1),
+        }
+    }
+
+    /// Screen rows line `i` takes up.
+    fn rows(&self, i: usize, width: usize, wrap: bool) -> usize {
+        match (wrap, self.indent(i)) {
+            (true, Some(indent)) => wrap_line(self.line(i), width, indent).len(),
+            _ => 1,
+        }
+    }
+
+    /// The line on screen as one or more rows.
+    fn render(&self, i: usize, width: usize, wrap: bool) -> Vec<Line<'static>> {
+        match (wrap, self.indent(i)) {
+            (true, Some(indent)) => wrap_line(self.line(i), width, indent),
+            _ => vec![self.line(i)],
+        }
+    }
+
+    fn file_starts(&self) -> Vec<usize> {
+        let prefix = self.prefix.len();
+        self.changes
+            .patch
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| l.kind == LineKind::File)
+            .map(|(i, _)| prefix + i)
+            .collect()
+    }
+
+    /// How many lines, from `from`, are at least partly on screen.
+    fn fits(&self, from: usize, width: usize, height: usize, wrap: bool) -> usize {
+        let mut rows = 0;
+        let mut i = from;
+        while i < self.len() && rows < height {
+            rows += self.rows(i, width, wrap);
+            i += 1;
+        }
+        i - from
+    }
+
+    /// The furthest down the top line can be while the pane still ends on
+    /// the last line rather than on empty space.
+    fn max_scroll(&self, width: usize, height: usize, wrap: bool) -> usize {
+        let len = self.len();
+        if !wrap {
+            return len.saturating_sub(height);
+        }
+        let mut rows = 0;
+        let mut i = len;
+        while i > 0 {
+            let r = self.rows(i - 1, width, wrap);
+            if rows + r > height {
+                break;
+            }
+            rows += r;
+            i -= 1;
+        }
+        i.min(len.saturating_sub(1))
+    }
+}
+
+/// Width of the line-number gutter on a line of the patch.
+const GUTTER: usize = 11;
+
+/// Break a line into rows of `width`, each after the first starting
+/// `indent` columns in, keeping every span's style across the breaks. A row
+/// breaks after its last space when there is one in its back two thirds, so
+/// prose wraps between words; code with no space to break at is cut where
+/// the row ends.
+fn wrap_line(line: Line<'static>, width: usize, indent: usize) -> Vec<Line<'static>> {
+    use unicode_width::UnicodeWidthChar;
+
+    if width <= indent + 1 || line.width() <= width {
+        return vec![line];
+    }
+    let cells: Vec<(char, Style, usize)> = line
+        .spans
+        .iter()
+        .flat_map(|span| {
+            let style = span.style;
+            span.content
+                .chars()
+                .map(move |ch| (ch, style, ch.width().unwrap_or(0)))
+        })
+        .collect();
+
+    let mut rows = Vec::new();
+    let mut start = 0;
+    while start < cells.len() {
+        let lead = if rows.is_empty() { 0 } else { indent };
+        let room = width - lead;
+        let mut end = start;
+        let mut used = 0;
+        while end < cells.len() && used + cells[end].2 <= room {
+            used += cells[end].2;
+            end += 1;
+        }
+        // Always take at least one character, or a character wider than the
+        // row would never be placed.
+        end = end.max(start + 1);
+        if end < cells.len() {
+            // Never back into the first row's gutter, whose spaces are
+            // padding rather than gaps between words.
+            let gutter = if rows.is_empty() { indent + 1 } else { 0 };
+            let floor = (start + (end - start) / 3).max(gutter);
+            if let Some(space) = (floor..end).rev().find(|i| cells[*i].0 == ' ') {
+                end = space + 1;
+            }
+        }
+
+        let mut spans = Vec::new();
+        if lead > 0 {
+            spans.push(Span::raw(" ".repeat(lead)));
+        }
+        let mut i = start;
+        while i < end {
+            let style = cells[i].1;
+            let mut text = String::new();
+            while i < end && cells[i].1 == style {
+                text.push(cells[i].0);
+                i += 1;
+            }
+            spans.push(Span::styled(text, style));
+        }
+        rows.push(Line::from(spans));
+        start = end;
+    }
+    rows
+}
+
+/// Where the diff pane is, in logical lines: how many there are, which one
+/// is at the top, how many of them are on screen, how far down the top can
+/// go, and where each file's header sits. `None` while nothing is loaded.
+struct Geometry {
+    len: usize,
+    scroll: usize,
+    fits: usize,
+    max: usize,
+    starts: Vec<usize>,
+}
+
+fn diff_geometry(app: &App) -> Option<Geometry> {
     let view = app.history.as_ref()?;
     let entry = view.selected()?;
     let Ok(changes) = view.changes.get(&entry)? else {
         return None;
     };
-    let prefix = prefix_lines(view, changes, app.now).len();
-    let starts = changes
-        .patch
-        .iter()
-        .enumerate()
-        .filter(|(_, l)| l.kind == LineKind::File)
-        .map(|(i, _)| prefix + i)
-        .collect();
-    Some((
-        prefix + changes.patch.len() + usize::from(changes.truncated),
-        starts,
-    ))
+    let doc = Doc::new(view, changes, app.now);
+    let pane = panes(app.area).1;
+    let (width, height) = (pane.width as usize, pane.height as usize);
+    let max = doc.max_scroll(width, height, view.wrap);
+    let scroll = view.diff_scroll.min(max);
+    Some(Geometry {
+        len: doc.len(),
+        scroll,
+        fits: doc.fits(scroll, width, height, view.wrap),
+        max,
+        starts: doc.file_starts(),
+    })
 }
 
 fn render_diff(f: &mut Frame, app: &App, view: &HistoryView, area: Rect) {
-    let dim = |text: String| Line::from(Span::styled(text, Style::default().fg(DIM)));
     let Some(entry) = view.selected() else {
         f.render_widget(Paragraph::new(Vec::<Line>::new()), area);
         return;
@@ -987,21 +1227,18 @@ fn render_diff(f: &mut Frame, app: &App, view: &HistoryView, area: Rect) {
         }
     };
 
-    let prefix = prefix_lines(view, changes, app.now);
-    let total = prefix.len() + changes.patch.len() + usize::from(changes.truncated);
-    let height = area.height as usize;
-    let scroll = view.diff_scroll.min(total.saturating_sub(height));
-    let lines: Vec<Line> = (scroll..(scroll + height).min(total))
-        .map(|i| {
-            if i < prefix.len() {
-                prefix[i].clone()
-            } else if let Some(line) = changes.patch.get(i - prefix.len()) {
-                patch_line(line)
-            } else {
-                dim(" … the diff stops here, a couple of megabytes in. t opens it in your git client.".into())
-            }
-        })
-        .collect();
+    let doc = Doc::new(view, changes, app.now);
+    let (width, height) = (area.width as usize, area.height as usize);
+    let scroll = view
+        .diff_scroll
+        .min(doc.max_scroll(width, height, view.wrap));
+    let mut lines: Vec<Line> = Vec::with_capacity(height);
+    let mut i = scroll;
+    while i < doc.len() && lines.len() < height {
+        lines.extend(doc.render(i, width, view.wrap));
+        i += 1;
+    }
+    lines.truncate(height);
     f.render_widget(Paragraph::new(lines), area);
 }
 
@@ -1363,6 +1600,50 @@ mod tests {
         // Detached, HEAD has no branch to fold into and keeps its own label.
         let detached = vec![label("HEAD", RefKind::Head), label("1.0", RefKind::Tag)];
         assert_eq!(compact_labels(&detached), detached);
+    }
+
+    fn texts(rows: &[Line]) -> Vec<String> {
+        rows.iter()
+            .map(|r| r.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect()
+    }
+
+    // A wrapped line keeps every character and every colour, and its
+    // continuation rows start under the text, not under the line numbers.
+    #[test]
+    fn a_long_line_wraps_under_its_text_with_its_colours() {
+        let line = Line::from(vec![
+            Span::styled("  12   12 ", Style::default().fg(DIM)),
+            Span::styled("+abcdefghij", Style::default().fg(CLEAN)),
+        ]);
+        let rows = wrap_line(line, 14, 11);
+        assert_eq!(
+            texts(&rows),
+            vec![
+                "  12   12 +abc",
+                "           def",
+                "           ghi",
+                "           j"
+            ]
+        );
+        assert!(rows[1].spans.iter().any(|s| s.style.fg == Some(CLEAN)));
+    }
+
+    // Prose breaks between words rather than through them.
+    #[test]
+    fn a_wrapped_line_breaks_at_a_space_when_it_can() {
+        let rows = wrap_line(Line::from(" staged and unstaged together"), 16, 1);
+        assert_eq!(
+            texts(&rows),
+            vec![" staged and ", " unstaged ", " together"]
+        );
+    }
+
+    // Short lines, and panes too narrow to wrap into, are left alone.
+    #[test]
+    fn a_line_that_fits_is_not_wrapped() {
+        assert_eq!(wrap_line(Line::from("short"), 14, 11).len(), 1);
+        assert_eq!(wrap_line(Line::from("x".repeat(50)), 12, 11).len(), 1);
     }
 
     #[test]

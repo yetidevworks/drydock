@@ -2,7 +2,7 @@
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::column::Column;
@@ -259,6 +259,9 @@ pub struct UiConfig {
     /// you get exactly what you list, in that order — the `c` key in the
     /// dashboard writes this.
     pub columns: Option<Vec<Column>>,
+    /// Wrap long lines in the history view's diff rather than cutting them
+    /// at the edge. The `W` key in that view writes this.
+    pub history_wrap: bool,
 }
 
 impl Default for UiConfig {
@@ -277,6 +280,7 @@ impl Default for UiConfig {
             ],
             file_manager_command: vec!["open".into(), "{path}".into()],
             columns: None,
+            history_wrap: false,
         }
     }
 }
@@ -422,17 +426,74 @@ pub fn missing_roots(roots: &[String]) -> Vec<String> {
 }
 
 pub fn save(cfg: &Config) -> Result<PathBuf> {
-    let dir = paths::config_dir()?;
-    std::fs::create_dir_all(&dir).with_context(|| format!("Creating {}", dir.display()))?;
     let path = paths::config_file()?;
-    let body = toml::to_string_pretty(cfg).context("Serializing config")?;
-    std::fs::write(&path, body).with_context(|| format!("Writing {}", path.display()))?;
+    write_to(&path, cfg)?;
     Ok(path)
+}
+
+/// Change one thing in the config file and leave the rest as the file has it.
+///
+/// This is what the dashboard's remembered settings go through, rather than
+/// [`save`] with the config it's running on: that config has `--root`
+/// folded into it, and writing it back would replace your configured roots
+/// with whatever one run was pointed at. A file that won't parse is left
+/// alone rather than overwritten with defaults.
+pub fn update(change: impl FnOnce(&mut Config)) -> Result<PathBuf> {
+    let path = paths::config_file()?;
+    update_at(&path, change)?;
+    Ok(path)
+}
+
+fn update_at(path: &Path, change: impl FnOnce(&mut Config)) -> Result<()> {
+    let mut cfg = if path.exists() {
+        let raw = std::fs::read_to_string(path)
+            .with_context(|| format!("Reading config at {}", path.display()))?;
+        toml::from_str(&raw).with_context(|| format!("Parsing config at {}", path.display()))?
+    } else {
+        Config::default()
+    };
+    change(&mut cfg);
+    write_to(path, &cfg)
+}
+
+fn write_to(path: &Path, cfg: &Config) -> Result<()> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).with_context(|| format!("Creating {}", dir.display()))?;
+    }
+    let body = toml::to_string_pretty(cfg).context("Serializing config")?;
+    std::fs::write(path, body).with_context(|| format!("Writing {}", path.display()))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // A remembered setting must not write a one-off `--root` over the roots
+    // in the file, which is what saving the running config used to do.
+    #[test]
+    fn an_update_keeps_what_the_file_says_about_everything_else() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "roots = [\"~/Projects\"]\n").unwrap();
+
+        update_at(&path, |cfg| cfg.ui.history_wrap = true).unwrap();
+
+        let cfg: Config = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(cfg.roots, vec!["~/Projects".to_string()]);
+        assert!(cfg.ui.history_wrap);
+    }
+
+    #[test]
+    fn an_update_leaves_a_file_it_cannot_read_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "roots = [unterminated").unwrap();
+        assert!(update_at(&path, |cfg| cfg.ui.history_wrap = true).is_err());
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "roots = [unterminated"
+        );
+    }
 
     #[test]
     fn durations_parse() {

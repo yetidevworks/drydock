@@ -393,11 +393,18 @@ impl App {
     }
 
     /// Write the current column list back to the config, so it survives a
-    /// restart. Everything else in the file is round-tripped untouched.
+    /// restart. Everything else in the file is left as the file has it.
     pub fn save_columns(&mut self) {
         let mut cfg = (*self.cfg).clone();
         cfg.ui.columns = Some(self.columns.clone());
-        match crate::config::save(&cfg) {
+        let columns = self.columns.clone();
+        // Showing VISIBILITY turns checking on with it, and that has to
+        // outlive the session as much as the column does.
+        let visibility = cfg.visibility.enabled;
+        match crate::config::update(|file| {
+            file.ui.columns = Some(columns);
+            file.visibility.enabled |= visibility;
+        }) {
             Ok(path) => {
                 self.cfg = Arc::new(cfg);
                 self.notify(format!(
@@ -1645,14 +1652,16 @@ pub async fn snapshot(width: u16, height: u16, view: &str, roots: Vec<String>) -
         "detail" => app.mode = Mode::Detail,
         "columns" => app.mode = Mode::Columns,
         // `history`, or `history:<name>` to open it on a particular repo.
-        v if v == "history" || v.starts_with("history:") => {
+        // `+wrap` turns wrapping on without touching the config.
+        v if v.starts_with("history") => {
             app.area = Rect::new(0, 0, width, height);
-            if let Some(name) = v.strip_prefix("history:") {
+            let wrap = v.contains("+wrap");
+            if let Some((_, name)) = v.split_once(':') {
                 if let Some(pos) = app.visible.iter().position(|i| app.repos[*i].name == name) {
                     app.selected = pos;
                 }
             }
-            history::open_now(&mut app).await;
+            history::open_now(&mut app, wrap).await;
         }
         "search" => {
             app.mode = Mode::Search;

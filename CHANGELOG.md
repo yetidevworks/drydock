@@ -1,3 +1,12 @@
+# 1.2.1
+
+## 09/23/2026
+
+1. [](#new)
+    * **`W` wraps long lines in the history view's diff**, and `W` again stops. Wrapped rows start under the code rather than under the line numbers, prose breaks between words, and the file header rules still run off the edge. The choice is remembered in `[ui] history_wrap`, so it's how the view opens next time.
+2. [](#bugfix)
+    * Saving a setting from the dashboard no longer writes a one-off `--root` into your config. The column picker saved the config the dashboard was running on, which has `--root` folded into it, so closing the picker during `drydock --root ~/scratch` replaced your configured roots with `~/scratch`. Settings are now written by reading the file, changing the one value, and writing it back, and a config file that won't parse is left alone rather than overwritten with defaults.
+
 # 1.2.0
 
 ## 09/23/2026

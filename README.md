@@ -169,6 +169,7 @@ The list is the branch you have checked out plus its upstream, so commits you ha
 | `j` `k` | step through the commits · `home` / `end` for the ends |
 | `J` `K` `pgdn` `pgup` | scroll the diff · `ctrl-d` / `ctrl-u` by half a page |
 | `n` `p` | jump to the next or previous file in the diff |
+| `W` | wrap long lines in the diff, or stop; remembered as `[ui] history_wrap` |
 | `a` | every branch and tag, or back to this branch and its upstream |
 | `y` | copy the commit hash |
 | `t` `o` `O` `T` `w` | hand off, the same as from the table |
@@ -464,6 +465,7 @@ interval = "24h"
 
 [ui]
 # columns = [...]            # unset = the defaults; the `C` key writes this
+history_wrap = false         # wrap long diff lines in the history view; `W` writes this
 default_filters = []         # e.g. ["dirty", "unpushed"]
 default_sort = "activity"
 default_since = ""           # e.g. "1w"
