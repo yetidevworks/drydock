@@ -46,8 +46,20 @@ pub struct Hold {
 
 impl Hold {
     /// True when this hold still describes what's checked out.
+    ///
+    /// Both hashes are git's abbreviated form (`%h`), and git lengthens that
+    /// as a repo gains objects: a fetch can turn `a1b2c3d` into `a1b2c3d4`
+    /// with HEAD untouched. Comparing them as strings then read the hold as
+    /// lifted, so it vanished without the repo having changed. Two
+    /// abbreviations of one commit always share the shorter as a prefix, so
+    /// that's the test.
     pub fn covers(&self, head_sha: Option<&str>) -> bool {
-        head_sha == Some(self.sha.as_str())
+        match head_sha {
+            Some(head) if !head.is_empty() && !self.sha.is_empty() => {
+                head.starts_with(self.sha.as_str()) || self.sha.starts_with(head)
+            }
+            _ => false,
+        }
     }
 
     /// `1.0.3 (a1b2c3d)`, or just the sha when the repo had no reachable tag.
@@ -260,6 +272,22 @@ mod tests {
         assert!(held.covers(Some("a1b2c3d")));
         assert!(!held.covers(Some("9999999")));
         assert!(!held.covers(None));
+    }
+
+    // Git lengthens abbreviated hashes as a repo grows, so the commit a hold
+    // was placed at can come back a character or two longer (or, on a fresh
+    // clone, shorter) with HEAD never having moved.
+    #[test]
+    fn a_hold_survives_git_lengthening_the_abbreviated_hash() {
+        let held = hold("a1b2c3d");
+        assert!(held.covers(Some("a1b2c3d4")));
+        assert!(held.covers(Some("a1b2c3d4e5")));
+        assert!(hold("a1b2c3d4e").covers(Some("a1b2c3d")));
+        // A different commit is still a different commit.
+        assert!(!held.covers(Some("a1b2c3e4")));
+        // An empty hash on either side never matches everything.
+        assert!(!held.covers(Some("")));
+        assert!(!hold("").covers(Some("a1b2c3d")));
     }
 
     #[test]

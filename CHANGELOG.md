@@ -1,3 +1,10 @@
+# 1.2.2
+
+## 10/06/2026
+
+1. [](#bugfix)
+    * A hold no longer lifts itself when the repo hasn't changed. Holds are pinned to git's short commit hash, and git makes those longer as a repo grows, so after a fetch the same commit could come back as `a1b2c3d4` instead of the `a1b2c3d` the hold was placed at. The two were compared as strings, so the hold read as lifted and the repo went back into "needs release". A hold now matches any abbreviation of the same commit.
+
 # 1.2.1
 
 ## 09/23/2026

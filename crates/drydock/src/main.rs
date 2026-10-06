@@ -538,7 +538,7 @@ async fn cmd_hold(path: Option<String>, note: Option<String>, roots: &[String]) 
     let file = hold::save(&holds)?;
 
     let what = match previous {
-        Some(prev) if prev.sha == sha => "Still holding",
+        Some(prev) if prev.covers(Some(&sha)) => "Still holding",
         Some(_) => "Re-held at the current commit:",
         None => "Held",
     };
