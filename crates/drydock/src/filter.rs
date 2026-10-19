@@ -373,18 +373,20 @@ pub fn sort_repos(repos: &mut [&RepoStatus], sort: Sort, reverse: bool) {
     repos.sort_by(|a, b| {
         let ord = match sort {
             Sort::Activity => a.activity_at().cmp(&b.activity_at()),
+            // By the name the table shows, so a worktree sorts in beside the
+            // repo it belongs to rather than under its folder's name.
             Sort::Name => a
-                .name
+                .display_name()
                 .to_ascii_lowercase()
-                .cmp(&b.name.to_ascii_lowercase()),
+                .cmp(&b.display_name().to_ascii_lowercase()),
             Sort::Group => a
                 .group
                 .to_ascii_lowercase()
                 .cmp(&b.group.to_ascii_lowercase())
                 .then_with(|| {
-                    a.name
+                    a.display_name()
                         .to_ascii_lowercase()
-                        .cmp(&b.name.to_ascii_lowercase())
+                        .cmp(&b.display_name().to_ascii_lowercase())
                 }),
             Sort::Dirty => a.dirty_total().cmp(&b.dirty_total()),
             // A repo nothing has probed yet sorts with the empty ones: this
@@ -500,6 +502,14 @@ pub fn score(needle: &str, repo: &RepoStatus) -> Option<u32> {
     if let Some(pos) = name.find(&needle) {
         return Some(10 + pos as u32);
     }
+    // A worktree answers to the repo it belongs to, so searching for that
+    // repo finds its worktrees too, just after the repo itself.
+    if let Some(pos) = repo
+        .worktree_origin()
+        .and_then(|origin| origin.to_ascii_lowercase().find(&needle))
+    {
+        return Some(50 + pos as u32);
+    }
     if let Some(pos) = slug.find(&needle) {
         return Some(100 + pos as u32);
     }
@@ -556,6 +566,7 @@ mod tests {
             changelog: None,
             is_bare: false,
             is_shallow: false,
+            worktree_of: None,
         });
         r.work = Some(WorkInfo {
             staged: 0,

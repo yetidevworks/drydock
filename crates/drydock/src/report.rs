@@ -192,6 +192,9 @@ pub fn detail(repo: &RepoStatus, now: i64) -> String {
 
     out.push_str(&format!("{}\n", repo.slug()));
     out.push_str(&format!("  path         {}\n", paths::contract(&repo.root)));
+    if let Some(origin) = repo.worktree_of() {
+        out.push_str(&format!("  worktree of  {}\n", paths::contract(origin)));
+    }
     out.push_str(&format!("  state        {}\n", repo.state_label()));
     out.push_str(&format!(
         "  release      {}\n",
@@ -433,6 +436,9 @@ pub struct RepoView<'a> {
     pub group: &'a str,
     pub name: &'a str,
     pub slug: String,
+    /// For a linked worktree, the checkout it was added from: the main
+    /// working tree, or the bare repo when there isn't one.
+    pub worktree_of: Option<&'a std::path::Path>,
     pub state: &'a str,
     /// `"held"` for a repo under a hold that still covers HEAD — see `hold`.
     /// A hold is opt-in and placed by hand, so nothing reads as held unless
@@ -533,6 +539,7 @@ pub fn view<'a>(repo: &'a RepoStatus, now: i64) -> RepoView<'a> {
         group: &repo.group,
         name: &repo.name,
         slug: repo.slug(),
+        worktree_of: repo.worktree_of(),
         state: repo.state_label(),
         release_state: repo.release_state().key(),
         release_state_raw: repo.release_state_raw().key(),
@@ -662,6 +669,7 @@ mod tests {
             changelog: None,
             is_bare: false,
             is_shallow: false,
+            worktree_of: None,
         });
 
         let v = view(&repo, 1_000);
@@ -700,6 +708,7 @@ mod tests {
             changelog: None,
             is_bare: false,
             is_shallow: false,
+            worktree_of: None,
         });
         repo.hold = Some(crate::hold::Hold {
             // What `branch()` puts on the fixture's only branch.

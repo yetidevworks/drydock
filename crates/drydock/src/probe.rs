@@ -702,6 +702,7 @@ mod tests {
             changelog: None,
             is_bare,
             is_shallow: false,
+            worktree_of: None,
         });
         status
     }
@@ -870,6 +871,7 @@ mod tests {
             changelog: None,
             is_bare: false,
             is_shallow: false,
+            worktree_of: None,
         });
         status
     }

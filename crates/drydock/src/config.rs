@@ -2,6 +2,7 @@
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -262,6 +263,12 @@ pub struct UiConfig {
     /// Wrap long lines in the history view's diff rather than cutting them
     /// at the edge. The `W` key in that view writes this.
     pub history_wrap: bool,
+    /// Widths set by dragging a column's edge in the dashboard header, in
+    /// characters including the gutter. A column listed here keeps its width
+    /// instead of the built-in one; double-clicking the edge takes it back
+    /// out. REPO is never listed: it takes whatever the others leave.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub column_widths: BTreeMap<Column, usize>,
 }
 
 impl Default for UiConfig {
@@ -281,6 +288,7 @@ impl Default for UiConfig {
             file_manager_command: vec!["open".into(), "{path}".into()],
             columns: None,
             history_wrap: false,
+            column_widths: BTreeMap::new(),
         }
     }
 }
@@ -481,6 +489,32 @@ mod tests {
         let cfg: Config = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(cfg.roots, vec!["~/Projects".to_string()]);
         assert!(cfg.ui.history_wrap);
+    }
+
+    // A dragged width has to come back on the next start, keyed by the same
+    // names `[ui] columns` uses -- and a config with none written has to stay
+    // free of an empty table nobody asked for.
+    #[test]
+    fn column_widths_round_trip_and_stay_out_of_the_file_when_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+
+        update_at(&path, |cfg| cfg.ui.history_wrap = true).unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(!raw.contains("column_widths"), "{raw}");
+
+        update_at(&path, |cfg| {
+            cfg.ui.column_widths.insert(Column::Branch, 30);
+            cfg.ui.column_widths.insert(Column::SinceTag, 4);
+        })
+        .unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(raw.contains("branch = 30"), "{raw}");
+        assert!(raw.contains("since_tag = 4"), "{raw}");
+
+        let cfg: Config = toml::from_str(&raw).unwrap();
+        assert_eq!(cfg.ui.column_widths.get(&Column::Branch), Some(&30));
+        assert_eq!(cfg.ui.column_widths.get(&Column::SinceTag), Some(&4));
     }
 
     #[test]

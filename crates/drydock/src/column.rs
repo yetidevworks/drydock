@@ -15,7 +15,7 @@ use crate::model::RepoStatus;
 use crate::paths;
 use crate::report::Align;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Column {
     Group,
@@ -40,6 +40,14 @@ pub enum Column {
     SinceTag,
     Age,
 }
+
+/// The most a branch name gets before it's truncated, in either table. Long
+/// enough for `feature/<something descriptive>`, which is what a worktree is
+/// usually checked out on and the part of the name that tells two apart.
+pub const BRANCH_CAP: usize = 32;
+
+/// The narrowest a column can be dragged: one character and its gutter.
+pub const MIN_WIDTH: usize = 2;
 
 /// How a column claims horizontal space in the dashboard. The CLI table sizes
 /// itself to its content instead, so this only matters to the TUI.
@@ -157,7 +165,7 @@ impl Column {
     pub fn describe(&self) -> &'static str {
         match self {
             Column::Group => "first path segment below the scan root",
-            Column::Repo => "repo name, or full path with --paths",
+            Column::Repo => "repo name, or full path with --paths; a worktree leads with its repo",
             Column::Branch => "current branch, or the detached HEAD",
             Column::State => "dirty, unpushed, conflict, bare, clean",
             Column::Release => "whether there's work past the newest tag",
@@ -239,10 +247,10 @@ impl Column {
                 if show_paths {
                     paths::contract(&repo.root)
                 } else {
-                    repo.name.clone()
+                    repo.display_name()
                 }
             }
-            Column::Branch => fmt::truncate(&repo.branch_label(), 24),
+            Column::Branch => fmt::truncate(&repo.branch_label(), BRANCH_CAP),
             Column::State => repo.state_label().to_string(),
             Column::Release => repo.release_state().label().to_string(),
             Column::Visibility => repo.visibility_label().to_string(),
@@ -435,6 +443,7 @@ mod tests {
             changelog: None,
             is_bare: false,
             is_shallow: false,
+            worktree_of: None,
         });
         assert_eq!(Column::Behind.cell(&repo, 0, false), "?");
         assert_eq!(Column::Fetched.cell(&repo, 0, false), "never");
@@ -479,6 +488,7 @@ mod tests {
             changelog: None,
             is_bare: false,
             is_shallow: false,
+            worktree_of: None,
         });
 
         // master is in sync, and says so -- with `*` so the topic branch
@@ -554,6 +564,7 @@ mod tests {
             changelog: None,
             is_bare: true,
             is_shallow: false,
+            worktree_of: None,
         });
         assert_eq!(Column::Stashes.cell(&repo, 0, false), "·");
 

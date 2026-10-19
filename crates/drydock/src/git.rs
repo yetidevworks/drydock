@@ -356,6 +356,7 @@ pub async fn probe_refs(root: &Path, cfg: &Config) -> Result<RefsInfo> {
         changelog: None,
         is_bare: cfg_scan.bare,
         is_shallow,
+        worktree_of: worktree_origin(&git_dir),
     };
 
     if cfg.release.read_changelog {
@@ -620,6 +621,26 @@ fn common_git_dir(git_dir: &Path) -> PathBuf {
         target
     } else {
         git_dir.join(target)
+    }
+}
+
+/// For a linked worktree, the checkout it was added from.
+///
+/// The shared git dir is either `<main checkout>/.git`, in which case the
+/// checkout is its parent, or a bare repo, which is its own answer. Either
+/// way it's read off the `commondir` pointer, so it costs one small file.
+fn worktree_origin(git_dir: &Path) -> Option<PathBuf> {
+    if !is_linked_worktree(git_dir) {
+        return None;
+    }
+    let common = common_git_dir(git_dir);
+    // `commondir` is usually `../..`, so the joined path needs resolving
+    // before its last segment means anything.
+    let common = common.canonicalize().unwrap_or(common);
+    if common.file_name().is_some_and(|n| n == ".git") {
+        common.parent().map(Path::to_path_buf)
+    } else {
+        Some(common)
     }
 }
 
@@ -1046,6 +1067,84 @@ mod tests {
             !is_bare(&repo.join("trunk")),
             "its worktree has a working tree"
         );
+        // A bare repo kept as `.git` inside its container is named for the
+        // container, which is the directory you'd recognise it by.
+        assert_eq!(
+            worktree_origin(&resolve_git_dir(&repo.join("trunk")).unwrap()),
+            Some(repo.canonicalize().unwrap())
+        );
+        assert_eq!(worktree_origin(&resolve_git_dir(&repo).unwrap()), None);
+    }
+
+    // The case from the dashboard: worktrees collected in a `_worktrees`
+    // folder, named for the feature rather than the repo, so nothing in the
+    // path says which repo each one is a checkout of.
+    #[test]
+    fn a_linked_worktree_knows_the_checkout_it_came_from() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("grav-theme-kahuna");
+        std::fs::create_dir_all(&main).unwrap();
+        git(&main, &["init", "-q", "-b", "main", "."]);
+        git(&main, &["commit", "-qm", "init", "--allow-empty"]);
+        git(
+            &main,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "../_worktrees/theme-blocks",
+                "-b",
+                "feature/theme-blocks",
+            ],
+        );
+
+        let side = dir.path().join("_worktrees/theme-blocks");
+        assert_eq!(
+            worktree_origin(&resolve_git_dir(&side).unwrap()),
+            Some(main.canonicalize().unwrap())
+        );
+        // The main checkout is not a worktree of anything.
+        assert_eq!(worktree_origin(&resolve_git_dir(&main).unwrap()), None);
+
+        let mut repo = RepoStatus::new(side, "g".into(), "_worktrees/theme-blocks".into());
+        repo.refs = Some(RefsInfo {
+            worktree_of: worktree_origin(&resolve_git_dir(&repo.root).unwrap()),
+            ..sample_refs()
+        });
+        assert_eq!(repo.display_name(), "grav-theme-kahuna ↳ theme-blocks");
+    }
+
+    fn sample_refs() -> RefsInfo {
+        RefsInfo {
+            head: Head::Branch("main".into()),
+            branches: Vec::new(),
+            last_commit: None,
+            stashes: 0,
+            operation: None,
+            newest_tag: None,
+            described_tag: None,
+            commits_since_tag: None,
+            since_tag_subjects: Vec::new(),
+            tags_orphaned: false,
+            index_mtime: None,
+            fetched_at: None,
+            remote_url: None,
+            changelog: None,
+            is_bare: false,
+            is_shallow: false,
+            worktree_of: None,
+        }
+    }
+
+    #[test]
+    fn a_bare_repo_named_dot_git_drops_the_suffix_as_an_origin() {
+        let mut repo = RepoStatus::new("/p/g/wt".into(), "g".into(), "wt".into());
+        repo.refs = Some(RefsInfo {
+            worktree_of: Some("/p/g/project.git".into()),
+            ..sample_refs()
+        });
+        assert_eq!(repo.worktree_origin().as_deref(), Some("project"));
+        assert_eq!(repo.name_parts(), ("project".into(), Some("wt".into())));
     }
 
     #[test]

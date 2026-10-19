@@ -126,7 +126,7 @@ Or, since it works as a git alias:
 | | |
 |---|---|
 | `j` `k` `↑` `↓` | move · `ctrl-d` / `ctrl-u` half a page · `home` / `end` ends |
-| mouse | click a row to select it · wheel moves the selection |
+| mouse | click a row to select it · wheel moves the selection · drag a header edge to resize a column, double-click it to reset |
 | `⏎` | detail view: branches, commits since the last tag, changed files |
 | `space` | history: recent commits and what each one changed, `space` again to close |
 | mouse | wheel scrolls the help and detail panes, and moves the column picker |
@@ -327,6 +327,14 @@ containing them, and a bare repo has no working tree for anything to be
 contained *in* — so it's descended into regardless. A checkout genuinely
 nested inside a working tree is still pruned.
 
+Any linked worktree, wherever it was checked out, leads its REPO cell with
+the repo it belongs to: `grav-theme-kahuna ↳ kahuna-theme-blocks`. That's read
+from git's own worktree pointer rather than guessed from the folder name, so
+a `_worktrees/` folder full of feature names still tells you whose each one
+is. Worktrees sort in beside their repo by name, searching for a repo finds
+its worktrees too, and `⏎`, `drydock show` and `--json` (`worktree_of`) give
+the full path of the checkout it came from.
+
 ### Visibility
 
 The VISIBILITY column shows whether each repo is public, private, or (on
@@ -414,6 +422,32 @@ Turning it back off leaves checking on, since `--public`, `--private` and
 `--json` still read it; set `visibility.enabled = false` yourself to stop the
 API traffic.
 
+### Column widths
+
+Drag an edge in the column header to make a column wider or narrower. Moving
+the mouse along the header lights up the edge under it with a `│` and the
+column it resizes in the accent colour, and the footer shows the width as you
+drag. Letting go saves it to `[ui] column_widths`, so it's the same next time:
+
+```toml
+[ui]
+column_widths = { branch = 30, group = 10 }
+```
+
+Double-click an edge to put that column back on its automatic width. A
+dragged BRANCH width replaces the automatic sizing to fit the branch names.
+
+REPO is the one column you don't size directly: it takes whatever the others
+leave, which is what keeps the counts on the right in the same place as the
+terminal resizes. So left of REPO an edge resizes the column before it, and
+right of REPO it resizes the column after it, and either way the edge goes
+where the mouse goes. On a terminal too narrow for the widths you dragged, they
+give way, back as far as their automatic widths, before REPO drops under 20
+characters. The saved widths are left alone, so they come back when the
+window is wide enough again.
+
+The plain `drydock list` table sizes itself to its content and ignores these.
+
 ## Configuration
 
 `drydock config init` writes the defaults to
@@ -466,6 +500,7 @@ interval = "24h"
 [ui]
 # columns = [...]            # unset = the defaults; the `C` key writes this
 history_wrap = false         # wrap long diff lines in the history view; `W` writes this
+# column_widths = { ... }    # dragged header widths; dragging an edge writes this
 default_filters = []         # e.g. ["dirty", "unpushed"]
 default_sort = "activity"
 default_since = ""           # e.g. "1w"

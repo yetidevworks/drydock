@@ -13,11 +13,14 @@ use ratatui::{
 };
 
 use crossterm::event::KeyModifiers;
+use std::collections::BTreeMap;
 
 use super::{App, Mode};
-use crate::column::{Column, Width};
+use crate::column::{Column, Width, BRANCH_CAP};
 use crate::fmt;
-use crate::model::{ChangeKind, ReleaseState, RepoStatus, Visibility, VisibilityStatus};
+use crate::model::{
+    ChangeKind, ReleaseState, RepoStatus, Visibility, VisibilityStatus, WORKTREE_MARK,
+};
 use crate::paths;
 use crate::report::Align;
 
@@ -45,19 +48,49 @@ pub(super) const CLEAN: Color = Color::Green;
 const PRIVATE: Color = Color::Blue;
 const INTERNAL: Color = Color::Cyan;
 
+/// How much room the two content-sized columns would like, measured over the
+/// rows that pass the filters. Each includes the one-space gutter.
+#[derive(Clone, Copy, Default)]
+struct ColumnWants {
+    /// What nearly every row's branch needs: a high percentile, so one long
+    /// name can't claim the column on its own.
+    branch_typical: usize,
+    /// The longest branch name listed.
+    branch_longest: usize,
+    /// The longest REPO cell listed.
+    name: usize,
+}
+
 /// The columns on screen, left to right, with the width each one resolved to
 /// for this terminal. Which columns are in here comes from the config (see
 /// [`crate::column`]); only the widths are worked out here.
-struct TableLayout {
-    columns: Vec<(Column, usize)>,
+pub(super) struct TableLayout {
+    pub(super) columns: Vec<(Column, usize)>,
 }
 
+/// The least the REPO column is left with when dragged widths need more than
+/// the terminal has. Below this the dragged columns give way instead, back
+/// as far as their built-in widths.
+const REPO_MIN: usize = 20;
+
 impl TableLayout {
-    fn for_width(width: usize, branch_want: usize, columns: &[Column]) -> Self {
+    fn for_width(
+        width: usize,
+        wants: ColumnWants,
+        columns: &[Column],
+        dragged: &BTreeMap<Column, usize>,
+    ) -> Self {
         // Every fixed column takes what it takes, the branch column takes only
         // what the branch names on screen need, and the repo name absorbs the
         // rest. That keeps the right-hand numbers in the same place as the
-        // terminal resizes, which is what makes the table scannable.
+        // terminal resizes, which is what makes the table scannable. A width
+        // somebody dragged replaces the built-in one, whichever kind it was.
+        //
+        // The branch column's own width is worked out against the built-in
+        // widths, not the dragged ones: dragging TAG wider should cost REPO
+        // the difference and leave BRANCH where it was, and on a narrow
+        // terminal BRANCH mustn't be squeezed out by widths that are about to
+        // give way anyway.
         let fixed: usize = columns
             .iter()
             .filter_map(|c| match c.width() {
@@ -69,29 +102,169 @@ impl TableLayout {
 
         // Nearly every repo sits on `main` or `develop`, so a fixed share of
         // the leftover left a wide strip of empty space next to truncated repo
-        // names. Long branch names still get room, up to a cap, and never more
-        // than half the leftover -- and never more than there is, or the age
-        // column would be pushed off the right edge.
+        // names. The branch column is guaranteed what most of its rows need,
+        // and gets the longest name it lists whenever the repo names would
+        // still fit beside it -- so the handful of `feature/…` worktrees in a
+        // fleet of `develop` aren't cut to eight characters while the REPO
+        // column sits half empty. Never more than half the leftover, and never
+        // more than there is, or the age column would be pushed off the edge.
         let branch = if columns.contains(&Column::Branch) {
-            branch_want.clamp(7, 24).min(leftover / 2)
+            let floor = wants.branch_typical.clamp(7, BRANCH_CAP);
+            let spare = leftover.saturating_sub(wants.name);
+            wants
+                .branch_longest
+                .clamp(7, BRANCH_CAP)
+                .min(spare.max(floor))
+                .min(leftover / 2)
         } else {
             0
         };
-        let fill = leftover.saturating_sub(branch);
+
+        // What each column would get with nobody's hand on it, which is as
+        // far as a dragged width gives way on a terminal too narrow for it.
+        let built_in = |c: &Column| match c.width() {
+            Width::Fixed(w) => w,
+            Width::Branch => branch,
+            Width::Fill => 0,
+        };
+        let mut widths: Vec<usize> = columns
+            .iter()
+            .map(|c| match c.width() {
+                Width::Fill => 0,
+                _ => dragged.get(c).copied().unwrap_or_else(|| built_in(c)),
+            })
+            .collect();
+
+        // Widths dragged out on a wide terminal mustn't push AGE off the edge
+        // of a narrow one. The widest dragged column gives up a character at
+        // a time until REPO has its minimum back or nothing dragged is above
+        // its built-in width; the saved widths are untouched, so they return
+        // as soon as there's room.
+        let budget = width.saturating_sub(REPO_MIN);
+        while widths.iter().sum::<usize>() > budget {
+            let widest = columns
+                .iter()
+                .enumerate()
+                .filter(|(i, c)| dragged.contains_key(c) && widths[*i] > built_in(c))
+                .max_by_key(|(i, _)| widths[*i])
+                .map(|(i, _)| i);
+            match widest {
+                Some(i) => widths[i] -= 1,
+                None => break,
+            }
+        }
+        let fill = width.saturating_sub(widths.iter().sum());
 
         let columns = columns
             .iter()
-            .map(|c| {
-                let w = match c.width() {
-                    Width::Fixed(w) => w,
-                    Width::Branch => branch,
-                    Width::Fill => fill,
-                };
-                (*c, w)
-            })
+            .zip(widths)
+            .map(|(c, w)| (*c, if c.width() == Width::Fill { fill } else { w }))
             .collect();
         Self { columns }
     }
+
+    /// The draggable edges, as boundaries between neighbouring columns.
+    ///
+    /// REPO takes up the slack, so the column that resizes is the one on the
+    /// far side of the edge from REPO: left of it, dragging an edge right
+    /// widens the column to its left; right of it, the table is anchored to
+    /// the right border, so dragging an edge left widens the column to its
+    /// right. Either way the edge goes where the mouse does.
+    pub(super) fn edges(&self) -> Vec<Edge> {
+        let repo = self
+            .columns
+            .iter()
+            .position(|(c, _)| c.width() == Width::Fill)
+            .unwrap_or(self.columns.len());
+        let mut x = 0;
+        let mut edges = Vec::new();
+        for i in 1..self.columns.len() {
+            x += self.columns[i - 1].1;
+            let (resizes, sign) = if i <= repo { (i - 1, 1) } else { (i, -1) };
+            let (column, width) = self.columns[resizes];
+            edges.push(Edge {
+                index: i,
+                x,
+                column,
+                width,
+                sign,
+            });
+        }
+        edges
+    }
+}
+
+/// One draggable boundary in the header: where it sits, and which column it
+/// resizes in which direction.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct Edge {
+    /// Which boundary: the one before `columns[index]`.
+    pub(super) index: usize,
+    /// Characters from the table's left edge to the first character of the
+    /// column after the boundary.
+    pub(super) x: usize,
+    pub(super) column: Column,
+    pub(super) width: usize,
+    /// `1` when dragging right widens `column`, `-1` when it narrows it.
+    pub(super) sign: i32,
+}
+
+/// What the column sizing needs to know about the rows, measured over every
+/// row that passes the filters -- not just the ones on screen, so the columns
+/// hold still while scrolling.
+fn column_wants(app: &App) -> ColumnWants {
+    let mut branch_widths: Vec<usize> = app
+        .visible
+        .iter()
+        .map(|idx| app.repos[*idx].branch_label().chars().count() + 1)
+        .collect();
+    branch_widths.sort_unstable();
+    ColumnWants {
+        branch_typical: branch_widths
+            .get(branch_widths.len().saturating_sub(1) * 95 / 100)
+            .copied()
+            .unwrap_or(0),
+        branch_longest: branch_widths.last().copied().unwrap_or(0),
+        name: app
+            .visible
+            .iter()
+            .map(|idx| app.repos[*idx].display_name().chars().count() + 1)
+            .max()
+            .unwrap_or(0),
+    }
+}
+
+/// The table's columns as the next frame will draw them, for a terminal of
+/// this size. The mouse handler asks this rather than remembering the last
+/// frame, so a drag can't act on a layout that's since moved.
+pub(super) fn table_layout(app: &App, area: Rect) -> TableLayout {
+    TableLayout::for_width(
+        table_inner_width(area),
+        column_wants(app),
+        &app.columns,
+        &app.column_widths,
+    )
+}
+
+/// Inside the table's left and right borders.
+fn table_inner_width(area: Rect) -> usize {
+    area.width.saturating_sub(2) as usize
+}
+
+/// Screen row of the column header, where the edges can be dragged.
+pub fn table_header_row(area: Rect) -> u16 {
+    table_first_row(area) - 1
+}
+
+/// The edge a mouse at this screen column is on, if any. The gutter space at
+/// the end of a column and the first character after it both count: a
+/// one-character target is easy to miss with a mouse.
+pub(super) fn edge_at(layout: &TableLayout, area: Rect, x: u16) -> Option<Edge> {
+    let x = (x as usize).checked_sub(area.x as usize + 1)?;
+    layout
+        .edges()
+        .into_iter()
+        .find(|e| x + 1 == e.x || x == e.x)
 }
 
 /// How many repo rows fit, so the app can scroll by the right amount.
@@ -328,23 +501,13 @@ fn render_table(f: &mut Frame, app: &App, area: Rect) {
     if inner.height < 2 {
         return;
     }
-    // Size the branch column from every row that passes the filters, not just
-    // the ones on screen, so it holds still while scrolling. Take a high
-    // percentile rather than the longest name: nearly every repo is on `main`
-    // or `develop`, and one `codex/some-experiment-branch` should truncate
-    // rather than tax all 500 rows with a column of empty space.
-    let mut branch_widths: Vec<usize> = app
-        .visible
-        .iter()
-        .map(|idx| app.repos[*idx].branch_label().chars().count() + 1)
-        .collect();
-    branch_widths.sort_unstable();
-    let branch_want = branch_widths
-        .get(branch_widths.len().saturating_sub(1) * 95 / 100)
-        .copied()
-        .unwrap_or(0);
-    let layout = TableLayout::for_width(inner.width as usize, branch_want, &app.columns);
-    let mut lines = vec![header_line(&layout)];
+    let layout = TableLayout::for_width(
+        inner.width as usize,
+        column_wants(app),
+        &app.columns,
+        &app.column_widths,
+    );
+    let mut lines = vec![header_line(&layout, app.active_edge())];
 
     let rows = inner.height.saturating_sub(1) as usize;
     let end = (app.scroll + rows).min(app.visible.len());
@@ -381,20 +544,97 @@ fn render_table(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(Paragraph::new(lines), inner);
 }
 
-fn header_line(layout: &TableLayout) -> Line<'static> {
+/// The REPO cell. A linked worktree reads `origin ↳ worktree`, with the
+/// marker in the accent colour so worktrees can be picked out going down the
+/// column. When the cell is too narrow for both, the worktree's own name is
+/// what gets cut: the origin is the half that says whose it is.
+fn name_spans(repo: &RepoStatus, width: usize, style: Style) -> Vec<Span<'static>> {
+    let room = width.saturating_sub(1);
+    let (origin, own) = repo.name_parts();
+    let Some(own) = own.filter(|_| room >= 4) else {
+        return vec![Span::styled(
+            pad(&fmt::truncate(&origin, room), width),
+            style,
+        )];
+    };
+
+    let mark = Style::default().fg(ACCENT);
+    let lead = origin.chars().count() + WORKTREE_MARK.chars().count() + 2;
+    let (spans, used) = if lead + 4 <= room {
+        let own = fmt::truncate(&own, room - lead);
+        let used = lead + own.chars().count();
+        (
+            vec![
+                Span::styled(format!("{origin} "), style),
+                Span::styled(format!("{WORKTREE_MARK} "), mark),
+                Span::styled(own, style),
+            ],
+            used,
+        )
+    } else {
+        // Not even a few characters of the worktree's name fit, so keep the
+        // marker and as much of the origin as there's room for.
+        let origin = fmt::truncate(&origin, room.saturating_sub(2));
+        let used = origin.chars().count() + 2;
+        (
+            vec![
+                Span::styled(format!("{origin} "), style),
+                Span::styled(WORKTREE_MARK.to_string(), mark),
+            ],
+            used,
+        )
+    };
+    let mut spans = spans;
+    spans.push(Span::styled(" ".repeat(width.saturating_sub(used)), style));
+    spans
+}
+
+/// The column header. While the mouse is over an edge, or dragging one, the
+/// column it resizes is lit in the accent colour and a `│` marks the edge
+/// itself, in whichever gutter space sits beside it -- a terminal can't show
+/// a resize cursor, so this is how the header says it can be dragged.
+fn header_line(layout: &TableLayout, active: Option<usize>) -> Line<'static> {
     let style = Style::default().fg(DIM).add_modifier(Modifier::BOLD);
-    let spans: Vec<Span<'static>> = layout
+    let hot = Style::default().fg(ACCENT).add_modifier(Modifier::BOLD);
+    let edge = active.and_then(|i| layout.edges().into_iter().find(|e| e.index == i));
+
+    let cells: Vec<String> = layout
         .columns
         .iter()
         .map(|(col, w)| {
             let text = col.header(false);
-            let cell = match col.align() {
-                Align::Right => rpad(text, *w),
-                Align::Left => pad(text, *w),
-            };
-            Span::styled(cell, style)
+            match col.align() {
+                Align::Right => rcell(text, *w),
+                Align::Left => lcell(text, *w),
+            }
         })
         .collect();
+
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut marked = false;
+    for (i, ((col, _), cell)) in layout.columns.iter().zip(&cells).enumerate() {
+        let cell_style = if edge.is_some_and(|e| e.column == *col) {
+            hot
+        } else {
+            style
+        };
+        if let Some(e) = edge.filter(|_| !marked) {
+            if i + 1 == e.index && cell.ends_with(' ') {
+                let body: String = cell.chars().take(cell.chars().count() - 1).collect();
+                spans.push(Span::styled(body, cell_style));
+                spans.push(Span::styled("│", hot));
+                marked = true;
+                continue;
+            }
+            if i == e.index && cell.starts_with(' ') {
+                spans.push(Span::styled("│", hot));
+                spans.push(Span::styled(cell[1..].to_string(), cell_style));
+                marked = true;
+                continue;
+            }
+        }
+        spans.push(Span::styled(cell.clone(), cell_style));
+    }
     Line::from(spans)
 }
 
@@ -431,28 +671,33 @@ fn repo_line(repo: &RepoStatus, layout: &TableLayout, now: i64, selected: bool) 
     let mut spans: Vec<Span<'static>> = layout
         .columns
         .iter()
-        .map(|(col, w)| {
+        .flat_map(|(col, w)| {
             let w = *w;
-            match col {
-                Column::Group => Span::styled(pad(&repo.group, w), base.fg(DIM)),
-                Column::Repo => Span::styled(
-                    pad(&fmt::truncate(&repo.name, w.saturating_sub(1)), w),
-                    if flags.clean() {
-                        base
-                    } else {
-                        base.add_modifier(Modifier::BOLD)
-                    },
-                ),
+            let span = match col {
+                Column::Group => Span::styled(lcell(&repo.group, w), base.fg(DIM)),
+                // The one cell that's more than one span: a worktree's name
+                // is in two parts, and they're styled apart.
+                Column::Repo => {
+                    return name_spans(
+                        repo,
+                        w,
+                        if flags.clean() {
+                            base
+                        } else {
+                            base.add_modifier(Modifier::BOLD)
+                        },
+                    )
+                }
                 Column::Branch => Span::styled(
-                    pad(&fmt::truncate(&repo.branch_label(), w.saturating_sub(1)), w),
+                    lcell(&fmt::truncate(&repo.branch_label(), w.saturating_sub(1)), w),
                     base.fg(if flags.detached { TROUBLE } else { Color::Blue }),
                 ),
                 Column::State => Span::styled(
-                    pad(&format!("{marker} {}", repo.state_label()), w),
+                    lcell(&format!("{marker} {}", repo.state_label()), w),
                     Style::default().fg(state_colour),
                 ),
                 Column::Release => Span::styled(
-                    pad(&release_cell(repo), w),
+                    lcell(&release_cell(repo), w),
                     match repo.release_state() {
                         ReleaseState::NeedsRelease => Style::default().fg(UNRELEASED),
                         ReleaseState::Unreleased => base.fg(DIM),
@@ -463,11 +708,12 @@ fn repo_line(repo: &RepoStatus, layout: &TableLayout, now: i64, selected: bool) 
                         ReleaseState::Held => base.fg(DIM),
                     },
                 ),
-                Column::Visibility => {
-                    Span::styled(pad(&visibility_cell(repo), w), visibility_style(repo, base))
-                }
+                Column::Visibility => Span::styled(
+                    lcell(&visibility_cell(repo), w),
+                    visibility_style(repo, base),
+                ),
                 Column::VisibilityShort => Span::styled(
-                    pad(repo.visibility_marker(), w),
+                    lcell(repo.visibility_marker(), w),
                     visibility_style(repo, base),
                 ),
                 Column::Changes => {
@@ -485,7 +731,7 @@ fn repo_line(repo: &RepoStatus, layout: &TableLayout, now: i64, selected: bool) 
                             }
                         });
                     Span::styled(
-                        pad(&fmt::truncate(&changes, w.saturating_sub(1)), w),
+                        lcell(&fmt::truncate(&changes, w.saturating_sub(1)), w),
                         base.fg(if flags.dirty { DIRTY } else { DIM }),
                     )
                 }
@@ -496,9 +742,9 @@ fn repo_line(repo: &RepoStatus, layout: &TableLayout, now: i64, selected: bool) 
                     // state is in STATE and CHANGES, and this shouldn't
                     // out-shout them.
                     match repo.stash_count() {
-                        Some(n) if n > 0 => Span::styled(rpad(&n.to_string(), w), base.fg(DIRTY)),
-                        Some(_) => Span::styled(rpad("·", w), base.fg(DIM)),
-                        None => Span::styled(rpad("?", w), base.fg(DIM)),
+                        Some(n) if n > 0 => Span::styled(rcell(&n.to_string(), w), base.fg(DIRTY)),
+                        Some(_) => Span::styled(rcell("·", w), base.fg(DIM)),
+                        None => Span::styled(rcell("?", w), base.fg(DIM)),
                     }
                 }
                 // Both counts are the checked-out branch's, matching BRANCH
@@ -509,7 +755,7 @@ fn repo_line(repo: &RepoStatus, layout: &TableLayout, now: i64, selected: bool) 
                     let ahead = repo.branch_unpushed();
                     let text = fmt::marked(fmt::count(ahead), repo.other_branches_unpushed());
                     Span::styled(
-                        rpad(&text, w),
+                        rcell(&text, w),
                         base.fg(if ahead > 0 { UNPUSHED } else { DIM }),
                     )
                 }
@@ -519,27 +765,30 @@ fn repo_line(repo: &RepoStatus, layout: &TableLayout, now: i64, selected: bool) 
                     // against a remote, which is not the same as in sync.
                     if behind > 0 {
                         let text = fmt::marked(fmt::count(behind), repo.other_branches_behind());
-                        Span::styled(rpad(&text, w), base.fg(BEHIND).add_modifier(Modifier::BOLD))
+                        Span::styled(
+                            rcell(&text, w),
+                            base.fg(BEHIND).add_modifier(Modifier::BOLD),
+                        )
                     } else if repo.never_fetched() && repo.behind_total() == 0 {
-                        Span::styled(rpad("?", w), base.fg(DIM))
+                        Span::styled(rcell("?", w), base.fg(DIM))
                     } else {
                         let text = fmt::marked("·".to_string(), repo.other_branches_behind());
-                        Span::styled(rpad(&text, w), base.fg(DIM))
+                        Span::styled(rcell(&text, w), base.fg(DIM))
                     }
                 }
                 Column::Fetched => {
                     let text = crate::column::fetched_label(repo, now);
                     Span::styled(
-                        rpad(&text, w),
+                        rcell(&text, w),
                         base.fg(if text == "never" { BEHIND } else { DIM }),
                     )
                 }
                 Column::Tag => Span::styled(
-                    pad(&fmt::truncate(&repo.tag_label(), w.saturating_sub(1)), w),
+                    lcell(&fmt::truncate(&repo.tag_label(), w.saturating_sub(1)), w),
                     base.fg(DIM),
                 ),
                 Column::SinceTag => Span::styled(
-                    rpad(&fmt::count(repo.commits_since_tag()), w),
+                    rcell(&fmt::count(repo.commits_since_tag()), w),
                     base.fg(if repo.commits_since_tag() > 0 {
                         UNRELEASED
                     } else {
@@ -547,9 +796,10 @@ fn repo_line(repo: &RepoStatus, layout: &TableLayout, now: i64, selected: bool) 
                     }),
                 ),
                 Column::Age => {
-                    Span::styled(rpad(&fmt::age(repo.activity_at(), now), w), base.fg(DIM))
+                    Span::styled(rcell(&fmt::age(repo.activity_at(), now), w), base.fg(DIM))
                 }
-            }
+            };
+            vec![span]
         })
         .collect();
 
@@ -844,6 +1094,10 @@ fn render_help(f: &mut Frame, app: &App, area: Rect) -> u16 {
                 ("ctrl-d / ctrl-u", "half a page"),
                 ("home / end", "first and last row"),
                 ("click", "select that row"),
+                (
+                    "header edge",
+                    "drag to resize a column, double-click to reset it",
+                ),
                 ("wheel", "move the selection, or scroll the detail view"),
                 ("enter", "open the detail view"),
                 (
@@ -1066,6 +1320,12 @@ fn render_detail(f: &mut Frame, app: &App, area: Rect) -> u16 {
         label("path"),
         Span::raw(paths::contract(&repo.root)),
     ]));
+    if let Some(origin) = repo.worktree_of() {
+        lines.push(Line::from(vec![
+            label("worktree of"),
+            Span::raw(paths::contract(origin)),
+        ]));
+    }
     lines.push(Line::from(vec![
         label("state"),
         Span::styled(
@@ -1372,6 +1632,18 @@ pub(super) fn pad(text: &str, width: usize) -> String {
     }
 }
 
+/// A table cell, left-aligned. Unlike [`pad`] it always keeps the one-space
+/// gutter, so a column dragged narrower than its content truncates rather
+/// than running into the next one.
+fn lcell(text: &str, width: usize) -> String {
+    pad(&fmt::truncate(text, width.saturating_sub(1)), width)
+}
+
+/// A table cell, right-aligned, with the same guaranteed gutter.
+fn rcell(text: &str, width: usize) -> String {
+    rpad(&fmt::truncate(text, width.saturating_sub(1)), width)
+}
+
 fn rpad(text: &str, width: usize) -> String {
     let len = text.chars().count();
     if len >= width {
@@ -1388,5 +1660,274 @@ fn humanize_window(secs: u64) -> String {
         s if s < 604_800 => format!("{}d", s / 86_400),
         s if s < 2_592_000 => format!("{}w", s / 604_800),
         s => format!("{}mo", s / 2_592_000),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{Head, RefsInfo};
+
+    fn branch_width(layout: &TableLayout) -> usize {
+        layout
+            .columns
+            .iter()
+            .find(|(c, _)| *c == Column::Branch)
+            .map(|(_, w)| *w)
+            .unwrap()
+    }
+
+    // The screenshot this came from: a wide terminal, a REPO column half
+    // empty, and `feature/theme-blocks` cut to `feature/…` because 95% of
+    // the fleet sits on `develop`.
+    #[test]
+    fn a_long_branch_gets_its_room_when_the_repo_names_leave_it() {
+        let columns = Column::defaults(true);
+        let wants = ColumnWants {
+            branch_typical: "develop".len() + 1,
+            branch_longest: "feature/home-version-line".len() + 1,
+            name: 40,
+        };
+        let layout = TableLayout::for_width(200, wants, &columns, &BTreeMap::new());
+        assert_eq!(branch_width(&layout), wants.branch_longest);
+    }
+
+    // On a narrow terminal the repo names come first: the branch column
+    // falls back to what most rows need, and the long one truncates.
+    #[test]
+    fn a_long_branch_still_truncates_when_the_repo_names_need_the_room() {
+        let columns = Column::defaults(true);
+        let wants = ColumnWants {
+            branch_typical: "develop".len() + 1,
+            branch_longest: "feature/home-version-line".len() + 1,
+            name: 40,
+        };
+        let layout = TableLayout::for_width(130, wants, &columns, &BTreeMap::new());
+        assert_eq!(branch_width(&layout), "develop".len() + 1);
+    }
+
+    #[test]
+    fn no_branch_is_given_more_than_the_cap() {
+        let wants = ColumnWants {
+            branch_typical: 8,
+            branch_longest: 80,
+            name: 10,
+        };
+        let layout = TableLayout::for_width(300, wants, &Column::defaults(true), &BTreeMap::new());
+        assert_eq!(branch_width(&layout), BRANCH_CAP);
+    }
+
+    fn width_of(layout: &TableLayout, column: Column) -> usize {
+        layout
+            .columns
+            .iter()
+            .find(|(c, _)| *c == column)
+            .map(|(_, w)| *w)
+            .unwrap()
+    }
+
+    fn develop_fleet() -> ColumnWants {
+        ColumnWants {
+            branch_typical: 8,
+            branch_longest: 8,
+            name: 30,
+        }
+    }
+
+    // A dragged width replaces the built-in one -- including BRANCH's, which
+    // would otherwise size itself to the names listed -- and REPO takes up
+    // the difference, so everything right of it stays where it was.
+    #[test]
+    fn a_dragged_width_wins_and_repo_takes_up_the_difference() {
+        let columns = Column::defaults(true);
+        let before = TableLayout::for_width(200, develop_fleet(), &columns, &BTreeMap::new());
+        let dragged = BTreeMap::from([(Column::Branch, 30), (Column::Group, 8)]);
+        let after = TableLayout::for_width(200, develop_fleet(), &columns, &dragged);
+
+        assert_eq!(width_of(&after, Column::Branch), 30);
+        assert_eq!(width_of(&after, Column::Group), 8);
+        assert_eq!(
+            width_of(&after, Column::Repo),
+            width_of(&before, Column::Repo) - (30 - width_of(&before, Column::Branch)) + (14 - 8)
+        );
+        let total: usize = after.columns.iter().map(|(_, w)| w).sum();
+        assert_eq!(total, 200);
+    }
+
+    // Widths dragged out on a wide terminal give way on a narrow one, back
+    // as far as their built-in widths, rather than pushing AGE off the edge.
+    #[test]
+    fn dragged_widths_give_way_on_a_narrow_terminal() {
+        let columns = Column::defaults(true);
+        let dragged = BTreeMap::from([(Column::Branch, 40), (Column::Tag, 30)]);
+        let layout = TableLayout::for_width(150, develop_fleet(), &columns, &dragged);
+        let total: usize = layout.columns.iter().map(|(_, w)| w).sum();
+        assert_eq!(total, 150);
+        assert_eq!(width_of(&layout, Column::Repo), REPO_MIN);
+        // The wider one gave up the most.
+        assert!(width_of(&layout, Column::Branch) < 40);
+        assert!(width_of(&layout, Column::Tag) < 30);
+
+        // Far too narrow for even the built-in widths: the dragged columns
+        // stop at those, and the table is no worse off than with no drags.
+        let tiny = TableLayout::for_width(90, develop_fleet(), &columns, &dragged);
+        let plain = TableLayout::for_width(90, develop_fleet(), &columns, &BTreeMap::new());
+        assert_eq!(width_of(&tiny, Column::Tag), width_of(&plain, Column::Tag));
+        assert_eq!(
+            width_of(&tiny, Column::Branch),
+            width_of(&plain, Column::Branch)
+        );
+    }
+
+    // Found by hand: TAG dragged to 54 on a wide terminal squeezed BRANCH
+    // down to nothing once the window narrowed, and on the wide one it took
+    // BRANCH's room as well as REPO's. Dragging one column costs REPO alone.
+    #[test]
+    fn dragging_one_column_leaves_branch_where_it_was() {
+        let columns = Column::defaults(true);
+        let wants = ColumnWants {
+            branch_typical: 8,
+            branch_longest: 26,
+            name: 50,
+        };
+        let dragged = BTreeMap::from([(Column::Tag, 54)]);
+        for width in [198, 118] {
+            let plain = TableLayout::for_width(width, wants, &columns, &BTreeMap::new());
+            let wide_tag = TableLayout::for_width(width, wants, &columns, &dragged);
+            assert_eq!(
+                width_of(&wide_tag, Column::Branch),
+                width_of(&plain, Column::Branch),
+                "at {width}"
+            );
+            assert!(width_of(&wide_tag, Column::Branch) > 0, "at {width}");
+        }
+    }
+
+    // Left of REPO an edge resizes the column before it; right of REPO the
+    // table hangs off the right border, so it resizes the column after.
+    // Either way, the edge follows the mouse.
+    #[test]
+    fn each_edge_resizes_the_column_on_the_far_side_from_repo() {
+        let columns = vec![Column::Group, Column::Repo, Column::Branch, Column::Age];
+        let layout = TableLayout::for_width(100, develop_fleet(), &columns, &BTreeMap::new());
+        let edges = layout.edges();
+        let summary: Vec<(Column, i32)> = edges.iter().map(|e| (e.column, e.sign)).collect();
+        assert_eq!(
+            summary,
+            vec![(Column::Group, 1), (Column::Branch, -1), (Column::Age, -1)]
+        );
+        // Each edge sits where the next column starts.
+        assert_eq!(edges[0].x, 14);
+        assert_eq!(edges[1].x, 14 + width_of(&layout, Column::Repo));
+    }
+
+    #[test]
+    fn the_mouse_finds_an_edge_from_either_side_of_it() {
+        let columns = vec![Column::Group, Column::Repo, Column::Age];
+        let layout = TableLayout::for_width(100, develop_fleet(), &columns, &BTreeMap::new());
+        // The table starts one in from the screen edge, inside its border, so
+        // the GROUP|REPO edge is at screen column 15 and its gutter at 14.
+        let area = Rect::new(0, 0, 102, 40);
+        assert_eq!(
+            edge_at(&layout, area, 14).map(|e| e.column),
+            Some(Column::Group)
+        );
+        assert_eq!(
+            edge_at(&layout, area, 15).map(|e| e.column),
+            Some(Column::Group)
+        );
+        assert_eq!(edge_at(&layout, area, 13), None);
+        assert_eq!(edge_at(&layout, area, 0), None);
+    }
+
+    // A terminal has no resize cursor, so the header marks the edge under
+    // the mouse with a `│` in the gutter beside it.
+    #[test]
+    fn the_active_edge_is_marked_in_the_header() {
+        let columns = vec![Column::Group, Column::Repo, Column::Ahead, Column::Behind];
+        let layout = TableLayout::for_width(60, develop_fleet(), &columns, &BTreeMap::new());
+        let plain = text(&header_line(&layout, None).spans);
+        assert!(!plain.contains('│'));
+
+        // GROUP's gutter is its own trailing space.
+        let marked = text(&header_line(&layout, Some(1)).spans);
+        assert_eq!(marked.chars().nth(13), Some('│'));
+        assert_eq!(marked.chars().count(), plain.chars().count());
+
+        // Right-aligned columns keep their gutter at the end too.
+        let marked = text(&header_line(&layout, Some(3)).spans);
+        let at = 14 + width_of(&layout, Column::Repo) + 5;
+        assert_eq!(marked.chars().nth(at), Some('│'));
+        assert_eq!(marked.chars().count(), plain.chars().count());
+    }
+
+    fn worktree(origin: &str, own: &str) -> RepoStatus {
+        let mut repo = RepoStatus::new(
+            format!("/p/grav/_worktrees/{own}").into(),
+            "grav".into(),
+            format!("_worktrees/{own}"),
+        );
+        repo.refs = Some(RefsInfo {
+            head: Head::Branch("feature/theme-blocks".into()),
+            branches: Vec::new(),
+            last_commit: None,
+            stashes: 0,
+            operation: None,
+            newest_tag: None,
+            described_tag: None,
+            commits_since_tag: None,
+            since_tag_subjects: Vec::new(),
+            tags_orphaned: false,
+            index_mtime: None,
+            fetched_at: None,
+            remote_url: None,
+            changelog: None,
+            is_bare: false,
+            is_shallow: false,
+            worktree_of: Some(format!("/p/grav/{origin}").into()),
+        });
+        repo
+    }
+
+    fn text(spans: &[Span]) -> String {
+        spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    #[test]
+    fn a_worktree_leads_with_the_repo_it_belongs_to() {
+        let repo = worktree("grav-theme-kahuna", "kahuna-theme-blocks");
+        let spans = name_spans(&repo, 50, Style::default());
+        assert_eq!(
+            text(&spans).trim_end(),
+            "grav-theme-kahuna ↳ kahuna-theme-blocks"
+        );
+        assert_eq!(text(&spans).chars().count(), 50);
+    }
+
+    // The worktree's own name is the half that goes: the origin is what
+    // says whose it is.
+    #[test]
+    fn a_narrow_cell_cuts_the_worktree_name_not_the_origin() {
+        let repo = worktree("grav-theme-kahuna", "kahuna-theme-blocks");
+        let spans = name_spans(&repo, 30, Style::default());
+        assert_eq!(text(&spans).trim_end(), "grav-theme-kahuna ↳ kahuna-t…");
+        assert_eq!(text(&spans).chars().count(), 30);
+
+        let spans = name_spans(&repo, 20, Style::default());
+        assert_eq!(text(&spans).trim_end(), "grav-theme-kahuna ↳");
+        assert_eq!(text(&spans).chars().count(), 20);
+    }
+
+    #[test]
+    fn a_main_checkout_is_just_its_name() {
+        let repo = RepoStatus::new(
+            "/p/grav/grav-plugin-api".into(),
+            "grav".into(),
+            "grav-plugin-api".into(),
+        );
+        assert_eq!(
+            text(&name_spans(&repo, 20, Style::default())).trim_end(),
+            "grav-plugin-api"
+        );
     }
 }

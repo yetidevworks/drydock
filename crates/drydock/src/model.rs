@@ -141,6 +141,12 @@ pub struct RefsInfo {
     pub changelog: Option<ChangelogInfo>,
     pub is_bare: bool,
     pub is_shallow: bool,
+    /// For a linked worktree, the checkout it was added from: the main
+    /// working tree, or the bare repo when there isn't one. `None` for the
+    /// main checkout itself, and for cache entries written before this field
+    /// existed, which simply read as not-a-worktree until the next probe.
+    #[serde(default)]
+    pub worktree_of: Option<PathBuf>,
 }
 
 impl RefsInfo {
@@ -412,6 +418,10 @@ pub struct VisibilityInfo {
     pub checked_at: i64,
 }
 
+/// What separates a worktree's origin repo from the worktree's own name in
+/// the REPO column.
+pub const WORKTREE_MARK: &str = "↳";
+
 /// One repo, as most recently observed.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RepoStatus {
@@ -492,6 +502,48 @@ impl RepoStatus {
             | Some(VisibilityStatus::Unknown)
             | Some(VisibilityStatus::CheckingDisabled) => "·",
             None => "-",
+        }
+    }
+
+    /// The checkout this linked worktree was added from, if it is one.
+    pub fn worktree_of(&self) -> Option<&std::path::Path> {
+        self.refs.as_ref()?.worktree_of.as_deref()
+    }
+
+    /// The name of the repo this worktree belongs to: the main checkout's
+    /// directory, or a bare repo's with its `.git` suffix dropped.
+    pub fn worktree_origin(&self) -> Option<String> {
+        let origin = self.worktree_of()?;
+        let name = origin.file_name()?.to_string_lossy();
+        Some(name.strip_suffix(".git").unwrap_or(&name).to_string())
+    }
+
+    /// The REPO cell, as its two halves: for a linked worktree the repo it
+    /// belongs to and the worktree's own directory, otherwise just the name.
+    ///
+    /// A worktree's name is only where it was checked out, which says
+    /// nothing reliable about whose it is: `_worktrees/kahuna-theme-blocks`
+    /// belongs to `grav-theme-kahuna`, and nothing in the name says so. The
+    /// origin goes first so it's the part that survives truncation.
+    pub fn name_parts(&self) -> (String, Option<String>) {
+        match self.worktree_origin() {
+            Some(origin) => {
+                let own = self
+                    .root
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_else(|| self.name.clone());
+                (origin, Some(own))
+            }
+            None => (self.name.clone(), None),
+        }
+    }
+
+    /// [`name_parts`](Self::name_parts) joined for plain text and sorting.
+    pub fn display_name(&self) -> String {
+        match self.name_parts() {
+            (origin, Some(own)) => format!("{origin} {WORKTREE_MARK} {own}"),
+            (name, None) => name,
         }
     }
 

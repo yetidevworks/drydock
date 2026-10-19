@@ -22,7 +22,7 @@ use ratatui::{
     layout::{Rect, Size},
     Terminal,
 };
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::{self, Stdout};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -30,7 +30,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
 use crate::cache;
-use crate::column::Column;
+use crate::column::{Column, MIN_WIDTH};
 use crate::config::Config;
 use crate::filter::{Filter, MatchMode, Query, Sort};
 use crate::git;
@@ -51,6 +51,10 @@ const TICK: Duration = Duration::from_millis(250);
 /// the sweep died without saying so, and a dashboard left open for days would
 /// otherwise sit on the state it started with.
 const SWEEP_STUCK_AFTER: Duration = Duration::from_secs(180);
+
+/// Two presses on the same edge inside this count as a double-click, which
+/// crossterm doesn't report on its own.
+const DOUBLE_CLICK: Duration = Duration::from_millis(400);
 
 /// Braille spinner frames, advanced once per tick.
 pub const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -75,6 +79,23 @@ pub const SINCE_PRESETS: &[(&str, &str)] = &[
     ("3", "1w"),
     ("4", "1mo"),
 ];
+
+/// A header edge held down by the mouse.
+#[derive(Clone, Copy, Debug)]
+pub struct ColumnDrag {
+    /// Which boundary, as [`ui::Edge::index`].
+    edge: usize,
+    column: Column,
+    /// Where the mouse went down, and how wide the column was then: every
+    /// later position is measured from here rather than step by step, so the
+    /// edge stays under the mouse however fast it moves.
+    start_x: u16,
+    start_width: usize,
+    sign: i32,
+    /// Whether it's actually moved. A press and release in place is a click,
+    /// and shouldn't pin a column at the width it already had.
+    moved: bool,
+}
 
 pub struct App {
     pub cfg: Arc<Config>,
@@ -117,6 +138,16 @@ pub struct App {
     pub columns: Vec<Column>,
     /// Row the column picker is sitting on, indexing [`App::picker_rows`].
     pub column_cursor: usize,
+    /// Widths set by dragging a header edge, live while the drag is under
+    /// way. Starts from `[ui] column_widths`, and is written back to it when
+    /// the mouse is let go.
+    pub column_widths: BTreeMap<Column, usize>,
+    /// The header edge being dragged right now, if one is.
+    pub column_drag: Option<ColumnDrag>,
+    /// The header edge under the mouse, so it can be lit before it's grabbed.
+    pub hover_edge: Option<usize>,
+    /// The last press on a header edge, to tell a double-click from two.
+    last_edge_press: Option<(Column, Instant)>,
     /// How far the overlay on screen can scroll before it's showing only
     /// empty space, measured by the last frame that drew it. Zero when there
     /// is no overlay, or when it fits.
@@ -163,6 +194,7 @@ impl App {
 
         // Resolved before `cfg` moves into the struct.
         let columns = cfg.columns();
+        let column_widths = cfg.ui.column_widths.clone();
 
         let mut app = Self {
             cfg,
@@ -177,6 +209,10 @@ impl App {
             detail_scroll: 0,
             columns,
             column_cursor: 0,
+            column_widths,
+            column_drag: None,
+            hover_edge: None,
+            last_edge_press: None,
             overlay_max_scroll: 0,
             mods: KeyModifiers::NONE,
             modifier_events: false,
@@ -420,6 +456,12 @@ impl App {
     pub fn reset_columns(&mut self) {
         self.columns = Column::defaults(self.cfg.visibility.enabled);
         self.column_cursor = 0;
+    }
+
+    /// The header edge to light up: the one being dragged, or failing that
+    /// the one under the mouse.
+    pub fn active_edge(&self) -> Option<usize> {
+        self.column_drag.map(|d| d.edge).or(self.hover_edge)
     }
 
     pub fn notify(&mut self, message: impl Into<String>) {
@@ -903,18 +945,154 @@ fn handle_mouse(
         _ => {}
     }
 
+    let Some(size) = size else { return };
+    let area = Rect::new(0, 0, size.width, size.height);
+    if handle_header_mouse(app, ev, area) {
+        return;
+    }
+
     match ev.kind {
         MouseEventKind::ScrollDown => app.move_selection(1),
         MouseEventKind::ScrollUp => app.move_selection(-1),
         MouseEventKind::Down(MouseButton::Left) => {
-            let Some(size) = size else { return };
-            let first = ui::table_first_row(Rect::new(0, 0, size.width, size.height));
+            let first = ui::table_first_row(area);
             if app.select_at_row(ev.row, first) {
                 app.detail_scroll = 0;
             }
         }
         _ => {}
     }
+}
+
+/// Dragging column edges in the header. Returns whether the event was the
+/// header's, so a press there doesn't also go looking for a row to select.
+fn handle_header_mouse(app: &mut App, ev: MouseEvent, area: Rect) -> bool {
+    let on_header = ev.row == ui::table_header_row(area);
+    match ev.kind {
+        // Only worth laying the table out when the mouse is on the header
+        // row, or just left it with an edge still lit.
+        MouseEventKind::Moved => {
+            if on_header {
+                let layout = ui::table_layout(app, area);
+                app.hover_edge = ui::edge_at(&layout, area, ev.column).map(|e| e.index);
+            } else {
+                app.hover_edge = None;
+            }
+            false
+        }
+        MouseEventKind::Down(MouseButton::Left) if on_header => {
+            let layout = ui::table_layout(app, area);
+            let Some(edge) = ui::edge_at(&layout, area, ev.column) else {
+                return true;
+            };
+            let double = app
+                .last_edge_press
+                .is_some_and(|(c, at)| c == edge.column && at.elapsed() < DOUBLE_CLICK);
+            if double {
+                app.last_edge_press = None;
+                app.column_drag = None;
+                reset_column_width(app, edge.column);
+                return true;
+            }
+            app.last_edge_press = Some((edge.column, Instant::now()));
+            app.column_drag = Some(ColumnDrag {
+                edge: edge.index,
+                column: edge.column,
+                start_x: ev.column,
+                start_width: edge.width,
+                sign: edge.sign,
+                moved: false,
+            });
+            true
+        }
+        MouseEventKind::Drag(MouseButton::Left) => {
+            let Some(drag) = app.column_drag.as_mut() else {
+                return false;
+            };
+            let delta = (ev.column as i32 - drag.start_x as i32) * drag.sign;
+            let width = (drag.start_width as i32 + delta).max(MIN_WIDTH as i32) as usize;
+            drag.moved |= delta != 0;
+            let column = drag.column;
+            app.column_widths.insert(column, width);
+            // The terminal may not have room for what was asked, so report
+            // what the table actually gave it.
+            let shown = shown_width(app, area, column).unwrap_or(width);
+            app.notify(format!(
+                "{} {shown} wide · let go to keep it, double-click the edge to reset",
+                column.header(false)
+            ));
+            true
+        }
+        MouseEventKind::Up(MouseButton::Left) => {
+            let Some(drag) = app.column_drag.take() else {
+                return false;
+            };
+            if drag.moved {
+                // Saved as drawn, so a drag past what the terminal could fit
+                // doesn't store a width nobody has ever seen.
+                if let Some(shown) = shown_width(app, area, drag.column) {
+                    app.column_widths.insert(drag.column, shown);
+                }
+                // A completed drag isn't the first half of a double-click.
+                app.last_edge_press = None;
+                save_column_widths(app, drag.column);
+            }
+            true
+        }
+        _ => false,
+    }
+}
+
+/// How wide a column is in the table as it would be drawn now.
+fn shown_width(app: &App, area: Rect, column: Column) -> Option<usize> {
+    ui::table_layout(app, area)
+        .columns
+        .iter()
+        .find(|(c, _)| *c == column)
+        .map(|(_, w)| *w)
+}
+
+/// Put a dragged column back on its built-in width.
+fn reset_column_width(app: &mut App, column: Column) {
+    if app.column_widths.remove(&column).is_none() {
+        app.notify(format!(
+            "{} is already at its automatic width",
+            column.header(false)
+        ));
+        return;
+    }
+    let widths = app.column_widths.clone();
+    let what = format!("{} back to its automatic width", column.header(false));
+    match crate::config::update(|file| file.ui.column_widths = widths.clone()) {
+        Ok(_) => {
+            remember_column_widths(app, widths);
+            app.notify(what);
+        }
+        Err(err) => app.notify(format!("{what}, but could not save it: {err:#}")),
+    }
+}
+
+fn save_column_widths(app: &mut App, column: Column) {
+    let widths = app.column_widths.clone();
+    let what = format!(
+        "{} kept at {}",
+        column.header(false),
+        widths.get(&column).copied().unwrap_or_default()
+    );
+    match crate::config::update(|file| file.ui.column_widths = widths.clone()) {
+        Ok(_) => {
+            remember_column_widths(app, widths);
+            app.notify(what);
+        }
+        Err(err) => app.notify(format!("{what} for now, but could not save it: {err:#}")),
+    }
+}
+
+/// Keep the running config in step with what was just written to the file.
+fn remember_column_widths(app: &mut App, widths: BTreeMap<Column, usize>) {
+    let mut cfg = (*app.cfg).clone();
+    cfg.ui.column_widths = widths;
+    app.cfg = Arc::new(cfg);
 }
 
 /// Keep [`App::mods`] in step with what's actually held down.
@@ -1826,6 +2004,7 @@ mod tests {
                 changelog: None,
                 is_bare: false,
                 is_shallow: false,
+                worktree_of: None,
             };
             // The last one has no remote, so there's nothing to fetch from.
             if i == 2 {
@@ -1876,6 +2055,7 @@ mod tests {
             changelog: None,
             is_bare: false,
             is_shallow: false,
+            worktree_of: None,
         });
         repo
     }

@@ -1,3 +1,15 @@
+# 1.3.0
+
+## 10/19/2026
+
+1. [](#new)
+    * **Drag a column's edge in the header to resize it.** Moving the mouse along the header lights up the edge under it, and the footer shows the width as you drag. Letting go saves the width to `[ui] column_widths`, so it's kept for next time, and double-clicking an edge puts that column back on its automatic width. REPO still takes up whatever's left, so the counts on the right stay put. On a terminal too narrow for the widths you saved, they give way before REPO drops under 20 characters, and come back when there's room.
+2. [](#improved)
+    * **A worktree's REPO cell names the repo it belongs to**, as `grav-theme-kahuna ↳ kahuna-theme-blocks`. A worktree used to be listed by where it was checked out, so `_worktrees/kahuna-theme-blocks` gave no hint that it was a checkout of `grav-theme-kahuna`. The origin comes from git's own worktree pointer, so the name of the folder doesn't matter. It's also the half that's kept when the cell is too narrow for both.
+    * Worktrees sort in beside their repo when sorting by name or group, and searching for a repo finds its worktrees too.
+    * The detail view (`⏎`), `drydock show` and `--json` (`worktree_of`) give the full path of the checkout a worktree came from.
+    * The BRANCH column now fits the longest branch listed, up to 32 characters, whenever the repo names still fit beside it. It was sized to what 95% of rows needed, so in a fleet that's mostly on `develop` the few `feature/…` branches, which are usually the worktrees, were cut to eight characters with the REPO column half empty beside them. On a narrow terminal the repo names still come first.
+
 # 1.2.2
 
 ## 10/06/2026
