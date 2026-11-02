@@ -1,3 +1,10 @@
+# 1.3.1
+
+## 11/01/2026
+
+1. [](#bugfix)
+    * **`drydock releasable` leaves held repos out.** A hold took a repo out of "needs release" in the dashboard and `drydock list`, but `releasable` listed it anyway. Held repos are now left out, with a count of them under the table, and `--include-held` lists them as before.
+
 # 1.3.0
 
 ## 10/19/2026

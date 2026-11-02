@@ -44,8 +44,9 @@ async fn main() -> Result<()> {
         Some(Commands::Releasable {
             min_commits,
             include_changelog,
+            include_held,
             json,
-        }) => cmd_releasable(min_commits, include_changelog, json, &roots).await,
+        }) => cmd_releasable(min_commits, include_changelog, include_held, json, &roots).await,
         Some(Commands::Scan {
             fast,
             no_cache,
@@ -313,6 +314,7 @@ async fn cmd_status(path: Option<String>, json: bool, roots: &[String]) -> Resul
 async fn cmd_releasable(
     min_commits: u32,
     include_changelog: bool,
+    include_held: bool,
     json: bool,
     roots: &[String],
 ) -> Result<()> {
@@ -333,6 +335,15 @@ async fn cmd_releasable(
             by_commits || by_changelog
         })
         .collect();
+    // A hold says "not this batch", so a held repo is left out like a
+    // released one unless asked for, the same as `list` and the dashboard.
+    let held = selected
+        .iter()
+        .filter(|r| r.release_state() == model::ReleaseState::Held)
+        .count();
+    if !include_held {
+        selected.retain(|r| r.release_state() != model::ReleaseState::Held);
+    }
     filter::sort_repos(&mut selected, Sort::Activity, false);
 
     if json {
@@ -340,8 +351,16 @@ async fn cmd_releasable(
         return Ok(());
     }
 
+    // Held repos left out, named so an empty or short list isn't mistaken for
+    // the whole story.
+    let held_note = if include_held || held == 0 {
+        String::new()
+    } else {
+        format!(" {held} held, not shown (--include-held lists them).")
+    };
+
     if selected.is_empty() {
-        println!("Nothing has commits past its last tag.");
+        println!("Nothing has commits past its last tag.{held_note}");
         return Ok(());
     }
 
@@ -422,7 +441,7 @@ async fn cmd_releasable(
     );
     println!();
     println!(
-        "{} candidate{}.",
+        "{} candidate{}.{held_note}",
         selected.len(),
         if selected.len() == 1 { "" } else { "s" }
     );

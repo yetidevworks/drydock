@@ -44,6 +44,9 @@ pub enum Commands {
         /// no commits follow the tag.
         #[arg(long)]
         include_changelog: bool,
+        /// Include repos held out of "needs release" (see `drydock hold`).
+        #[arg(long)]
+        include_held: bool,
         #[arg(long)]
         json: bool,
     },
