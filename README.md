@@ -171,7 +171,7 @@ The list is the branch you have checked out plus its upstream, so commits you ha
 | `n` `p` | jump to the next or previous file in the diff |
 | `W` | wrap long lines in the diff, or stop; remembered as `[ui] history_wrap` |
 | `a` | every branch and tag, or back to this branch and its upstream |
-| `y` | copy the commit hash |
+| `y` | copy the commit hash (the copy key in `[keys]`) |
 | `t` `o` `O` `T` `w` | hand off, the same as from the table |
 | mouse | wheel over the list moves through it, over the diff scrolls it · click a commit to select it |
 
@@ -508,11 +508,28 @@ editor_command = ["zed", "{path}"]              # O
 file_manager_command = ["open", "{path}"]      # o — `open -R` reveals instead
 git_client_command = ["open", "-a", "Tower", "{path}"]      # t
 terminal_command = ["open", "-a", "Terminal", "{path}"]     # T and ctrl-o
+
+[keys]                       # the keys for the commands above
+editor = "O"
+git_client = "t"
+file_manager = "o"
+terminal = "T"               # ctrl-o opens a terminal too, whatever this is
+copy = "y"                   # copies the path, or the commit hash in history
 ```
 
 Every one of those is a command template with `{path}` replaced by the repo
 root, so point them at whatever you actually use — `["open", "-a", "iTerm",
 "{path}"]` for iTerm2, `["open", "-a", "Ghostty", "{path}"]` for Ghostty.
+
+If you point them at particular tools, `[keys]` lets the keys follow: `v` for nvim, `g` for lazygit, `y` for yazi with copying moved to `Y`. List only the keys you're moving. Each is one character and case counts; a capital is the one that shows when you hold shift. A key works the same in the table, the detail view and history, and the footer and the `?` help show the keys you've set. A key that's used twice, or that drydock already uses for something else in any view, gets the whole table ignored, and the dashboard says what was wrong when it opens.
+
+```toml
+[keys]
+editor = "v"
+git_client = "g"
+file_manager = "y"
+copy = "Y"
+```
 
 `drydock config show` prints the effective config; `drydock config path` says
 where things live — config, holds and cache.

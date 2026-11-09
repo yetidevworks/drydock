@@ -58,6 +58,7 @@ pub struct Config {
     pub visibility: VisibilityConfig,
     pub release: ReleaseConfig,
     pub ui: UiConfig,
+    pub keys: KeysConfig,
 }
 
 impl Default for Config {
@@ -81,6 +82,7 @@ impl Default for Config {
             visibility: VisibilityConfig::default(),
             release: ReleaseConfig::default(),
             ui: UiConfig::default(),
+            keys: KeysConfig::default(),
         }
     }
 }
@@ -246,14 +248,17 @@ pub struct UiConfig {
     pub default_sort: String,
     /// Initial "modified since" window, e.g. `1h`, `1d`, `1w`. Empty for all.
     pub default_since: String,
-    /// Command used by the `O` key. `{path}` is replaced with the repo root.
+    /// Command used by the editor key, `O` unless `[keys]` moves it. `{path}`
+    /// is replaced with the repo root.
     pub editor_command: Vec<String>,
-    /// Command used by the `t` key.
+    /// Command used by the git client key, `t` unless `[keys]` moves it.
     pub git_client_command: Vec<String>,
-    /// Command used by the `T` and `ctrl-o` keys.
+    /// Command used by the terminal key, `T` unless `[keys]` moves it, and by
+    /// `ctrl-o`.
     pub terminal_command: Vec<String>,
-    /// Command used by the `o` key. `open {path}` shows the repo's folder in
-    /// Finder; `open -R {path}` would reveal it in its parent instead.
+    /// Command used by the file manager key, `o` unless `[keys]` moves it.
+    /// `open {path}` shows the repo's folder in Finder; `open -R {path}` would
+    /// reveal it in its parent instead.
     pub file_manager_command: Vec<String>,
     /// Columns to show, left to right. Unset means the defaults, which
     /// include VISIBILITY only when `visibility.enabled` is on. Set it and
@@ -289,6 +294,39 @@ impl Default for UiConfig {
             columns: None,
             history_wrap: false,
             column_widths: BTreeMap::new(),
+        }
+    }
+}
+
+/// The keys that hand a repo off to another tool, so they can follow the
+/// tools the commands point at: `v` for nvim, `g` for lazygit. Each is one
+/// character, case counts, and the same key works in the table, the detail
+/// view and the history view. They're kept as strings rather than `char` so a
+/// bad one costs only the `[keys]` table, not the whole config; the dashboard
+/// checks them at startup and says what's wrong.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct KeysConfig {
+    /// Runs `[ui] editor_command`.
+    pub editor: String,
+    /// Runs `[ui] git_client_command`.
+    pub git_client: String,
+    /// Runs `[ui] file_manager_command`.
+    pub file_manager: String,
+    /// Runs `[ui] terminal_command`. `ctrl-o` does too, wherever this is.
+    pub terminal: String,
+    /// Copies the repo's path, or the commit hash in the history view.
+    pub copy: String,
+}
+
+impl Default for KeysConfig {
+    fn default() -> Self {
+        Self {
+            editor: "O".into(),
+            git_client: "t".into(),
+            file_manager: "o".into(),
+            terminal: "T".into(),
+            copy: "y".into(),
         }
     }
 }
@@ -587,6 +625,16 @@ mod tests {
         let real = dir.path().display().to_string();
         let fake = dir.path().join("nope").display().to_string();
         assert_eq!(missing_roots(&[real, fake.clone()]), vec![fake],);
+    }
+
+    // Keys left out keep their defaults, so a `[keys]` table can be as short
+    // as the one key you want to move.
+    #[test]
+    fn a_partial_keys_table_keeps_the_other_defaults() {
+        let cfg: Config = toml::from_str("[keys]\neditor = \"v\"\n").unwrap();
+        assert_eq!(cfg.keys.editor, "v");
+        assert_eq!(cfg.keys.git_client, "t");
+        assert_eq!(cfg.keys.copy, "y");
     }
 
     #[test]

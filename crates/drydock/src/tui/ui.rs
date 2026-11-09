@@ -15,6 +15,7 @@ use ratatui::{
 use crossterm::event::KeyModifiers;
 use std::collections::BTreeMap;
 
+use super::keys::HandOff;
 use super::{App, Mode};
 use crate::column::{Column, Width, BRANCH_CAP};
 use crate::fmt;
@@ -863,81 +864,128 @@ fn release_cell(repo: &RepoStatus) -> String {
     format!("{marker} {}", state.label())
 }
 
+/// The hand-offs the table's footer has room for. Both rows list the same
+/// ones, so a key shows up on whichever row it's typed from.
+const TABLE_HAND_OFFS: &[(HandOff, &str)] = &[
+    (HandOff::FileManager, "finder"),
+    (HandOff::Editor, "editor"),
+    (HandOff::Terminal, "terminal"),
+];
+
 /// What the footer lists, which depends on what's held down.
 ///
 /// Holding shift or ctrl swaps the row for what those keys would do right
 /// now, so the modified bindings are discoverable by pressing the modifier
 /// rather than by reading the help. Terminals that don't report a bare
 /// modifier keep [`App::mods`] empty and always get the first row.
-pub(super) fn key_hints(app: &App) -> &'static [(&'static str, &'static str)] {
+///
+/// The hand-off keys come from `[keys]`, so each lands on the shift row or
+/// the plain one by whether it's a capital, wherever that view lists them.
+pub(super) fn key_hints(app: &App) -> Vec<(String, &'static str)> {
     let shift = app.mods.contains(KeyModifiers::SHIFT);
     let ctrl = app.mods.contains(KeyModifiers::CONTROL);
+
+    let fixed = |list: &[(&str, &'static str)]| -> Vec<(String, &'static str)> {
+        list.iter()
+            .map(|(k, what)| (k.to_string(), *what))
+            .collect()
+    };
+    let hand_offs = |list: &[(HandOff, &'static str)]| -> Vec<(String, &'static str)> {
+        list.iter()
+            .map(|&(action, what)| (app.keys.key(action), what))
+            .filter(|(key, _)| key.is_uppercase() == shift)
+            .map(|(key, what)| (key.to_string(), what))
+            .collect()
+    };
+    let join = |a: &[(&str, &'static str)],
+                hands: &[(HandOff, &'static str)],
+                b: &[(&str, &'static str)]| {
+        let mut row = fixed(a);
+        row.extend(hand_offs(hands));
+        row.extend(fixed(b));
+        row
+    };
 
     match app.mode {
         // Ctrl wins when both are down: its bindings are the same everywhere,
         // so showing them is never wrong, and a chord in progress is more
         // likely to be a ctrl one.
-        _ if ctrl => &[
+        _ if ctrl => fixed(&[
             ("^o", "terminal"),
             ("^f", "fetch all"),
             ("^r", "rescan"),
             ("^d/^u", "half page"),
             ("^c", "quit"),
-        ],
-        Mode::Detail if shift => &[("O", "editor"), ("T", "terminal")],
-        Mode::Detail => &[
-            ("esc", "back"),
-            ("j/k", "scroll"),
-            ("o", "finder"),
-            ("t", "client"),
-            ("y", "copy path"),
-        ],
-        Mode::Search => &[("esc", "cancel"), ("enter", "keep"), ("type", "to filter")],
-        Mode::History if shift => &[
-            ("J/K", "scroll diff"),
-            ("W", "wrap long lines"),
-            ("O", "editor"),
-            ("T", "terminal"),
-        ],
-        Mode::History => &[
-            ("space", "close"),
-            ("j/k", "commit"),
-            ("J/K", "scroll"),
-            ("^d/^u", "half page"),
-            ("n/p", "next/prev file"),
-            ("W", "wrap"),
-            ("a", "all branches"),
-            ("y", "copy hash"),
-            ("t", "client"),
-        ],
-        Mode::Columns if shift => &[("J/K", "move column"), ("C", "close")],
-        _ if shift => &[
-            ("O", "editor"),
-            ("T", "terminal"),
-            ("F", "fetch screen"),
-            ("N", "unreleased"),
-            ("H", "held"),
-            ("S", "reverse sort"),
-            ("C", "columns"),
-            ("R", "rescan"),
-        ],
-        _ => &[
-            ("j/k", "move"),
-            ("⏎", "detail"),
-            ("space", "history"),
-            ("d", "dirty"),
-            ("u", "unpushed"),
-            ("r", "needs release"),
-            ("h", "hold"),
-            ("a", "clear"),
-            ("s", "sort"),
-            ("/", "search"),
-            ("[ ]", "group"),
-            ("1-4", "since"),
-            ("o", "finder"),
-            ("^f", "fetch all"),
-            ("?", "help"),
-        ],
+        ]),
+        Mode::Detail => join(
+            if shift {
+                &[]
+            } else {
+                &[("esc", "back"), ("j/k", "scroll")]
+            },
+            &[
+                (HandOff::FileManager, "finder"),
+                (HandOff::GitClient, "client"),
+                (HandOff::Copy, "copy path"),
+                (HandOff::Editor, "editor"),
+                (HandOff::Terminal, "terminal"),
+            ],
+            &[],
+        ),
+        Mode::Search => fixed(&[("esc", "cancel"), ("enter", "keep"), ("type", "to filter")]),
+        Mode::History => join(
+            if shift {
+                &[("J/K", "scroll diff"), ("W", "wrap long lines")]
+            } else {
+                &[
+                    ("space", "close"),
+                    ("j/k", "commit"),
+                    ("J/K", "scroll"),
+                    ("^d/^u", "half page"),
+                    ("n/p", "next/prev file"),
+                    ("W", "wrap"),
+                    ("a", "all branches"),
+                ]
+            },
+            &[
+                (HandOff::Copy, "copy hash"),
+                (HandOff::GitClient, "client"),
+                (HandOff::Editor, "editor"),
+                (HandOff::Terminal, "terminal"),
+            ],
+            &[],
+        ),
+        Mode::Columns if shift => fixed(&[("J/K", "move column"), ("C", "close")]),
+        _ if shift => join(
+            &[],
+            TABLE_HAND_OFFS,
+            &[
+                ("F", "fetch screen"),
+                ("N", "unreleased"),
+                ("H", "held"),
+                ("S", "reverse sort"),
+                ("C", "columns"),
+                ("R", "rescan"),
+            ],
+        ),
+        _ => join(
+            &[
+                ("j/k", "move"),
+                ("⏎", "detail"),
+                ("space", "history"),
+                ("d", "dirty"),
+                ("u", "unpushed"),
+                ("r", "needs release"),
+                ("h", "hold"),
+                ("a", "clear"),
+                ("s", "sort"),
+                ("/", "search"),
+                ("[ ]", "group"),
+                ("1-4", "since"),
+            ],
+            TABLE_HAND_OFFS,
+            &[("^f", "fetch all"), ("?", "help")],
+        ),
     }
 }
 
@@ -947,7 +995,7 @@ fn render_keys(f: &mut Frame, app: &App, area: Rect) {
     let mut spans = vec![Span::raw(" ")];
     for (key, what) in keys {
         spans.push(Span::styled(
-            (*key).to_string(),
+            key,
             Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
         ));
         spans.push(Span::styled(format!(" {what}  "), Style::default().fg(DIM)));
@@ -1082,6 +1130,17 @@ pub fn marker_legend(app: &App) -> Vec<MarkerGroup> {
     groups
 }
 
+/// Put the `[keys]` hand-off keys into a help entry, which names them as
+/// `{editor}` and so on rather than by their default keys.
+fn with_hand_off_keys(text: &str, app: &App) -> String {
+    let keys = &app.keys;
+    text.replace("{editor}", &keys.editor.to_string())
+        .replace("{git_client}", &keys.git_client.to_string())
+        .replace("{file_manager}", &keys.file_manager.to_string())
+        .replace("{terminal}", &keys.terminal.to_string())
+        .replace("{copy}", &keys.copy.to_string())
+}
+
 fn render_help(f: &mut Frame, app: &App, area: Rect) -> u16 {
     let area = centred(area, 72, 92);
     f.render_widget(Clear, area);
@@ -1145,8 +1204,11 @@ fn render_help(f: &mut Frame, app: &App, area: Rect) -> u16 {
                 ("n / p", "next and previous file in the diff"),
                 ("W", "wrap long lines in the diff, remembered"),
                 ("a", "every branch, or back to this one and its upstream"),
-                ("y", "copy the commit hash"),
-                ("t, o, O, T, w", "hand off, as in the table"),
+                ("{copy}", "copy the commit hash"),
+                (
+                    "{git_client}, {file_manager}, {editor}, {terminal}, w",
+                    "hand off, as in the table",
+                ),
                 ("space / esc", "back to the table"),
             ],
         ),
@@ -1165,12 +1227,12 @@ fn render_help(f: &mut Frame, app: &App, area: Rect) -> u16 {
         (
             "Handing off",
             &[
-                ("o", "show the folder in Finder"),
-                ("O", "open in your editor"),
-                ("T / ctrl-o", "open a terminal there"),
-                ("t", "open in your git client"),
+                ("{file_manager}", "show the folder in Finder"),
+                ("{editor}", "open in your editor"),
+                ("{terminal} / ctrl-o", "open a terminal there"),
+                ("{git_client}", "open in your git client"),
                 ("w", "open the remote in a browser"),
-                ("y", "copy the path"),
+                ("{copy}", "copy the path"),
                 ("R / ctrl-r", "rescan now"),
                 ("C", "choose which columns to show"),
             ],
@@ -1184,6 +1246,7 @@ fn render_help(f: &mut Frame, app: &App, area: Rect) -> u16 {
             Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
         )));
         for (key, what) in *entries {
+            let key = with_hand_off_keys(key, app);
             lines.push(Line::from(vec![
                 Span::styled(format!("   {:<16}", key), Style::default().fg(Color::White)),
                 Span::styled((*what).to_string(), Style::default().fg(DIM)),

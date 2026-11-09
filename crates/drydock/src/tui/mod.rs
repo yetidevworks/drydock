@@ -5,6 +5,7 @@
 //! rendering are split: this module owns state and events, `ui` owns pixels.
 
 mod history;
+mod keys;
 mod ui;
 
 use anyhow::Result;
@@ -38,6 +39,7 @@ use crate::hold::{self, Holds};
 use crate::model::RepoStatus;
 use crate::probe::{self, Tier, Timings};
 use crate::watch;
+use keys::{HandOff, Keys};
 
 /// How long a status message stays on screen.
 const MESSAGE_TTL: Duration = Duration::from_secs(6);
@@ -99,6 +101,9 @@ pub struct ColumnDrag {
 
 pub struct App {
     pub cfg: Arc<Config>,
+    /// The hand-off keys, from `[keys]` or the defaults if that table had a
+    /// problem.
+    pub keys: Keys,
     /// Every known repo, keyed for updates by path.
     pub repos: Vec<RepoStatus>,
     pub by_root: HashMap<PathBuf, usize>,
@@ -195,9 +200,14 @@ impl App {
         // Resolved before `cfg` moves into the struct.
         let columns = cfg.columns();
         let column_widths = cfg.ui.column_widths.clone();
+        let (keys, keys_problem) = match Keys::resolve(&cfg.keys) {
+            Ok(keys) => (keys, None),
+            Err(problem) => (Keys::default(), Some(problem)),
+        };
 
         let mut app = Self {
             cfg,
+            keys,
             repos,
             holds,
             by_root: HashMap::new(),
@@ -235,6 +245,9 @@ impl App {
         };
         app.reindex();
         app.recompute();
+        if let Some(problem) = keys_problem {
+            app.notify(problem);
+        }
         app
     }
 
@@ -1196,6 +1209,21 @@ fn handle_key(app: &mut App, key: KeyEvent, tx: &mpsc::UnboundedSender<Input>) {
         }
     }
 
+    // Handing off to other tools works the same from the table, the detail
+    // view and history, on whatever keys `[keys]` gives it. By default `o` is
+    // the one you reach for most, so it's the file manager; the editor is a
+    // shift away.
+    if matches!(app.mode, Mode::Normal | Mode::Detail | Mode::History) {
+        if let Some(action) = app.keys.action(key.code) {
+            match action {
+                // In history the thing worth copying is the commit.
+                HandOff::Copy if app.mode == Mode::History => history::copy_hash(app),
+                _ => hand_off(app, action),
+            }
+            return;
+        }
+    }
+
     match app.mode {
         Mode::Search => handle_search_key(app, key),
         Mode::Help => match key.code {
@@ -1240,11 +1268,6 @@ fn handle_key(app: &mut App, key: KeyEvent, tx: &mpsc::UnboundedSender<Input>) {
             KeyCode::Char('k') | KeyCode::Up => app.scroll_overlay(-1),
             KeyCode::PageDown => app.detail_scroll = app.detail_scroll.saturating_add(10),
             KeyCode::PageUp => app.detail_scroll = app.detail_scroll.saturating_sub(10),
-            KeyCode::Char('o') => open_file_manager(app),
-            KeyCode::Char('O') => open_editor(app),
-            KeyCode::Char('T') => open_terminal(app),
-            KeyCode::Char('t') => open_git_client(app),
-            KeyCode::Char('y') => copy_path(app),
             KeyCode::Char(' ') => {
                 app.detail_scroll = 0;
                 history::open(app, tx);
@@ -1355,15 +1378,8 @@ fn handle_normal_key(app: &mut App, key: KeyEvent, tx: &mpsc::UnboundedSender<In
             app.search_input = app.query.search.clone();
         }
 
-        // Handing off to other tools.
-        // `o` is the one you reach for most, so it's the file manager; the
-        // editor is a shift away.
-        KeyCode::Char('o') => open_file_manager(app),
-        KeyCode::Char('O') => open_editor(app),
-        KeyCode::Char('t') => open_git_client(app),
-        KeyCode::Char('T') => open_terminal(app),
+        // The other hand-offs are on `[keys]` and run before this match.
         KeyCode::Char('w') => open_remote(app),
-        KeyCode::Char('y') => copy_path(app),
         KeyCode::Char('R') => {
             start_sweep(app, tx, Tier::Full);
             app.notify("Rescanning");
@@ -1636,6 +1652,16 @@ fn handoff_repo(app: &App) -> Option<&RepoStatus> {
     match &app.history {
         Some(view) => app.by_root.get(&view.root).map(|&i| &app.repos[i]),
         None => app.current(),
+    }
+}
+
+fn hand_off(app: &mut App, action: HandOff) {
+    match action {
+        HandOff::Editor => open_editor(app),
+        HandOff::GitClient => open_git_client(app),
+        HandOff::FileManager => open_file_manager(app),
+        HandOff::Terminal => open_terminal(app),
+        HandOff::Copy => copy_path(app),
     }
 }
 
@@ -1916,24 +1942,63 @@ mod tests {
     fn the_footer_follows_the_modifier_being_held() {
         let mut app = app_with(1);
         let plain = crate::tui::ui::key_hints(&app);
-        assert!(plain.iter().any(|(k, what)| *k == "o" && *what == "finder"));
+        assert!(plain.iter().any(|(k, what)| k == "o" && *what == "finder"));
 
         app.mods = KeyModifiers::SHIFT;
         let shifted = crate::tui::ui::key_hints(&app);
         assert!(shifted
             .iter()
-            .any(|(k, what)| *k == "O" && *what == "editor"));
+            .any(|(k, what)| k == "O" && *what == "editor"));
 
         app.mods = KeyModifiers::CONTROL;
         let ctrl = crate::tui::ui::key_hints(&app);
         assert!(ctrl
             .iter()
-            .any(|(k, what)| *k == "^o" && *what == "terminal"));
+            .any(|(k, what)| k == "^o" && *what == "terminal"));
 
         // Both down is a chord in progress; ctrl's bindings are the same in
         // every mode, so showing them is never wrong.
         app.mods = KeyModifiers::SHIFT | KeyModifiers::CONTROL;
         assert_eq!(crate::tui::ui::key_hints(&app), ctrl);
+    }
+
+    // A moved key has to move in the footer too, onto the plain row or the
+    // shift row by whether it's a capital, or the footer teaches the wrong key.
+    #[test]
+    fn the_footer_shows_the_keys_from_the_keys_table() {
+        let mut cfg = Config::default();
+        cfg.keys.editor = "v".into();
+        cfg.keys.file_manager = "Y".into();
+        let mut app = App::new(Arc::new(cfg));
+        assert_eq!(app.keys.editor, 'v');
+
+        let plain = crate::tui::ui::key_hints(&app);
+        assert!(plain.iter().any(|(k, what)| k == "v" && *what == "editor"));
+        assert!(!plain.iter().any(|(k, _)| k == "o"));
+
+        app.mods = KeyModifiers::SHIFT;
+        let shifted = crate::tui::ui::key_hints(&app);
+        assert!(shifted
+            .iter()
+            .any(|(k, what)| k == "Y" && *what == "finder"));
+        assert!(!shifted.iter().any(|(_, what)| *what == "editor"));
+    }
+
+    // A bad table is reported and costs only the keys: the rest of the
+    // config still applies.
+    #[test]
+    fn a_bad_keys_table_falls_back_to_the_default_keys_and_says_so() {
+        let mut cfg = Config::default();
+        cfg.keys.editor = "q".into();
+        cfg.ui.default_sort = "name".into();
+        let app = App::new(Arc::new(cfg));
+        assert_eq!(app.keys, Keys::default());
+        assert_eq!(app.query.sort, Sort::Name);
+        let message = app.active_message().unwrap_or_default();
+        assert!(
+            message.contains("[keys]") && message.contains("editor"),
+            "{message}"
+        );
     }
 
     // A terminal that reports the unshifted codepoint with a shift flag would

@@ -1,3 +1,10 @@
+# 1.4.0
+
+## 11/09/2026
+
+1. [](#new)
+    * **Move the hand-off keys with a `[keys]` table** ([#13](https://github.com/yetidevworks/drydock/issues/13)). The commands for the editor, git client, file manager and terminal were configurable but their keys weren't, so pointing them at nvim, lazygit and yazi left them on `O`, `t` and `o`. Now `editor`, `git_client`, `file_manager`, `terminal` and `copy` in `[keys]` move them, and keys you leave out keep their defaults. A key works the same in the table, the detail view and history, where `copy` copies the commit hash, and the footer and `?` help show the keys you've set, capitals on the shift row. A key that's used twice, isn't a single character, or is already one of drydock's own keys in any view gets the table ignored, and the dashboard lists every problem with it when it opens. The rest of the config still applies.
+
 # 1.3.1
 
 ## 11/01/2026

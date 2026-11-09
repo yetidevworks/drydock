@@ -558,23 +558,22 @@ pub fn handle_key(app: &mut App, key: KeyEvent, tx: &mpsc::UnboundedSender<Input
                 app.notify(format!("History of {what}"));
             }
         }
-        KeyCode::Char('y') => {
-            let sha = app
-                .history
-                .as_ref()
-                .and_then(|v| v.selected_commit())
-                .map(|c| c.sha.clone());
-            match sha {
-                Some(sha) => super::copy_text(app, &sha),
-                None => app.notify("Nothing committed to copy a hash of"),
-            }
-        }
-        KeyCode::Char('o') => super::open_file_manager(app),
-        KeyCode::Char('O') => super::open_editor(app),
-        KeyCode::Char('t') => super::open_git_client(app),
-        KeyCode::Char('T') => super::open_terminal(app),
+        // The hand-off keys, copy included, are handled before this.
         KeyCode::Char('w') => super::open_remote(app),
         _ => {}
+    }
+}
+
+/// The copy key in this view: the selected commit's hash.
+pub fn copy_hash(app: &mut App) {
+    let sha = app
+        .history
+        .as_ref()
+        .and_then(|v| v.selected_commit())
+        .map(|c| c.sha.clone());
+    match sha {
+        Some(sha) => super::copy_text(app, &sha),
+        None => app.notify("Nothing committed to copy a hash of"),
     }
 }
 
