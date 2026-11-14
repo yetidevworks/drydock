@@ -208,19 +208,68 @@ pub fn now_unix() -> i64 {
 }
 
 /// The cheap fingerprint that decides whether a cached working-tree scan is
-/// still valid: if HEAD hasn't moved and the index hasn't been rewritten,
-/// nothing git knows about has changed.
+/// still valid: if HEAD hasn't moved, the index hasn't been rewritten and no
+/// ignore rule outside the working tree has changed, nothing git knows about
+/// has changed.
+///
+/// The ignore rules matter because adding `.DS_Store` to the global excludes
+/// file turns every repo holding one from dirty to clean while touching
+/// neither HEAD nor any index. A `.gitignore` in the tree is a tracked file
+/// and is left to the watcher like any other.
 ///
 /// Note this deliberately doesn't try to capture unsaved working-tree edits;
 /// those are caught by the filesystem watcher instead.
 pub fn work_key(root: &Path, head_sha: Option<String>) -> WorkKey {
-    let index = resolve_git_dir(root)
-        .map(|d| d.join("index"))
-        .unwrap_or_else(|_| root.join(".git/index"));
+    let git_dir = resolve_git_dir(root).unwrap_or_else(|_| root.join(".git"));
+    let index = git_dir.join("index");
     WorkKey {
         head_sha,
         index_mtime: mtime_secs(&index),
         index_size: file_size(&index),
+        info_exclude_mtime: mtime_secs(&common_git_dir(&git_dir).join("info/exclude")),
+        global_excludes_mtime: global_excludes_file().and_then(mtime_secs),
+    }
+}
+
+/// Where git reads the user's global ignore rules from: `core.excludesFile`
+/// when it's set, otherwise `$XDG_CONFIG_HOME/git/ignore` or
+/// `~/.config/git/ignore`.
+///
+/// Resolved once per process, since `work_key` runs for every repo on every
+/// sweep. Only the path is fixed; its mtime is read fresh each time, so edits
+/// to the file are still seen.
+fn global_excludes_file() -> Option<&'static Path> {
+    static PATH: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+    PATH.get_or_init(|| {
+        let configured = std::process::Command::new("git")
+            .args(["config", "--global", "--path", "--get", "core.excludesFile"])
+            .stdin(std::process::Stdio::null())
+            .output()
+            .ok()
+            .filter(|out| out.status.success())
+            .and_then(|out| String::from_utf8(out.stdout).ok())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from);
+        configured.or_else(|| {
+            default_excludes_file(
+                std::env::var_os("XDG_CONFIG_HOME"),
+                std::env::var_os("HOME"),
+            )
+        })
+    })
+    .as_deref()
+}
+
+/// Git's fallback for the global excludes file when `core.excludesFile` is
+/// unset. An empty `XDG_CONFIG_HOME` counts as unset, as it does for git.
+fn default_excludes_file(
+    xdg_config_home: Option<std::ffi::OsString>,
+    home: Option<std::ffi::OsString>,
+) -> Option<PathBuf> {
+    match xdg_config_home.filter(|v| !v.is_empty()) {
+        Some(xdg) => Some(PathBuf::from(xdg).join("git/ignore")),
+        None => home.map(|h| PathBuf::from(h).join(".config/git/ignore")),
     }
 }
 
@@ -1008,6 +1057,52 @@ mod tests {
             .output()
             .unwrap();
         assert!(out.status.success(), "git {args:?}: {out:?}");
+    }
+
+    // Ignoring a file through `.git/info/exclude` changes what `git status`
+    // reports without touching HEAD or the index, so the key has to move with
+    // it or a cached scan keeps counting the file as untracked.
+    #[test]
+    fn editing_info_exclude_changes_the_work_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        git(root, &["init", "-q", "-b", "main", "."]);
+        let exclude = root.join(".git/info/exclude");
+        let set_mtime = |secs: u64| {
+            std::fs::File::options()
+                .write(true)
+                .open(&exclude)
+                .unwrap()
+                .set_modified(UNIX_EPOCH + Duration::from_secs(secs))
+                .unwrap();
+        };
+
+        set_mtime(1_000);
+        let before = work_key(root, None);
+        std::fs::write(&exclude, ".DS_Store\n").unwrap();
+        set_mtime(2_000);
+        let after = work_key(root, None);
+
+        assert_ne!(before, after);
+        assert_eq!(before.info_exclude_mtime, Some(1_000));
+        assert_eq!(after.info_exclude_mtime, Some(2_000));
+    }
+
+    #[test]
+    fn the_default_excludes_file_follows_xdg_config_home() {
+        assert_eq!(
+            default_excludes_file(Some("/x".into()), Some("/h".into())),
+            Some(PathBuf::from("/x/git/ignore"))
+        );
+        assert_eq!(
+            default_excludes_file(Some("".into()), Some("/h".into())),
+            Some(PathBuf::from("/h/.config/git/ignore"))
+        );
+        assert_eq!(
+            default_excludes_file(None, Some("/h".into())),
+            Some(PathBuf::from("/h/.config/git/ignore"))
+        );
+        assert_eq!(default_excludes_file(None, None), None);
     }
 
     // A linked worktree's git dir holds HEAD and refs but no `config` -- that

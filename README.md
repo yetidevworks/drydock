@@ -233,8 +233,9 @@ syscall time, roughly 85% of the total. So:
 
 - **Tier 1** — refs, tags, tracking counts, stash count, in-progress operations
   — runs on every sweep.
-- **Tier 2** — the working-tree scan — is cached against HEAD and the index
-  mtime, and only reruns where something actually moved.
+- **Tier 2** — the working-tree scan — is cached against HEAD, the index
+  mtime and the ignore files outside the tree (`.git/info/exclude` and your
+  global excludes file), and only reruns where something actually moved.
 - A **filesystem watcher** then re-probes individual repos as they change, which
   costs milliseconds. That is what makes leaving the dashboard open all day
   reasonable rather than a background CPU tax.
