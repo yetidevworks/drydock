@@ -136,12 +136,12 @@ where
 /// Decide whether a changed path could possibly affect what's on screen.
 fn is_interesting(path: &Path, prune: &HashSet<String>) -> bool {
     let mut inside_git = false;
-    let mut git_child: Option<String> = None;
+    let mut below_git: Vec<String> = Vec::new();
 
     for component in path.components() {
         let name = component.as_os_str().to_string_lossy();
-        if inside_git && git_child.is_none() {
-            git_child = Some(name.to_string());
+        if inside_git {
+            below_git.push(name.to_string());
             continue;
         }
         if name == ".git" {
@@ -153,13 +153,23 @@ fn is_interesting(path: &Path, prune: &HashSet<String>) -> bool {
         }
     }
 
-    match (inside_git, git_child) {
-        // A write directly to `.git` itself.
-        (true, None) => true,
-        // Only the paths that reflect repo state.
-        (true, Some(child)) => GIT_PATHS_OF_INTEREST.iter().any(|p| *p == child),
+    if !inside_git {
         // An ordinary working-tree file.
-        (false, _) => true,
+        return true;
+    }
+    let of_interest = |child: &str| GIT_PATHS_OF_INTEREST.contains(&child);
+    match below_git.as_slice() {
+        // A write directly to `.git` itself.
+        [] => true,
+        // A linked worktree keeps its HEAD and index in `worktrees/<name>`,
+        // so the same handful of paths count there. The entry itself coming
+        // or going is a worktree being added or removed, which counts too.
+        [worktrees, rest @ ..] if worktrees == "worktrees" => match rest {
+            [] | [_] => true,
+            [_, child, ..] => of_interest(child) || child == "gitdir",
+        },
+        // Only the paths that reflect repo state.
+        [child, ..] => of_interest(child),
     }
 }
 
@@ -181,7 +191,10 @@ fn owning_repo(path: &Path, roots: &[PathBuf]) -> Option<PathBuf> {
         .position(|c| c.as_os_str() == std::ffi::OsStr::new(".git"))
     {
         let trimmed: PathBuf = path.components().take(pos).collect();
-        return (!trimmed.as_os_str().is_empty()).then_some(trimmed);
+        if trimmed.as_os_str().is_empty() {
+            return None;
+        }
+        return Some(linked_worktree(path, pos).unwrap_or(trimmed));
     }
 
     let mut current = path;
@@ -194,6 +207,30 @@ fn owning_repo(path: &Path, roots: &[PathBuf]) -> Option<PathBuf> {
             return None;
         }
     }
+}
+
+/// For a path under `.git/worktrees/<name>`, the worktree it belongs to.
+///
+/// That's where a linked worktree's HEAD and index live, so a commit made in
+/// the worktree shows up here rather than anywhere under the worktree itself.
+/// It costs one read of the entry's `gitdir` pointer. Once the worktree is
+/// removed the pointer is gone with it, and the event falls back to the repo
+/// it was removed from, which is the row that has to notice.
+fn linked_worktree(path: &Path, git_pos: usize) -> Option<PathBuf> {
+    let mut below = path.components().skip(git_pos + 1);
+    if below.next()?.as_os_str() != "worktrees" {
+        return None;
+    }
+    let name = below.next()?;
+    let entry: PathBuf = path
+        .components()
+        .take(git_pos + 1)
+        .collect::<PathBuf>()
+        .join("worktrees")
+        .join(name);
+    let body = std::fs::read_to_string(entry.join("gitdir")).ok()?;
+    let checkout = entry.join(body.trim()).parent()?.to_path_buf();
+    checkout.canonicalize().ok()
 }
 
 #[cfg(test)]
@@ -247,6 +284,59 @@ mod tests {
             Path::new("/p/grav/grav/.git/MERGE_HEAD"),
             &prune
         ));
+    }
+
+    // Issue #15: a linked worktree's own HEAD and index live under its repo's
+    // `.git/worktrees/<name>`, and a worktree being added or removed shows up
+    // nowhere else.
+    #[test]
+    fn linked_worktree_state_is_interesting() {
+        let prune = prune_set();
+        for path in [
+            "/p/g/repo/.git/worktrees",
+            "/p/g/repo/.git/worktrees/feat",
+            "/p/g/repo/.git/worktrees/feat/HEAD",
+            "/p/g/repo/.git/worktrees/feat/index",
+            "/p/g/repo/.git/worktrees/feat/gitdir",
+        ] {
+            assert!(is_interesting(Path::new(path), &prune), "{path}");
+        }
+        assert!(!is_interesting(
+            Path::new("/p/g/repo/.git/worktrees/feat/COMMIT_EDITMSG"),
+            &prune
+        ));
+    }
+
+    #[test]
+    fn a_worktree_event_names_the_worktree_while_it_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let main = root.join("main");
+        std::fs::create_dir_all(&main).unwrap();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .current_dir(&main)
+                .args(args)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_SYSTEM", "/dev/null")
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@e")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@e")
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?}: {out:?}");
+        };
+        git(&["init", "-q", "-b", "main", "."]);
+        git(&["commit", "-qm", "init", "--allow-empty"]);
+        git(&["worktree", "add", "-q", "../feat", "-b", "feat"]);
+
+        let roots = vec![root.clone()];
+        let head = main.join(".git/worktrees/feat/HEAD");
+        assert_eq!(owning_repo(&head, &roots), Some(root.join("feat")));
+
+        git(&["worktree", "remove", "../feat"]);
+        assert_eq!(owning_repo(&head, &roots), Some(main));
     }
 
     #[test]

@@ -874,11 +874,48 @@ fn start_sweep(app: &mut App, tx: &mpsc::UnboundedSender<Input>, tier: Tier) {
 /// watching: a single repo costs milliseconds, where a full sweep costs seconds.
 fn reprobe_paths(app: &mut App, paths: Vec<PathBuf>, tx: &mpsc::UnboundedSender<Input>) {
     let mut targets: Vec<(PathBuf, String, String)> = Vec::new();
-    for path in paths {
-        if let Some(&idx) = app.by_root.get(&path) {
+    let add = |app: &App, targets: &mut Vec<(PathBuf, String, String)>, path: &PathBuf| {
+        if targets.iter().any(|(root, _, _)| root == path) {
+            return;
+        }
+        if let Some(&idx) = app.by_root.get(path) {
             let repo = &app.repos[idx];
             targets.push((repo.root.clone(), repo.group.clone(), repo.name.clone()));
+        } else if let Some(d) = crate::discover::admit(&app.cfg, path) {
+            // New since the last sweep: a fresh clone, or a worktree just
+            // added. Listed now rather than at the next sweep, as long as the
+            // sweep would list it too.
+            targets.push((d.root, d.group, d.name));
         }
+    };
+    let mut gone: Vec<PathBuf> = Vec::new();
+    for path in &paths {
+        add(app, &mut targets, path);
+        // A worktree removed from this repo has no files left to send an
+        // event of its own; the watcher reports the repo it was removed from
+        // instead. Settle that repo's worktrees against git's list.
+        if let Some(family) = git::worktree_family(path).filter(|f| &f.origin == path) {
+            gone.extend(
+                app.repos
+                    .iter()
+                    .filter(|r| r.worktree_of() == Some(path.as_path()))
+                    .filter(|r| !family.members.contains(&r.root))
+                    .map(|r| r.root.clone()),
+            );
+            // Only the new ones: a known worktree gets events of its own, and
+            // re-probing every member on each edit to the main checkout
+            // would multiply the work for nothing.
+            for member in &family.members {
+                if !app.by_root.contains_key(member) {
+                    add(app, &mut targets, member);
+                }
+            }
+        }
+    }
+    if !gone.is_empty() {
+        app.repos.retain(|r| !gone.contains(&r.root));
+        app.reindex();
+        app.recompute();
     }
     if targets.is_empty() {
         return;

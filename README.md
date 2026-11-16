@@ -193,6 +193,7 @@ drydock holds                                # what's held, and what has lifted
 drydock status .                             # everything about one repo
 drydock scan                                 # refresh the cache
 drydock scan --fetch                         # ...checking the remotes as it goes
+drydock scan .                               # just this repo and its worktrees
 drydock groups                               # per-group tallies
 drydock config init                          # write a config file
 ```
@@ -334,6 +335,16 @@ a `_worktrees/` folder full of feature names still tells you whose each one
 is. Worktrees sort in beside their repo by name, searching for a repo finds
 its worktrees too, and `⏎`, `drydock show` and `--json` (`worktree_of`) give
 the full path of the checkout it came from.
+
+An open dashboard lists a worktree as soon as `git worktree add` makes it and drops it when `git worktree remove` takes it away, without waiting for the next sweep. Commits made inside a worktree show up straight away too.
+
+The cache can be kept up to date the same way from outside the dashboard. `drydock scan <path>` refreshes one repo and all of its worktrees, and leaves every other cache entry alone: a new worktree is added, a removed one is taken out, and the path can be any of them, including one that has just been removed. It costs milliseconds rather than a walk of every root, so it suits a hook that runs whenever a worktree is created or removed:
+
+```sh
+drydock scan /path/to/the/worktree   # from a post-create or post-remove hook
+```
+
+It only adds repos a full `drydock scan` would also find, so a path outside your roots, or one that's excluded, pruned or too deep, is an error and leaves the cache as it was. `--fast`, `--fetch` and `--no-cache` work as they do on a full scan, applied to just those repos.
 
 ### Visibility
 

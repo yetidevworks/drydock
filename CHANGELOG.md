@@ -1,3 +1,14 @@
+# 1.4.1
+
+## 11/16/2026
+
+1. [](#new)
+    * **`drydock scan <path>` refreshes one repo and its worktrees** ([#15](https://github.com/yetidevworks/drydock/issues/15)). It updates just those entries in the cache that `drydock` and `drydock list` read, so a worktree hook can keep the cache current in milliseconds instead of walking every root. A new worktree is added, a removed one is taken out, and the path can be the repo, any of its worktrees, or a worktree that has just been removed. A path a full scan wouldn't list (outside the roots, excluded, pruned or too deep) is an error and leaves the cache as it was. `--fast`, `--fetch` and `--no-cache` work as they do on a full scan, for just those repos.
+2. [](#improved)
+    * **An open dashboard lists a new worktree straight away**, and drops one as soon as it's removed. Both used to wait for the next sweep, five minutes by default. A repo cloned into one of your roots is also listed as soon as the watcher sees it.
+3. [](#bugfix)
+    * A commit made inside a linked worktree now updates its row straight away. A worktree keeps its HEAD and index under its repo's `.git/worktrees/`, which the watcher ignored, so a worktree that went from dirty to committed kept showing as dirty until the next sweep.
+
 # 1.4.0
 
 ## 11/09/2026

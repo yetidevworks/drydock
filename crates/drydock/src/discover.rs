@@ -169,6 +169,72 @@ fn walk_root(
     }
 }
 
+/// Whether a full walk would list this checkout, and under what name.
+///
+/// For the callers that are handed one repo rather than walking for it -- a
+/// `drydock scan <path>`, or the dashboard noticing a new worktree -- so
+/// neither can add a row a sweep would never have found, and then lose it
+/// again at the next one. The rules are [`walk_root`]'s, applied to the one
+/// path: under a root, within `max_depth`, no hidden, pruned or excluded
+/// directory on the way down, and not inside another checkout's working tree
+/// unless `follow_nested_repos` is on.
+pub fn admit(cfg: &Config, path: &Path) -> Option<Discovered> {
+    let path = path.canonicalize().ok()?;
+    if !path.join(".git").exists() {
+        return None;
+    }
+    let excludes = build_excludes(&cfg.exclude).ok()?;
+    let prune: HashSet<String> = cfg.prune_names().into_iter().collect();
+    for root in cfg.root_paths() {
+        let root = root.canonicalize().unwrap_or(root);
+        let Ok(rel) = path.strip_prefix(&root) else {
+            continue;
+        };
+        if rel.as_os_str().is_empty() || !reachable(&root, rel, cfg, &excludes, &prune) {
+            continue;
+        }
+        let (group, name) = split_slug(&root, &path);
+        return Some(Discovered {
+            root: path,
+            group,
+            name,
+        });
+    }
+    None
+}
+
+/// Whether [`walk_root`] would get from `root` down to `root/rel`.
+fn reachable(
+    root: &Path,
+    rel: &Path,
+    cfg: &Config,
+    excludes: &Option<GlobSet>,
+    prune: &HashSet<String>,
+) -> bool {
+    if rel.components().count() > cfg.max_depth {
+        return false;
+    }
+    let mut dir = root.to_path_buf();
+    for component in rel.components() {
+        // Every directory above the repo, the root included, has to be one
+        // the walk keeps descending through.
+        if dir.join(".git").exists() && !cfg.follow_nested_repos && !git::is_bare(&dir) {
+            return false;
+        }
+        let name = component.as_os_str().to_string_lossy();
+        if name.starts_with('.') || prune.contains(name.as_ref()) {
+            return false;
+        }
+        dir.push(component);
+        if let (Some(set), Ok(rel)) = (excludes, dir.strip_prefix(root)) {
+            if set.is_match(rel) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
 /// Split a repo path into a group (its first segment below the root) and a
 /// name (everything after). A repo sitting directly in a root has no group.
 fn split_slug(root: &Path, repo: &Path) -> (String, String) {
@@ -323,6 +389,55 @@ mod tests {
             !slugs.iter().any(|n| n.contains("vendored")),
             "vendored checkout should have been pruned, got {slugs:?}"
         );
+    }
+
+    // Issue #15: a repo handed over by path gets the walk's answer, both for
+    // whether it's listed and for the group and name it's listed under.
+    #[test]
+    fn admitting_one_repo_agrees_with_the_walk() {
+        let dir = bare_repo_with_worktrees();
+        let base = dir.path().canonicalize().unwrap();
+        let repo = base.join("dev").join("myrepo");
+        std::fs::create_dir_all(repo.join("trunk").join("vendored").join(".git")).unwrap();
+        std::fs::create_dir_all(base.join("dev").join("skipme").join(".git")).unwrap();
+        std::fs::create_dir_all(base.join("dev").join("node_modules/x/.git")).unwrap();
+
+        let cfg = Config {
+            roots: vec![base.join("dev").to_string_lossy().to_string()],
+            exclude: vec!["skipme/**".into()],
+            ..Config::default()
+        };
+        let (found, _) = discover(&cfg).unwrap();
+        assert!(!found.is_empty());
+        for d in &found {
+            let admitted = admit(&cfg, &d.root).expect("the walk found it");
+            assert_eq!(
+                (&admitted.root, &admitted.group, &admitted.name),
+                (&d.root, &d.group, &d.name)
+            );
+        }
+
+        for left_out in [
+            repo.join("trunk").join("vendored"),     // inside a working tree
+            base.join("dev").join("skipme"),         // excluded
+            base.join("dev").join("node_modules/x"), // pruned
+            base.join("upstream"),                   // outside every root
+            base.join("dev"),                        // the root itself
+        ] {
+            assert!(
+                admit(&cfg, &left_out).is_none(),
+                "{} should not be admitted",
+                left_out.display()
+            );
+            assert!(!found.iter().any(|d| d.root == left_out));
+        }
+
+        let shallow = Config {
+            max_depth: 1,
+            ..cfg.clone()
+        };
+        assert!(admit(&shallow, &repo).is_some());
+        assert!(admit(&shallow, &repo.join("trunk")).is_none());
     }
 
     #[test]

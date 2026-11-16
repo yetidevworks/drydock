@@ -48,6 +48,13 @@ async fn main() -> Result<()> {
             json,
         }) => cmd_releasable(min_commits, include_changelog, include_held, json, &roots).await,
         Some(Commands::Scan {
+            path: Some(path),
+            fast,
+            no_cache,
+            fetch,
+        }) => cmd_scan_one(&path, fast, no_cache, fetch, &roots).await,
+        Some(Commands::Scan {
+            path: None,
             fast,
             no_cache,
             fetch,
@@ -473,6 +480,197 @@ async fn cmd_scan(fast: bool, no_cache: bool, fetch: bool, roots: &[String]) -> 
         }
     }
     Ok(())
+}
+
+/// `drydock scan <path>`: refresh one repo and its worktrees in the cache,
+/// leaving every other entry as it was.
+///
+/// The unit is the whole worktree family rather than the one checkout named,
+/// because the hooks this exists for (issue #15) fire on a worktree being
+/// added or removed, and the only place that change shows is the family's
+/// list. A path that has already gone is fine: its cached rows are dropped,
+/// and whatever repo they were worktrees of is refreshed in their place.
+async fn cmd_scan_one(
+    path: &str,
+    fast: bool,
+    no_cache: bool,
+    fetch: bool,
+    roots: &[String],
+) -> Result<()> {
+    let cfg = load_config(roots);
+    let started = std::time::Instant::now();
+    let target = canonical_or_nearest(&paths::expand(path));
+    let mut cache = cache::load();
+
+    // What the refresh replaces: rows for the gone path, and every family
+    // touched, found again from what's on disk now.
+    let mut dropped: Vec<RepoStatus> = Vec::new();
+    let mut families: Vec<git::Family> = Vec::new();
+    if target.exists() {
+        let root = find_repo_root(&target)
+            .ok_or_else(|| anyhow!("No git repo at or above {}", paths::contract(&target)))?;
+        let family = git::worktree_family(&root)
+            .ok_or_else(|| anyhow!("{} has no readable .git", paths::contract(&root)))?;
+        families.push(family);
+    } else {
+        let gone: Vec<PathBuf> = cache
+            .keys()
+            .filter(|root| root.starts_with(&target))
+            .cloned()
+            .collect();
+        if gone.is_empty() {
+            return Err(anyhow!(
+                "Nothing at {}, and no cached repo there to drop",
+                paths::contract(&target)
+            ));
+        }
+        for root in gone {
+            let status = cache.remove(&root).expect("listed from the cache");
+            if let Some(family) = status.worktree_of().and_then(git::worktree_family) {
+                if !families.contains(&family) {
+                    families.push(family);
+                }
+            }
+            dropped.push(status);
+        }
+    }
+
+    let mut wanted: Vec<discover::Discovered> = Vec::new();
+    let mut unlisted: Vec<PathBuf> = Vec::new();
+    for family in &families {
+        for member in &family.members {
+            match discover::admit(&cfg, member) {
+                Some(d) => wanted.push(d),
+                None => unlisted.push(member.clone()),
+            }
+        }
+    }
+
+    // Take every cached row for these families out. A member that's still
+    // listed keeps its row as the probe's previous answer, which is what lets
+    // an unchanged working tree skip its scan; one that's gone is reported.
+    let mut previous: std::collections::HashMap<PathBuf, RepoStatus> = Default::default();
+    let stale: Vec<PathBuf> = cache
+        .values()
+        .filter(|r| {
+            families.iter().any(|f| {
+                f.members.contains(&r.root)
+                    || r.root == f.origin
+                    || r.worktree_of() == Some(f.origin.as_path())
+            })
+        })
+        .map(|r| r.root.clone())
+        .collect();
+    for root in stale {
+        let status = cache.remove(&root).expect("listed from the cache");
+        if wanted.iter().any(|d| d.root == root) {
+            if !no_cache {
+                previous.insert(root, status);
+            }
+        } else if !families.iter().any(|f| f.members.contains(&root)) {
+            dropped.push(status);
+        }
+    }
+
+    if wanted.is_empty() && dropped.is_empty() {
+        return Err(anyhow!(
+            "A full scan wouldn't list {} (it's outside the scan roots, or excluded, \
+             pruned or too deep), so the cache is unchanged",
+            paths::contract(&target)
+        ));
+    }
+
+    let fetch = if fetch && !wanted.is_empty() {
+        // Linked worktrees share their repo's refs, so one fetch per family
+        // covers all of them.
+        let mut once: Vec<PathBuf> = Vec::new();
+        for family in &families {
+            if let Some(d) = wanted.iter().find(|d| family.members.contains(&d.root)) {
+                once.push(d.root.clone());
+            }
+        }
+        eprintln!("drydock: fetching...");
+        Some(probe::fetch_all(cfg.clone(), once).await)
+    } else {
+        None
+    };
+
+    let tier = if fast { Tier::Refs } else { Tier::Full };
+    let mut timings = probe::Timings::default();
+    let fresh = probe::sweep_repos(
+        cfg.clone(),
+        wanted,
+        previous,
+        Arc::new(hold::load()),
+        tier,
+        &None,
+        &mut timings,
+    )
+    .await;
+
+    let mut repos: Vec<RepoStatus> = cache.into_values().chain(fresh.iter().cloned()).collect();
+    repos.sort_by(|a, b| a.root.cmp(&b.root));
+    cache::save(&repos)?;
+
+    let names = |rows: &[RepoStatus]| {
+        rows.iter()
+            .map(|r| r.display_name())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    if !fresh.is_empty() {
+        println!(
+            "Refreshed {} in {}: {}",
+            count_of("repo", fresh.len()),
+            fmt::duration(started.elapsed()),
+            names(&fresh)
+        );
+    }
+    if !dropped.is_empty() {
+        println!("Dropped, no longer on disk: {}", names(&dropped));
+    }
+    for path in unlisted {
+        println!(
+            "Left out, a full scan wouldn't list it: {}",
+            paths::contract(&path)
+        );
+    }
+    if fast && !fresh.is_empty() {
+        println!("Working trees were not scanned (--fast).");
+    }
+    if let Some(report) = fetch {
+        if report.failed > 0 {
+            println!(
+                "The fetch failed for {}, which shows its last known counts.",
+                count_of("repo", report.failed)
+            );
+        }
+    }
+    Ok(())
+}
+
+fn count_of(noun: &str, count: usize) -> String {
+    format!("{count} {noun}{}", if count == 1 { "" } else { "s" })
+}
+
+/// Canonicalize a path that may no longer exist, by resolving the deepest
+/// ancestor that does. A removed worktree has to come out matching the
+/// canonical root it was cached under, or nothing would be dropped.
+fn canonical_or_nearest(path: &Path) -> PathBuf {
+    let mut tail: Vec<&std::ffi::OsStr> = Vec::new();
+    let mut current = path;
+    loop {
+        if let Ok(resolved) = current.canonicalize() {
+            return tail.iter().rev().fold(resolved, |p, part| p.join(part));
+        }
+        match (current.file_name(), current.parent()) {
+            (Some(name), Some(parent)) => {
+                tail.push(name);
+                current = parent;
+            }
+            _ => return path.to_path_buf(),
+        }
+    }
 }
 
 async fn cmd_groups(json: bool, roots: &[String]) -> Result<()> {

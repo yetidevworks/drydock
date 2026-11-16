@@ -644,6 +644,60 @@ fn worktree_origin(git_dir: &Path) -> Option<PathBuf> {
     }
 }
 
+/// A repository and every linked worktree it has right now.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Family {
+    /// The checkout the worktrees were added from: the main working tree, or
+    /// the bare repo when there isn't one. The same path a member's
+    /// `worktree_of` names.
+    pub origin: PathBuf,
+    /// The origin itself followed by each linked worktree still on disk,
+    /// all canonical.
+    pub members: Vec<PathBuf>,
+}
+
+/// Find the repository a checkout belongs to, and all of its worktrees.
+///
+/// Read straight from git's own bookkeeping rather than from a walk: every
+/// linked worktree has a `worktrees/<name>/gitdir` file in the shared git dir
+/// naming its `.git` file, so the list costs one small directory read. A
+/// worktree whose directory has gone (removed by hand, not pruned yet) is
+/// left out, the same as a walk would leave it out.
+pub fn worktree_family(root: &Path) -> Option<Family> {
+    let git_dir = resolve_git_dir(root).ok()?;
+    let common = common_git_dir(&git_dir);
+    let common = common.canonicalize().unwrap_or(common);
+    let origin = if common.file_name().is_some_and(|n| n == ".git") {
+        common.parent()?.to_path_buf()
+    } else {
+        common.clone()
+    };
+
+    let mut members = vec![origin.clone()];
+    let mut linked: Vec<PathBuf> = std::fs::read_dir(common.join("worktrees"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|entry| {
+            let body = std::fs::read_to_string(entry.path().join("gitdir")).ok()?;
+            // Relative under `worktree.useRelativePaths`, from this entry.
+            let dot_git = entry.path().join(body.trim());
+            let checkout = dot_git.parent()?;
+            checkout.join(".git").exists().then_some(())?;
+            Some(
+                checkout
+                    .canonicalize()
+                    .unwrap_or_else(|_| checkout.to_path_buf()),
+            )
+        })
+        .collect();
+    linked.sort();
+    linked.dedup();
+    linked.retain(|p| *p != origin);
+    members.extend(linked);
+    Some(Family { origin, members })
+}
+
 /// Pull the bits of `.git/config` worth having without paying for a `git
 /// config` process. `origin` wins if present, otherwise the first remote found.
 fn scan_git_config(git_dir: &Path) -> GitConfigScan {
@@ -1038,6 +1092,63 @@ mod tests {
             scan_git_config(&git_dir).remote_url.as_deref(),
             Some("git@github.com:owner/repo.git")
         );
+    }
+
+    // Issue #15: refreshing one worktree has to reach the rest of its repo,
+    // from whichever member the path names, and has to stop listing a
+    // worktree the moment it's removed.
+    #[test]
+    fn a_worktree_family_is_the_same_from_any_member() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("main");
+        std::fs::create_dir_all(&main).unwrap();
+        git(&main, &["init", "-q", "-b", "main", "."]);
+        git(&main, &["commit", "-qm", "init", "--allow-empty"]);
+        git(&main, &["worktree", "add", "-q", "../a", "-b", "a"]);
+        git(&main, &["worktree", "add", "-q", "../b", "-b", "b"]);
+
+        let canon = |p: &str| dir.path().join(p).canonicalize().unwrap();
+        let expected = Family {
+            origin: canon("main"),
+            members: vec![canon("main"), canon("a"), canon("b")],
+        };
+        assert_eq!(worktree_family(&main).as_ref(), Some(&expected));
+        assert_eq!(worktree_family(&canon("b")).as_ref(), Some(&expected));
+
+        git(&main, &["worktree", "remove", "../a"]);
+        assert_eq!(
+            worktree_family(&main).unwrap().members,
+            vec![canon("main"), canon("b")]
+        );
+
+        // Deleted by hand and not pruned yet: git still has the entry, but
+        // there's nothing on disk to report on.
+        std::fs::remove_dir_all(canon("b")).unwrap();
+        assert_eq!(worktree_family(&main).unwrap().members, vec![canon("main")]);
+    }
+
+    #[test]
+    fn a_bare_repos_family_is_named_for_its_container() {
+        let dir = tempfile::tempdir().unwrap();
+        let upstream = dir.path().join("upstream");
+        std::fs::create_dir_all(&upstream).unwrap();
+        git(&upstream, &["init", "-q", "-b", "main", "."]);
+        git(&upstream, &["commit", "-qm", "init", "--allow-empty"]);
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        git(
+            &repo,
+            &["clone", "-q", "--bare", upstream.to_str().unwrap(), ".git"],
+        );
+        git(
+            &repo,
+            &["--git-dir=.git", "worktree", "add", "-q", "trunk", "main"],
+        );
+
+        let family = worktree_family(&repo.join("trunk")).unwrap();
+        let repo = repo.canonicalize().unwrap();
+        assert_eq!(family.origin, repo);
+        assert_eq!(family.members, vec![repo.clone(), repo.join("trunk")]);
     }
 
     // `core.bare` describes the repository, and a linked worktree of a bare

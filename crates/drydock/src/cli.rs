@@ -80,7 +80,15 @@ pub enum Commands {
     },
 
     /// Walk the roots, probe everything, and refresh the cache.
+    ///
+    /// Given a path, refresh just that repo and its linked worktrees instead
+    /// of walking every root: a worktree that's been added is put in the
+    /// cache, and one that's been removed is taken out. Quick enough to run
+    /// from a `git worktree` hook.
     Scan {
+        /// A repo or worktree, or one that has just been removed. Must be
+        /// somewhere a full scan would find it.
+        path: Option<String>,
         /// Skip working-tree scans. Much faster, but no change counts.
         #[arg(long)]
         fast: bool,
