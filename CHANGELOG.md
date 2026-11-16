@@ -7,6 +7,7 @@
 2. [](#improved)
     * **An open dashboard lists a new worktree straight away**, and drops one as soon as it's removed. Both used to wait for the next sweep, five minutes by default. A repo cloned into one of your roots is also listed as soon as the watcher sees it.
 3. [](#bugfix)
+    * **Editing an ignore file outside the repo now updates its status** ([#14](https://github.com/yetidevworks/drydock/pull/14)). `.git/info/exclude` and your global excludes file (`core.excludesFile`, or `~/.config/git/ignore`) change what `git status` counts as untracked without touching HEAD or the index, so drydock kept its cached answer. Adding `.DS_Store` to the global file left every repo holding one marked dirty until `status.max_age` ran out, or forever with an empty `max_age`. Both files are now part of the cache key, so the first scan after upgrading rescans every repo once. An open dashboard picks up an edit to `.git/info/exclude` straight away. Thanks to @broeneatsdinner for the report and the fix.
     * A commit made inside a linked worktree now updates its row straight away. A worktree keeps its HEAD and index under its repo's `.git/worktrees/`, which the watcher ignored, so a worktree that went from dirty to committed kept showing as dirty until the next sweep.
 
 # 1.4.0

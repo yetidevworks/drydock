@@ -44,6 +44,9 @@ const GIT_PATHS_OF_INTEREST: &[&str] = &[
     "rebase-merge",
     "rebase-apply",
     "shallow",
+    // `info/exclude` decides what `git status` counts as untracked, without
+    // touching HEAD or the index.
+    "info",
 ];
 
 /// Start watching every configured root. `on_change` is called with the repo
@@ -282,6 +285,10 @@ mod tests {
         ));
         assert!(is_interesting(
             Path::new("/p/grav/grav/.git/MERGE_HEAD"),
+            &prune
+        ));
+        assert!(is_interesting(
+            Path::new("/p/grav/grav/.git/info/exclude"),
             &prune
         ));
     }
