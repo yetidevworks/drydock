@@ -133,7 +133,7 @@ fn work_expired(prev: &RepoStatus, cfg: &Config, now: i64) -> bool {
     }
 }
 
-/// Tier 2 for one repo, reusing the cache when HEAD and the index both match.
+/// Tier 2 for one repo, reusing the cache when [`git::work_key`] matches.
 ///
 /// `force` skips that reuse. The watcher passes it, because a filesystem event
 /// is direct evidence the working tree moved — evidence the key cannot carry.

@@ -231,13 +231,20 @@ impl WorkInfo {
     }
 }
 
-/// Cache validity key for tier 2. If HEAD and the index are unchanged, a
-/// cached working-tree result is still good.
+/// Cache validity key for tier 2. If HEAD, the index and the ignore rules
+/// outside the working tree are unchanged, a cached working-tree result is
+/// still good.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WorkKey {
     pub head_sha: Option<String>,
     pub index_mtime: Option<i64>,
     pub index_size: Option<u64>,
+    /// The ignore files outside the tree. Missing from caches written before
+    /// they were part of the key, which then rescan once.
+    #[serde(default)]
+    pub info_exclude_mtime: Option<i64>,
+    #[serde(default)]
+    pub global_excludes_mtime: Option<i64>,
 }
 
 /// Why a repo's activity timestamp is what it is, so the age column can always
