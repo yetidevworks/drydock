@@ -140,9 +140,10 @@ fn walk_root(
 
         if is_repo {
             // Canonicalize so a symlinked path and its target can't both land
-            // in the list.
+            // in the list. The root itself counts too, so a single checkout
+            // like `~/.dotfiles` can be a root of its own.
             let canonical = dir.canonicalize().unwrap_or_else(|_| dir.clone());
-            if seen.insert(canonical) && dir != root {
+            if seen.insert(canonical) {
                 let (group, name) = split_slug(root, &dir);
                 found.push(Discovered {
                     root: dir.clone(),
@@ -190,7 +191,7 @@ pub fn admit(cfg: &Config, path: &Path) -> Option<Discovered> {
         let Ok(rel) = path.strip_prefix(&root) else {
             continue;
         };
-        if rel.as_os_str().is_empty() || !reachable(&root, rel, cfg, &excludes, &prune) {
+        if !reachable(&root, rel, cfg, &excludes, &prune) {
             continue;
         }
         let (group, name) = split_slug(&root, &path);
@@ -236,7 +237,8 @@ fn reachable(
 }
 
 /// Split a repo path into a group (its first segment below the root) and a
-/// name (everything after). A repo sitting directly in a root has no group.
+/// name (everything after). A repo sitting directly in a root has no group,
+/// and neither does a root that is a repo, which is named after its directory.
 fn split_slug(root: &Path, repo: &Path) -> (String, String) {
     let rel = match repo.strip_prefix(root) {
         Ok(r) => r,
@@ -247,7 +249,12 @@ fn split_slug(root: &Path, repo: &Path) -> (String, String) {
         .map(|c| c.as_os_str().to_string_lossy().to_string())
         .collect();
     match parts.len() {
-        0 => (String::new(), root.display().to_string()),
+        0 => (
+            String::new(),
+            root.file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| root.display().to_string()),
+        ),
         1 => (String::new(), parts[0].clone()),
         _ => (parts[0].clone(), parts[1..].join("/")),
     }
@@ -422,7 +429,7 @@ mod tests {
             base.join("dev").join("skipme"),         // excluded
             base.join("dev").join("node_modules/x"), // pruned
             base.join("upstream"),                   // outside every root
-            base.join("dev"),                        // the root itself
+            base.join("dev"),                        // a root, but not a repo
         ] {
             assert!(
                 admit(&cfg, &left_out).is_none(),
@@ -438,6 +445,33 @@ mod tests {
         };
         assert!(admit(&shallow, &repo).is_some());
         assert!(admit(&shallow, &repo.join("trunk")).is_none());
+    }
+
+    // A root can be one checkout rather than a directory of them, like
+    // `~/.dotfiles`: it's listed under its own name, with no group.
+    #[test]
+    fn a_root_that_is_a_repo_is_listed() {
+        let dir = bare_repo_with_worktrees();
+        let base = dir.path().canonicalize().unwrap();
+        let upstream = base.join("upstream");
+        std::fs::create_dir_all(upstream.join("vendored").join(".git")).unwrap();
+
+        assert_eq!(slugs_found(&upstream, false), vec!["upstream".to_string()]);
+
+        let cfg = Config {
+            roots: vec![upstream.to_string_lossy().to_string()],
+            ..Config::default()
+        };
+        let admitted = admit(&cfg, &upstream).expect("the root is a repo");
+        assert_eq!(
+            (admitted.group.as_str(), admitted.name.as_str()),
+            ("", "upstream")
+        );
+        assert!(admit(&cfg, &upstream.join("vendored")).is_none());
+
+        // A bare root still descends to its worktrees.
+        let slugs = slugs_found(&base.join("dev").join("myrepo"), false);
+        assert_eq!(slugs, vec!["myrepo".to_string(), "trunk".to_string()]);
     }
 
     #[test]
