@@ -477,6 +477,7 @@ nothing keeps the platform default.
 ```toml
 roots = ["~/Projects"]       # each immediate subdirectory becomes a "group"
                              # `~` and `$VAR` expand; `--root` overrides them
+                             # a root can also be one repo, e.g. `~/.dotfiles`
 max_depth = 4
 follow_nested_repos = false  # keeps submodules and vendored checkouts out
                              # (bare repos always descend — see "Worktrees")
