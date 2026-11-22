@@ -239,7 +239,7 @@ fn reachable(
 /// Split a repo path into a group (its first segment below the root) and a
 /// name (everything after). A repo sitting directly in a root has no group,
 /// and neither does a root that is a repo, which is named after its directory.
-fn split_slug(root: &Path, repo: &Path) -> (String, String) {
+pub(crate) fn split_slug(root: &Path, repo: &Path) -> (String, String) {
     let rel = match repo.strip_prefix(root) {
         Ok(r) => r,
         Err(_) => return (String::new(), repo.display().to_string()),

@@ -1,3 +1,12 @@
+# 1.4.2
+
+## 11/22/2026
+
+1. [](#improved)
+    * **A root can be a single repo** ([#17](https://github.com/yetidevworks/drydock/pull/17)), so a checkout that lives on its own, like `~/.dotfiles`, can be listed with `roots = ["~/Projects", "~/.dotfiles"]`. drydock never listed a root itself, and hidden folders are skipped below a root, so there was no way to list one before. It's listed under its folder name with no group, and `drydock scan <path>`, `drydock status` and the dashboard's watcher all accept it. If one of your roots is already a repo, it shows up as a new row after upgrading. Thanks to @broeneatsdinner for the report and the fix.
+2. [](#bugfix)
+    * `drydock status` and `drydock hold` now name a repo under a symlinked root the same way the table does. They compared the repo's resolved path with the root as written, so it never matched, and the repo lost its group.
+
 # 1.4.1
 
 ## 11/16/2026

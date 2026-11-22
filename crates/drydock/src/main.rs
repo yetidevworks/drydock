@@ -987,17 +987,12 @@ fn find_repo_root(start: &Path) -> Option<PathBuf> {
 /// Work out the group and name for a repo found outside a normal sweep, so a
 /// one-off `status` call labels it the same way the table would.
 fn split_for_display(cfg: &config::Config, root: &Path) -> (String, String) {
+    // Canonicalized like the walk's roots, since `resolve_repo` hands over a
+    // canonical path and a symlinked root would otherwise never match.
     for scan_root in cfg.root_paths() {
-        if let Ok(rel) = root.strip_prefix(&scan_root) {
-            let parts: Vec<String> = rel
-                .components()
-                .map(|c| c.as_os_str().to_string_lossy().to_string())
-                .collect();
-            return match parts.len() {
-                0 => (String::new(), root.display().to_string()),
-                1 => (String::new(), parts[0].clone()),
-                _ => (parts[0].clone(), parts[1..].join("/")),
-            };
+        let scan_root = scan_root.canonicalize().unwrap_or(scan_root);
+        if root.starts_with(&scan_root) {
+            return discover::split_slug(&scan_root, root);
         }
     }
     (
