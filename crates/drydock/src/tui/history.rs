@@ -10,7 +10,7 @@
 //! for each commit it passes; each one cancels the last, and an answer for a
 //! commit the cursor has already left is dropped on arrival.
 
-use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
+use crossterm::event::{KeyCode, KeyEvent, MouseEvent, MouseEventKind};
 use ratatui::{
     layout::Rect,
     style::{Color, Modifier, Style},
@@ -24,6 +24,7 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
+use super::selection::{ContentKey, PaneSnapshot, RowTarget};
 use super::ui::{pad, ACCENT, BEHIND, CLEAN, DIM, DIRTY, TROUBLE, UNPUSHED, UNRELEASED};
 use super::{App, Input, Mode};
 use crate::commits::{
@@ -210,7 +211,7 @@ impl HistoryView {
         self.entry_at(self.cursor)
     }
 
-    fn selected_commit(&self) -> Option<&Commit> {
+    pub(super) fn selected_commit(&self) -> Option<&Commit> {
         match self.row(self.cursor)? {
             Row::Commit(_, c) => Some(c),
             _ => None,
@@ -558,7 +559,6 @@ pub fn handle_key(app: &mut App, key: KeyEvent, tx: &mpsc::UnboundedSender<Input
                 app.notify(format!("History of {what}"));
             }
         }
-        // The hand-off keys, copy included, are handled before this.
         KeyCode::Char('w') => super::open_remote(app),
         _ => {}
     }
@@ -663,27 +663,27 @@ fn jump_file(app: &mut App, forward: bool) {
     }
 }
 
-pub fn handle_mouse(app: &mut App, ev: MouseEvent, tx: &mpsc::UnboundedSender<Input>) {
-    let (list, diff) = panes(app.area);
+pub fn scroll_wheel(app: &mut App, ev: MouseEvent, tx: &mpsc::UnboundedSender<Input>) {
+    let (_, diff) = panes(app.area);
     let over_list = ev.column < diff.x;
     match ev.kind {
         MouseEventKind::ScrollDown if over_list => move_cursor(app, 1, tx),
         MouseEventKind::ScrollUp if over_list => move_cursor(app, -1, tx),
         MouseEventKind::ScrollDown => scroll_diff(app, WHEEL_LINES as isize),
         MouseEventKind::ScrollUp => scroll_diff(app, -(WHEEL_LINES as isize)),
-        MouseEventKind::Down(MouseButton::Left) if over_list => {
-            if ev.row < list.y || ev.row >= list.y + list.height {
-                return;
-            }
-            let Some(view) = app.history.as_mut() else {
-                return;
-            };
-            let row = view.list_scroll + (ev.row - list.y) as usize;
-            if view.entry_at(row).is_some() && view.place_cursor(row, list.height as usize) {
-                request_changes(view, tx);
-            }
-        }
         _ => {}
+    }
+}
+
+pub(super) fn select_entry(app: &mut App, entry: &Entry, tx: &mpsc::UnboundedSender<Input>) {
+    let height = panes(app.area).0.height as usize;
+    let Some(view) = app.history.as_mut() else {
+        return;
+    };
+    if let Some(row) = view.row_of(entry) {
+        if view.place_cursor(row, height) {
+            request_changes(view, tx);
+        }
     }
 }
 
@@ -691,9 +691,9 @@ pub fn handle_mouse(app: &mut App, ev: MouseEvent, tx: &mpsc::UnboundedSender<In
 // Drawing
 // ---------------------------------------------------------------------------
 
-pub fn render(f: &mut Frame, app: &App) {
+pub(super) fn render(f: &mut Frame, app: &App) -> Vec<PaneSnapshot> {
     let Some(view) = app.history.as_ref() else {
-        return;
+        return Vec::new();
     };
     let outer = frame(f.area());
     let (list, diff) = panes(f.area());
@@ -769,11 +769,19 @@ pub fn render(f: &mut Frame, app: &App) {
         },
     );
 
-    render_list(f, app, view, list);
+    let list = render_list(f, app, view, list);
     render_diff(f, app, view, diff);
+    let key = ContentKey::HistoryDiff {
+        root: view.root.clone(),
+        entry: view.selected(),
+        scroll: view.diff_scroll,
+        wrap: view.wrap,
+    };
+    let diff = PaneSnapshot::capture(f.buffer_mut(), diff, key);
+    list.into_iter().chain(diff).collect()
 }
 
-fn render_list(f: &mut Frame, app: &App, view: &HistoryView, area: Rect) {
+fn render_list(f: &mut Frame, app: &App, view: &HistoryView, area: Rect) -> Option<PaneSnapshot> {
     let height = area.height as usize;
     let width = area.width as usize;
     let total = view.row_count();
@@ -811,6 +819,16 @@ fn render_list(f: &mut Frame, app: &App, view: &HistoryView, area: Rect) {
         _ => {}
     }
     f.render_widget(Paragraph::new(lines), area);
+    let key = ContentKey::HistoryList {
+        root: view.root.clone(),
+        scope: view.scope,
+        scroll,
+        cursor: view.cursor,
+    };
+    let targets = (scroll..(scroll + height).min(total))
+        .map(|row| view.entry_at(row).map(RowTarget::History))
+        .collect();
+    PaneSnapshot::capture(f.buffer_mut(), area, key).map(|pane| pane.with_targets(targets))
 }
 
 fn uncommitted_line(view: &HistoryView, width: usize, selected: bool) -> Line<'static> {
@@ -1106,20 +1124,16 @@ const GUTTER: usize = 11;
 /// prose wraps between words; code with no space to break at is cut where
 /// the row ends.
 fn wrap_line(line: Line<'static>, width: usize, indent: usize) -> Vec<Line<'static>> {
-    use unicode_width::UnicodeWidthChar;
+    use unicode_width::UnicodeWidthStr;
 
     if width <= indent + 1 || line.width() <= width {
         return vec![line];
     }
-    let cells: Vec<(char, Style, usize)> = line
+    let cells: Vec<(&str, Style, usize)> = line
         .spans
         .iter()
-        .flat_map(|span| {
-            let style = span.style;
-            span.content
-                .chars()
-                .map(move |ch| (ch, style, ch.width().unwrap_or(0)))
-        })
+        .flat_map(|span| span.styled_graphemes(Style::default()))
+        .map(|glyph| (glyph.symbol, glyph.style, glyph.symbol.width()))
         .collect();
 
     let mut rows = Vec::new();
@@ -1133,7 +1147,7 @@ fn wrap_line(line: Line<'static>, width: usize, indent: usize) -> Vec<Line<'stat
             used += cells[end].2;
             end += 1;
         }
-        // Always take at least one character, or a character wider than the
+        // Always take at least one grapheme, or a grapheme wider than the
         // row would never be placed.
         end = end.max(start + 1);
         if end < cells.len() {
@@ -1141,7 +1155,7 @@ fn wrap_line(line: Line<'static>, width: usize, indent: usize) -> Vec<Line<'stat
             // padding rather than gaps between words.
             let gutter = if rows.is_empty() { indent + 1 } else { 0 };
             let floor = (start + (end - start) / 3).max(gutter);
-            if let Some(space) = (floor..end).rev().find(|i| cells[*i].0 == ' ') {
+            if let Some(space) = (floor..end).rev().find(|i| cells[*i].0 == " ") {
                 end = space + 1;
             }
         }
@@ -1155,7 +1169,7 @@ fn wrap_line(line: Line<'static>, width: usize, indent: usize) -> Vec<Line<'stat
             let style = cells[i].1;
             let mut text = String::new();
             while i < end && cells[i].1 == style {
-                text.push(cells[i].0);
+                text.push_str(cells[i].0);
                 i += 1;
             }
             spans.push(Span::styled(text, style));
@@ -1470,8 +1484,56 @@ fn clean(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::super::{clipboard, draw, handle_terminal_event, send_clipboard};
     use super::*;
     use crate::commits::{Flow, LogRow};
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    use crossterm::event::{Event, KeyModifiers, MouseButton};
+    use ratatui::{backend::TestBackend, Terminal};
+
+    fn send_mouse(
+        terminal: &mut Terminal<TestBackend>,
+        app: &mut App,
+        tx: &mpsc::UnboundedSender<Input>,
+        kind: MouseEventKind,
+        column: u16,
+        row: u16,
+    ) {
+        handle_terminal_event(
+            terminal,
+            app,
+            Event::Mouse(MouseEvent {
+                kind,
+                column,
+                row,
+                modifiers: KeyModifiers::NONE,
+            }),
+            tx,
+        )
+        .unwrap();
+        draw(terminal, app).unwrap();
+    }
+
+    fn pointer_app(view: HistoryView) -> App {
+        let mut app = App::new(Arc::new(crate::config::Config::default()));
+        app.mode = Mode::History;
+        app.history = Some(view);
+        app
+    }
+
+    fn copied_selection(app: &mut App, clipboard: &clipboard::Clipboard) -> Option<String> {
+        let mut output = Vec::new();
+        send_clipboard(app, &mut output, clipboard);
+        if output.is_empty() {
+            return None;
+        }
+        let data = output
+            .strip_prefix(b"\x1b]52;c;")
+            .unwrap()
+            .strip_suffix(b"\x07")
+            .unwrap();
+        Some(String::from_utf8(STANDARD.decode(data).unwrap()).unwrap())
+    }
 
     fn commit(sha: &str) -> Commit {
         Commit {
@@ -1515,6 +1577,267 @@ mod tests {
         };
         v.set_log(Ok(log), 10);
         v
+    }
+
+    #[tokio::test]
+    async fn history_drags_stay_on_the_side_where_they_started() {
+        let mut view = view(false);
+        let refs = vec![RefLabel {
+            name: "界👩‍💻".into(),
+            kind: RefKind::Tag,
+        }];
+        let Some(Ok(log)) = view.log.as_mut() else {
+            unreachable!()
+        };
+        log.commits[0].refs = refs.clone();
+        log.commits[0].subject = String::new();
+        view.changes.insert(
+            Entry::Commit("a".into()),
+            Ok(Arc::new(Changes {
+                header: Some(commits::Header {
+                    sha: "abcdef".into(),
+                    parents: Vec::new(),
+                    author: "Andy".into(),
+                    author_email: "andy@example.com".into(),
+                    author_date: String::new(),
+                    author_at: 0,
+                    committer: "Andy".into(),
+                    committer_email: "andy@example.com".into(),
+                    committer_date: String::new(),
+                    refs,
+                    message: String::new(),
+                }),
+                ..Changes::default()
+            })),
+        );
+        let mut app = pointer_app(view);
+        let mut terminal = Terminal::new(TestBackend::new(90, 24)).unwrap();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let clipboard = clipboard::Clipboard::start(true, vec![], tx.clone());
+        draw(&mut terminal, &mut app).unwrap();
+
+        let (list, diff) = panes(app.area);
+        let divider = list.right();
+        for (pane, opposite_x, reversed) in [(list, diff.x, true), (diff, list.x, false)] {
+            let before = terminal.backend().buffer();
+            let tag = pane
+                .positions()
+                .find(|pos| before[*pos].symbol() == "界")
+                .unwrap();
+            assert_eq!(before[tag].bg, Color::Yellow);
+            assert_eq!(before[tag].modifier.contains(Modifier::REVERSED), reversed);
+            let divider_bg = before[(divider, tag.y)].bg;
+            let emoji = pane
+                .positions()
+                .find(|pos| before[*pos].symbol() == "👩‍💻")
+                .unwrap();
+
+            let (start, end) = if reversed {
+                (tag.x + 1, opposite_x)
+            } else {
+                (emoji.x + 1, opposite_x)
+            };
+            send_mouse(
+                &mut terminal,
+                &mut app,
+                &tx,
+                MouseEventKind::Down(MouseButton::Left),
+                start,
+                tag.y,
+            );
+            send_mouse(
+                &mut terminal,
+                &mut app,
+                &tx,
+                MouseEventKind::Drag(MouseButton::Left),
+                end,
+                tag.y,
+            );
+            let after = terminal.backend().buffer();
+            for pos in [tag, emoji] {
+                assert_eq!((after[pos].fg, after[pos].bg), (Color::White, Color::Blue));
+                assert!(!after[pos].modifier.contains(Modifier::REVERSED));
+            }
+            assert_eq!(after[(divider, tag.y)].symbol(), "│");
+            assert_eq!(after[(divider, tag.y)].bg, divider_bg);
+            assert_ne!(after[(opposite_x, tag.y)].bg, Color::Blue);
+            send_mouse(
+                &mut terminal,
+                &mut app,
+                &tx,
+                MouseEventKind::Up(MouseButton::Left),
+                end,
+                tag.y,
+            );
+            let copied = copied_selection(&mut app, &clipboard).unwrap();
+            if reversed {
+                assert!(copied.starts_with("界👩‍💻 "));
+                assert!(copied.ends_with('-'));
+                assert!(!copied.contains('│'));
+            } else {
+                assert_eq!(copied, " refs        界👩‍💻");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn history_drag_copies_a_whole_emoji_at_a_wrap_boundary() {
+        let mut view = view(false);
+        view.wrap = true;
+        view.changes.insert(
+            Entry::Commit("a".into()),
+            Ok(Arc::new(Changes {
+                patch: vec![PatchLine {
+                    kind: LineKind::Added,
+                    text: "123456789👩‍💻x".into(),
+                    old: None,
+                    new: Some(1),
+                }],
+                ..Changes::default()
+            })),
+        );
+        let mut app = pointer_app(view);
+        let mut terminal = Terminal::new(TestBackend::new(60, 24)).unwrap();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let clipboard = clipboard::Clipboard::start(true, vec![], tx.clone());
+        draw(&mut terminal, &mut app).unwrap();
+
+        let (_, diff) = panes(app.area);
+        let buffer = terminal.backend().buffer();
+        let emoji = diff
+            .positions()
+            .find(|pos| buffer[*pos].symbol() == "👩‍💻")
+            .expect("a wrapped row should contain the whole emoji");
+        let end = (diff.x + GUTTER as u16 + 1, emoji.y + 1);
+        assert_eq!(buffer[end].symbol(), "x");
+        for (kind, (x, y)) in [
+            (
+                MouseEventKind::Down(MouseButton::Left),
+                (emoji.x + 1, emoji.y),
+            ),
+            (MouseEventKind::Drag(MouseButton::Left), end),
+            (MouseEventKind::Up(MouseButton::Left), end),
+        ] {
+            send_mouse(&mut terminal, &mut app, &tx, kind, x, y);
+        }
+        assert_eq!(
+            copied_selection(&mut app, &clipboard).as_deref(),
+            Some("👩‍💻\n            x")
+        );
+    }
+
+    #[tokio::test]
+    async fn history_copies_visible_diff_numbers_markers_and_wrap_indent() {
+        let mut view = view(false);
+        view.wrap = true;
+        view.changes.insert(
+            Entry::Commit("a".into()),
+            Ok(Arc::new(Changes {
+                patch: vec![
+                    PatchLine {
+                        kind: LineKind::Added,
+                        text: "abcdefghijklmnopqrstuvwxy token".into(),
+                        old: None,
+                        new: Some(7),
+                    },
+                    PatchLine {
+                        kind: LineKind::Removed,
+                        text: "removed".into(),
+                        old: Some(6),
+                        new: None,
+                    },
+                ],
+                ..Changes::default()
+            })),
+        );
+        let mut app = pointer_app(view);
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let clipboard = clipboard::Clipboard::start(true, vec![], tx.clone());
+        draw(&mut terminal, &mut app).unwrap();
+        let (_, diff) = panes(app.area);
+        let buffer = terminal.backend().buffer();
+        let added = diff
+            .positions()
+            .find(|p| buffer[*p].symbol() == "+" && buffer[(p.x + 1, p.y)].symbol() == "a")
+            .unwrap()
+            .y;
+        let start = (diff.x, added);
+        let end = (diff.x + 18, added + 2);
+        let expected =
+            "         7 +abcdefghijklmnopqrstuvwxy\n            token\n    6      -removed";
+
+        for (anchor, release) in [(start, end), (end, start)] {
+            for (kind, (x, y)) in [
+                (MouseEventKind::Down(MouseButton::Left), anchor),
+                (MouseEventKind::Drag(MouseButton::Left), release),
+                (MouseEventKind::Up(MouseButton::Left), release),
+            ] {
+                send_mouse(&mut terminal, &mut app, &tx, kind, x, y);
+            }
+            assert_eq!(
+                copied_selection(&mut app, &clipboard).as_deref(),
+                Some(expected)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn history_selects_a_commit_on_release_and_a_loaded_diff_cancels_its_old_drag() {
+        let mut view = view(false);
+        let root = view.root.clone();
+        view.changes
+            .insert(Entry::Commit("b".into()), Err("Diff for commit b".into()));
+        let mut app = pointer_app(view);
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let clipboard = clipboard::Clipboard::start(true, vec![], tx.clone());
+        draw(&mut terminal, &mut app).unwrap();
+        let (list, diff) = panes(app.area);
+        let down = MouseEventKind::Down(MouseButton::Left);
+        let drag = MouseEventKind::Drag(MouseButton::Left);
+        let up = MouseEventKind::Up(MouseButton::Left);
+        let b = list.y + 2;
+        send_mouse(&mut terminal, &mut app, &tx, down, list.x, b);
+        assert_eq!(
+            terminal.backend().buffer()[(diff.x + 2, diff.y)].symbol(),
+            " "
+        );
+        send_mouse(&mut terminal, &mut app, &tx, up, list.x, b - 1);
+        assert_eq!(
+            terminal.backend().buffer()[(diff.x + 2, diff.y)].symbol(),
+            " "
+        );
+
+        send_mouse(&mut terminal, &mut app, &tx, down, diff.x + 1, diff.y);
+        send_mouse(&mut terminal, &mut app, &tx, drag, diff.x + 5, diff.y);
+        assert_eq!(
+            terminal.backend().buffer()[(diff.x + 5, diff.y)].bg,
+            Color::Blue
+        );
+        on_loaded(
+            &mut app,
+            Loaded::Changes {
+                root,
+                entry: Entry::Commit("a".into()),
+                result: Err("Diff for commit a".into()),
+            },
+            &tx,
+        );
+        draw(&mut terminal, &mut app).unwrap();
+        send_mouse(&mut terminal, &mut app, &tx, up, diff.x + 5, diff.y);
+        assert_eq!(
+            terminal.backend().buffer()[(diff.x + 17, diff.y)].symbol(),
+            "a"
+        );
+        assert!(copied_selection(&mut app, &clipboard).is_none());
+
+        send_mouse(&mut terminal, &mut app, &tx, down, list.x, b);
+        send_mouse(&mut terminal, &mut app, &tx, up, list.x + 1, b);
+        assert_eq!(
+            terminal.backend().buffer()[(diff.x + 17, diff.y)].symbol(),
+            "b"
+        );
     }
 
     // The graph-only lines between commits are drawn but never selected.

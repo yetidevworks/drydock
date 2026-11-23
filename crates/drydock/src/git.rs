@@ -59,7 +59,18 @@ fn git_command(root: &Path, args: &[&str]) -> Command {
 
 /// One `git` invocation against a repo, with the safety rails applied.
 pub(crate) async fn run_git(root: &Path, args: &[&str]) -> Result<String> {
+    run_git_output(git_command(root, args), args).await
+}
+
+/// Read local refs and objects without fetching missing objects in a partial clone.
+pub(crate) async fn run_git_local(root: &Path, args: &[&str]) -> Result<String> {
     let mut cmd = git_command(root, args);
+    cmd.env("GIT_NO_LAZY_FETCH", "1")
+        .env("GIT_ALLOW_PROTOCOL", "");
+    run_git_output(cmd, args).await
+}
+
+async fn run_git_output(mut cmd: Command, args: &[&str]) -> Result<String> {
     let output = tokio::time::timeout(GIT_TIMEOUT, cmd.output())
         .await
         .map_err(|_| anyhow!("git {} timed out", args.join(" ")))?

@@ -130,6 +130,8 @@ Or, since it works as a git alias:
 | `⏎` | detail view: branches, commits since the last tag, changed files |
 | `space` | history: recent commits and what each one changed, `space` again to close |
 | mouse | wheel scrolls the help and detail panes, and moves the column picker |
+| drag | copy visible text within the table, Detail, History, or Help |
+| `l` | open the Link Picker from the table, Detail, or History |
 | `d` `u` `b` | filter to dirty, unpushed, behind |
 | `r` `N` `H` | filter to needs-release, never-released, held |
 | `h` | hold this repo out of needs-release, or lift the hold it's under |

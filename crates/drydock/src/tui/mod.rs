@@ -4,23 +4,31 @@
 //! streams in fresh results as a sweep runs behind it. Key handling and
 //! rendering are split: this module owns state and events, `ui` owns pixels.
 
+mod clipboard;
 mod history;
 mod keys;
+mod link_picker;
+#[cfg(all(test, unix))]
+mod link_tests;
+mod links;
+mod selection;
 mod ui;
 
 use anyhow::Result;
 use crossterm::{
     event::{
-        self, DisableMouseCapture, EnableMouseCapture, Event as TermEvent, KeyCode, KeyEvent,
-        KeyEventKind, KeyModifiers, KeyboardEnhancementFlags, ModifierKeyCode, MouseButton,
-        MouseEvent, MouseEventKind, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+        self, DisableFocusChange, DisableMouseCapture, EnableFocusChange, EnableMouseCapture,
+        Event as TermEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
+        KeyboardEnhancementFlags, ModifierKeyCode, MouseButton, MouseEvent, MouseEventKind,
+        PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
     },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use ratatui::{
-    backend::CrosstermBackend,
-    layout::{Rect, Size},
+    backend::{Backend, CrosstermBackend},
+    layout::{Position, Rect, Size},
+    style::Modifier,
     Terminal,
 };
 use std::collections::{BTreeMap, HashMap};
@@ -40,6 +48,7 @@ use crate::model::RepoStatus;
 use crate::probe::{self, Tier, Timings};
 use crate::watch;
 use keys::{HandOff, Keys};
+use selection::{Gesture, LinkHit, PaneKind, PaneSnapshot, RowTarget};
 
 /// How long a status message stays on screen.
 const MESSAGE_TTL: Duration = Duration::from_secs(6);
@@ -93,10 +102,24 @@ pub struct ColumnDrag {
     /// edge stays under the mouse however fast it moves.
     start_x: u16,
     start_width: usize,
+    original_width: Option<usize>,
     sign: i32,
     /// Whether it's actually moved. A press and release in place is a click,
     /// and shouldn't pin a column at the width it already had.
     moved: bool,
+}
+
+#[derive(Default)]
+enum PointerGesture {
+    #[default]
+    Idle,
+    ColumnDrag(ColumnDrag),
+    Pane {
+        kind: PaneKind,
+        gesture: Gesture,
+        target: Option<RowTarget>,
+        link: Option<LinkHit>,
+    },
 }
 
 pub struct App {
@@ -147,8 +170,13 @@ pub struct App {
     /// way. Starts from `[ui] column_widths`, and is written back to it when
     /// the mouse is let go.
     pub column_widths: BTreeMap<Column, usize>,
-    /// The header edge being dragged right now, if one is.
-    pub column_drag: Option<ColumnDrag>,
+    pointer: PointerGesture,
+    panes: Vec<PaneSnapshot>,
+    clipboard_request: Option<clipboard::Request>,
+    link_opener: Option<PathBuf>,
+    link_picker: Option<link_picker::Picker>,
+    link_picker_generation: u64,
+    hover_cell: Option<Position>,
     /// The header edge under the mouse, so it can be lit before it's grabbed.
     pub hover_edge: Option<usize>,
     /// The last press on a header edge, to tell a double-click from two.
@@ -220,7 +248,13 @@ impl App {
             columns,
             column_cursor: 0,
             column_widths,
-            column_drag: None,
+            pointer: PointerGesture::Idle,
+            panes: Vec::new(),
+            clipboard_request: None,
+            link_opener: links::platform_opener(),
+            link_picker: None,
+            link_picker_generation: 0,
+            hover_cell: None,
             hover_edge: None,
             last_edge_press: None,
             overlay_max_scroll: 0,
@@ -474,7 +508,37 @@ impl App {
     /// The header edge to light up: the one being dragged, or failing that
     /// the one under the mouse.
     pub fn active_edge(&self) -> Option<usize> {
-        self.column_drag.map(|d| d.edge).or(self.hover_edge)
+        match self.pointer {
+            PointerGesture::ColumnDrag(drag) => Some(drag.edge),
+            _ => self.hover_edge,
+        }
+    }
+
+    fn cancel_pointer(&mut self) {
+        if let PointerGesture::ColumnDrag(drag) = std::mem::take(&mut self.pointer) {
+            match drag.original_width {
+                Some(width) => {
+                    self.column_widths.insert(drag.column, width);
+                }
+                None => {
+                    self.column_widths.remove(&drag.column);
+                }
+            }
+            self.last_edge_press = None;
+        }
+    }
+
+    fn reset_pointer_frame(&mut self) {
+        self.cancel_pointer();
+        self.panes.clear();
+        self.hover_cell = None;
+        self.hover_edge = None;
+        self.last_edge_press = None;
+    }
+
+    fn hovered_link(&self) -> Option<&LinkHit> {
+        let position = self.hover_cell?;
+        self.panes.iter().find_map(|pane| pane.link_at(position))
     }
 
     pub fn notify(&mut self, message: impl Into<String>) {
@@ -499,20 +563,16 @@ impl App {
         self.clamp_scroll();
     }
 
-    /// Put the selection on whatever repo is drawn at this screen row.
-    /// Returns false for a click on the header, the border, or past the end of
-    /// the list, so the caller can leave the selection alone.
-    fn select_at_row(&mut self, row: u16, first_row: u16) -> bool {
-        if row < first_row {
-            return false;
+    fn select_repo(&mut self, root: PathBuf) {
+        if let Some(index) = self
+            .visible
+            .iter()
+            .position(|&i| self.repos[i].root == root)
+        {
+            self.selected = index;
+            self.selected_root = Some(root);
+            self.detail_scroll = 0;
         }
-        let idx = self.scroll + (row - first_row) as usize;
-        if idx >= self.visible.len() {
-            return false;
-        }
-        self.selected = idx;
-        self.selected_root = self.current().map(|r| r.root.clone());
-        true
     }
 
     fn clamp_scroll(&mut self) {
@@ -576,6 +636,9 @@ enum Input {
     AutoFetch,
     /// Git answering the history view.
     History(Box<history::Loaded>),
+    ClipboardStatus(String),
+    Link(links::Outcome),
+    Picker(link_picker::Loaded),
     Tick,
 }
 
@@ -698,6 +761,7 @@ async fn run_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut A
 
     let mut dirty = true;
     let mut idle_ticks = 0u32;
+    let clipboard = clipboard::Clipboard::for_terminal(tx.clone());
     loop {
         if dirty {
             draw(terminal, app)?;
@@ -719,32 +783,7 @@ async fn run_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut A
                     dirty = true;
                 }
             }
-            Input::Term(TermEvent::Key(key)) => {
-                // Every key event carries the modifier state, and with the
-                // protocol on, the modifiers arrive as events of their own.
-                // Tracked before dispatch so the footer is right in the same
-                // frame as whatever the key did.
-                track_modifiers(app, &key);
-                // Repeat counts as press. Without the keyboard protocol a held
-                // key just sends more presses, but `REPORT_EVENT_TYPES` splits
-                // them out -- so ignoring them would mean holding `j` scrolled
-                // exactly one row in the terminals this feature is for.
-                if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
-                    && !matches!(key.code, KeyCode::Modifier(_))
-                {
-                    handle_key(app, key, &tx);
-                }
-                dirty = true;
-            }
-            Input::Term(TermEvent::Resize(_, _)) => {
-                terminal.autoresize()?;
-                dirty = true;
-            }
-            Input::Term(TermEvent::Mouse(ev)) => {
-                handle_mouse(app, ev, terminal.size().ok(), &tx);
-                dirty = true;
-            }
-            Input::Term(_) => {}
+            Input::Term(event) => dirty = handle_terminal_event(terminal, app, event, &tx)?,
             Input::Probe(event) => {
                 handle_probe_event(app, event, &tx);
                 dirty = true;
@@ -753,6 +792,15 @@ async fn run_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut A
                 history::on_loaded(app, *loaded, &tx);
                 dirty = true;
             }
+            Input::ClipboardStatus(status) => {
+                app.notify(status);
+                dirty = true;
+            }
+            Input::Link(outcome) => {
+                apply_link_outcome(app, outcome);
+                dirty = true;
+            }
+            Input::Picker(loaded) => dirty = link_picker::on_loaded(app, loaded),
             Input::Changed(paths) => {
                 reprobe_paths(app, paths, &tx);
                 dirty = true;
@@ -781,6 +829,8 @@ async fn run_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut A
             }
         }
 
+        send_clipboard(app, terminal.backend_mut(), &clipboard);
+
         if app.should_quit {
             break;
         }
@@ -788,13 +838,79 @@ async fn run_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut A
     Ok(())
 }
 
+fn handle_terminal_event<B: Backend>(
+    terminal: &mut Terminal<B>,
+    app: &mut App,
+    event: TermEvent,
+    tx: &mpsc::UnboundedSender<Input>,
+) -> Result<bool>
+where
+    B::Error: Send + Sync + 'static,
+{
+    match event {
+        TermEvent::Key(key) => {
+            // Track the modifiers before dispatch so the footer updates in the same frame.
+            track_modifiers(app, &key);
+            if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
+                && !matches!(key.code, KeyCode::Modifier(_))
+            {
+                handle_key(app, key, tx);
+            }
+        }
+        TermEvent::Resize(_, _) => {
+            app.reset_pointer_frame();
+            terminal.autoresize()?;
+        }
+        TermEvent::FocusLost => {
+            app.cancel_pointer();
+            app.hover_cell = None;
+            app.hover_edge = None;
+            app.last_edge_press = None;
+        }
+        TermEvent::Mouse(event) => {
+            let was_pressed = !matches!(app.pointer, PointerGesture::Idle);
+            let old_edge = app.hover_edge;
+            let old_link = app.hovered_link().cloned();
+            handle_mouse(app, event, terminal.size().ok(), tx);
+            return Ok(event.kind != MouseEventKind::Moved
+                || was_pressed
+                || old_edge != app.hover_edge
+                || old_link.as_ref() != app.hovered_link());
+        }
+        _ => return Ok(false),
+    }
+    Ok(true)
+}
+
 /// One frame. Kept separate so the first paint can happen before any setup.
-fn draw(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) -> Result<()> {
+fn draw<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<()>
+where
+    B::Error: Send + Sync + 'static,
+{
     app.now = git::now_unix();
     terminal.draw(|f| {
+        if app.area != f.area() {
+            app.reset_pointer_frame();
+        }
         app.area = f.area();
         app.rows_on_screen = ui::table_rows(f.area());
-        app.overlay_max_scroll = ui::render(f, app);
+        let (max_scroll, panes) = ui::render(f, app);
+        app.overlay_max_scroll = max_scroll;
+        if let PointerGesture::Pane { kind, gesture, .. } = app.pointer {
+            let previous = app.panes.iter().find(|pane| pane.kind() == kind);
+            match panes.iter().find(|pane| pane.kind() == kind) {
+                Some(pane) if Some(pane) == previous => pane.highlight(f.buffer_mut(), gesture),
+                _ => app.cancel_pointer(),
+            }
+        }
+        app.panes = panes;
+        if let Some(link) = app.hovered_link() {
+            for y in link.rect.top()..link.rect.bottom() {
+                for x in link.rect.left()..link.rect.right() {
+                    f.buffer_mut()[(x, y)].modifier.insert(Modifier::UNDERLINED);
+                }
+            }
+        }
     })?;
     Ok(())
 }
@@ -965,49 +1081,96 @@ fn handle_mouse(
     size: Option<Size>,
     tx: &mpsc::UnboundedSender<Input>,
 ) {
-    // The detail and help panes cover the table, so a click there has nothing
-    // to hit and the wheel belongs to the pane.
-    match app.mode {
-        Mode::History => {
-            history::handle_mouse(app, ev, tx);
-            return;
-        }
-        // Both panes scroll on the same state, and the wheel is what people
-        // reach for before they find j/k.
-        Mode::Detail | Mode::Help => {
-            match ev.kind {
-                MouseEventKind::ScrollDown => app.scroll_overlay(1),
-                MouseEventKind::ScrollUp => app.scroll_overlay(-1),
-                _ => {}
-            }
-            return;
-        }
-        // The picker doesn't scroll -- it's short enough to fit -- so the
-        // wheel moves the cursor, which is the equivalent gesture.
-        Mode::Columns => {
-            match ev.kind {
-                MouseEventKind::ScrollDown => app.move_column_cursor(1),
-                MouseEventKind::ScrollUp => app.move_column_cursor(-1),
-                _ => {}
-            }
-            return;
-        }
-        _ => {}
+    if matches!(
+        ev.kind,
+        MouseEventKind::Moved | MouseEventKind::Down(MouseButton::Left)
+    ) {
+        // A new press or movement with no button held ends a lost gesture.
+        app.cancel_pointer();
     }
-
-    let Some(size) = size else { return };
-    let area = Rect::new(0, 0, size.width, size.height);
-    if handle_header_mouse(app, ev, area) {
+    if size.is_some_and(|size| size.width != app.area.width || size.height != app.area.height) {
+        app.reset_pointer_frame();
+        return;
+    }
+    let position = Position::new(ev.column, ev.row);
+    if ev.kind == MouseEventKind::Moved {
+        app.hover_cell = Some(position);
+    }
+    if app.link_picker.is_none()
+        && app.mode == Mode::Normal
+        && handle_header_mouse(app, ev, app.area)
+    {
         return;
     }
 
     match ev.kind {
-        MouseEventKind::ScrollDown => app.move_selection(1),
-        MouseEventKind::ScrollUp => app.move_selection(-1),
         MouseEventKind::Down(MouseButton::Left) => {
-            let first = ui::table_first_row(area);
-            if app.select_at_row(ev.row, first) {
-                app.detail_scroll = 0;
+            if let Some(pane) = app.panes.iter().find(|pane| pane.rect.contains(position)) {
+                app.pointer = PointerGesture::Pane {
+                    kind: pane.kind(),
+                    gesture: Gesture::Pressed(position),
+                    target: pane.target_at(position).cloned(),
+                    link: pane.link_at(position).cloned(),
+                };
+            }
+        }
+        MouseEventKind::Drag(MouseButton::Left) => {
+            if let PointerGesture::Pane { kind, gesture, .. } = &mut app.pointer {
+                if let Some(pane) = app.panes.iter().find(|pane| pane.kind() == *kind) {
+                    gesture.drag(position, pane.rect);
+                }
+            }
+        }
+        MouseEventKind::Up(MouseButton::Left) => {
+            let PointerGesture::Pane {
+                kind,
+                gesture,
+                target,
+                link,
+            } = std::mem::take(&mut app.pointer)
+            else {
+                return;
+            };
+            let Some(pane) = app.panes.iter().find(|pane| pane.kind() == kind) else {
+                return;
+            };
+            if let Some(text) = pane.copy_text(gesture, position) {
+                app.clipboard_request = Some(clipboard::Request::new(text, "selected text".into()));
+            } else if let Some(link) = link {
+                if Some(&link) == pane.link_at(position) {
+                    activate_link(app, link.root, link.target, tx);
+                    if kind == PaneKind::Links {
+                        app.link_picker = None;
+                        app.reset_pointer_frame();
+                    }
+                }
+            } else if matches!(gesture, Gesture::Pressed(origin) if origin.y == position.y)
+                && target.as_ref() == pane.target_at(position)
+            {
+                match target {
+                    Some(RowTarget::Repo(root)) => app.select_repo(root),
+                    Some(RowTarget::History(entry)) => history::select_entry(app, &entry, tx),
+                    None => {}
+                }
+            }
+        }
+        MouseEventKind::ScrollDown | MouseEventKind::ScrollUp
+            if matches!(app.pointer, PointerGesture::Idle) =>
+        {
+            let delta = if ev.kind == MouseEventKind::ScrollDown {
+                1
+            } else {
+                -1
+            };
+            if let Some(picker) = app.link_picker.as_mut() {
+                picker.move_cursor(delta > 0);
+                return;
+            }
+            match app.mode {
+                Mode::Normal | Mode::Search => app.move_selection(delta),
+                Mode::Detail | Mode::Help => app.scroll_overlay(delta as i32),
+                Mode::Columns => app.move_column_cursor(delta),
+                Mode::History => history::scroll_wheel(app, ev, tx),
             }
         }
         _ => {}
@@ -1017,7 +1180,11 @@ fn handle_mouse(
 /// Dragging column edges in the header. Returns whether the event was the
 /// header's, so a press there doesn't also go looking for a row to select.
 fn handle_header_mouse(app: &mut App, ev: MouseEvent, area: Rect) -> bool {
-    let on_header = ev.row == ui::table_header_row(area);
+    let on_header = app.panes.iter().any(|pane| {
+        pane.kind() == PaneKind::Table
+            && ev.row.saturating_add(1) == pane.rect.y
+            && (pane.rect.left()..pane.rect.right()).contains(&ev.column)
+    });
     match ev.kind {
         // Only worth laying the table out when the mouse is on the header
         // row, or just left it with an edge still lit.
@@ -1040,28 +1207,36 @@ fn handle_header_mouse(app: &mut App, ev: MouseEvent, area: Rect) -> bool {
                 .is_some_and(|(c, at)| c == edge.column && at.elapsed() < DOUBLE_CLICK);
             if double {
                 app.last_edge_press = None;
-                app.column_drag = None;
                 reset_column_width(app, edge.column);
                 return true;
             }
             app.last_edge_press = Some((edge.column, Instant::now()));
-            app.column_drag = Some(ColumnDrag {
+            app.pointer = PointerGesture::ColumnDrag(ColumnDrag {
                 edge: edge.index,
                 column: edge.column,
                 start_x: ev.column,
                 start_width: edge.width,
+                original_width: app.column_widths.get(&edge.column).copied(),
                 sign: edge.sign,
                 moved: false,
             });
             true
         }
+        MouseEventKind::Down(MouseButton::Left) => {
+            app.hover_edge = None;
+            app.last_edge_press = None;
+            false
+        }
         MouseEventKind::Drag(MouseButton::Left) => {
-            let Some(drag) = app.column_drag.as_mut() else {
+            let PointerGesture::ColumnDrag(drag) = &mut app.pointer else {
                 return false;
             };
             let delta = (ev.column as i32 - drag.start_x as i32) * drag.sign;
+            if delta == 0 && !drag.moved {
+                return true;
+            }
             let width = (drag.start_width as i32 + delta).max(MIN_WIDTH as i32) as usize;
-            drag.moved |= delta != 0;
+            drag.moved = true;
             let column = drag.column;
             app.column_widths.insert(column, width);
             // The terminal may not have room for what was asked, so report
@@ -1074,9 +1249,10 @@ fn handle_header_mouse(app: &mut App, ev: MouseEvent, area: Rect) -> bool {
             true
         }
         MouseEventKind::Up(MouseButton::Left) => {
-            let Some(drag) = app.column_drag.take() else {
+            let PointerGesture::ColumnDrag(drag) = app.pointer else {
                 return false;
             };
+            app.pointer = PointerGesture::Idle;
             if drag.moved {
                 // Saved as drawn, so a drag past what the terminal could fit
                 // doesn't store a width nobody has ever seen.
@@ -1203,7 +1379,20 @@ fn normalise_shift(mut key: KeyEvent) -> KeyEvent {
 }
 
 fn handle_key(app: &mut App, key: KeyEvent, tx: &mpsc::UnboundedSender<Input>) {
+    let mode = app.mode;
+    let picker_open = app.link_picker.is_some();
+    dispatch_key(app, key, tx);
+    if app.mode != mode || key.code == KeyCode::Esc || picker_open != app.link_picker.is_some() {
+        app.reset_pointer_frame();
+    }
+}
+
+fn dispatch_key(app: &mut App, key: KeyEvent, tx: &mpsc::UnboundedSender<Input>) {
     let key = normalise_shift(key);
+    if app.link_picker.is_some() {
+        link_picker::handle_key(app, key, tx);
+        return;
+    }
     if key.modifiers.contains(KeyModifiers::CONTROL) {
         match key.code {
             KeyCode::Char('c') => {
@@ -1259,6 +1448,14 @@ fn handle_key(app: &mut App, key: KeyEvent, tx: &mpsc::UnboundedSender<Input>) {
             }
             return;
         }
+    }
+
+    if matches!(app.mode, Mode::Normal | Mode::Detail | Mode::History)
+        && key.code == KeyCode::Char('l')
+        && key.modifiers.is_empty()
+    {
+        link_picker::open(app, tx);
+        return;
     }
 
     match app.mode {
@@ -1765,6 +1962,32 @@ pub fn web_url(remote: &str) -> String {
     trimmed.to_string()
 }
 
+fn activate_link(
+    app: &App,
+    root: PathBuf,
+    target: links::Target,
+    tx: &mpsc::UnboundedSender<Input>,
+) {
+    let opener = app.link_opener.clone();
+    let tx = tx.clone();
+    tokio::spawn(async move {
+        let outcome = links::activate(root, target, opener).await;
+        let _ = tx.send(Input::Link(outcome));
+    });
+}
+
+fn apply_link_outcome(app: &mut App, outcome: links::Outcome) {
+    match outcome {
+        links::Outcome::BrowserStatus(status) => app.notify(status),
+        links::Outcome::CopyPath { root, reason } => {
+            app.clipboard_request = Some(clipboard::Request::with_reason(
+                root.to_string_lossy().into_owned(),
+                reason.message(),
+            ));
+        }
+    }
+}
+
 fn copy_path(app: &mut App) {
     let Some(path) = handoff_repo(app).map(|r| r.root.clone()) else {
         return;
@@ -1774,20 +1997,12 @@ fn copy_path(app: &mut App) {
 }
 
 fn copy_text(app: &mut App, text: &str) {
-    let result = (|| -> std::io::Result<()> {
-        use std::io::Write;
-        let mut child = std::process::Command::new("pbcopy")
-            .stdin(std::process::Stdio::piped())
-            .spawn()?;
-        if let Some(stdin) = child.stdin.as_mut() {
-            stdin.write_all(text.as_bytes())?;
-        }
-        child.wait()?;
-        Ok(())
-    })();
-    match result {
-        Ok(()) => app.notify(format!("Copied {text}")),
-        Err(err) => app.notify(format!("Could not copy: {err}")),
+    app.clipboard_request = Some(clipboard::Request::new(text.to_string(), text.to_string()));
+}
+
+fn send_clipboard(app: &mut App, backend: &mut impl io::Write, clipboard: &clipboard::Clipboard) {
+    if let Some(request) = app.clipboard_request.take() {
+        clipboard.submit(backend, request);
     }
 }
 
@@ -1799,7 +2014,12 @@ fn copy_text(app: &mut App, text: &str) {
 fn setup_terminal() -> Result<(Terminal<CrosstermBackend<Stdout>>, bool)> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    execute!(
+        stdout,
+        EnterAlternateScreen,
+        EnableMouseCapture,
+        EnableFocusChange
+    )?;
 
     // Standalone modifier keys are only reported under the kitty keyboard
     // protocol, and only with `REPORT_ALL_KEYS_AS_ESCAPE_CODES` -- the spec is
@@ -1845,7 +2065,8 @@ fn restore_terminal(
     execute!(
         terminal.backend_mut(),
         LeaveAlternateScreen,
-        DisableMouseCapture
+        DisableMouseCapture,
+        DisableFocusChange
     )?;
     terminal.show_cursor()?;
     Ok(())
@@ -1970,6 +2191,292 @@ mod tests {
         app.columns = Column::defaults(false);
         app.column_cursor = 0;
         app
+    }
+
+    fn detail_app() -> App {
+        let mut app = app_with(1);
+        app.repos[0].root = PathBuf::from("/p/界👩‍💻\u{3000}");
+        app.reindex();
+        app.mode = Mode::Detail;
+        app
+    }
+
+    fn detail_cell(terminal: &Terminal<ratatui::backend::TestBackend>, symbol: &str) -> (u16, u16) {
+        let buffer = terminal.backend().buffer();
+        buffer
+            .area
+            .positions()
+            .find(|pos| buffer[*pos].symbol() == symbol)
+            .map(|pos| (pos.x, pos.y))
+            .unwrap()
+    }
+
+    fn mouse(kind: MouseEventKind, (column, row): (u16, u16)) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    #[test]
+    fn detail_drag_highlights_whole_wide_glyphs_without_selecting_the_border() {
+        use ratatui::{backend::TestBackend, style::Color};
+        let mut app = detail_app();
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        let (tx, _) = mpsc::unbounded_channel();
+        draw(&mut terminal, &mut app).unwrap();
+        let (x, y) = detail_cell(&terminal, "界");
+        let buffer = terminal.backend().buffer();
+        let before = buffer[(x, y)].bg;
+        let border = (x + 6..80)
+            .find(|&col| buffer[(col, y)].symbol() == "│")
+            .unwrap();
+        let border_bg = buffer[(border, y)].bg;
+
+        handle_mouse(
+            &mut app,
+            mouse(MouseEventKind::Down(MouseButton::Left), (x + 1, y)),
+            None,
+            &tx,
+        );
+        draw(&mut terminal, &mut app).unwrap();
+        assert_eq!(terminal.backend().buffer()[(x, y)].bg, before);
+
+        handle_mouse(
+            &mut app,
+            mouse(MouseEventKind::Drag(MouseButton::Left), (79, y)),
+            None,
+            &tx,
+        );
+        draw(&mut terminal, &mut app).unwrap();
+        let buffer = terminal.backend().buffer();
+        assert_eq!(buffer[(x, y)].bg, Color::Blue);
+        assert_eq!(buffer[(x + 2, y)].bg, Color::Blue);
+        assert_eq!(buffer[(border, y)].bg, border_bg);
+    }
+
+    async fn clipboard_status(app: &mut App, rx: &mut mpsc::UnboundedReceiver<Input>) {
+        let result = tokio::time::timeout(Duration::from_secs(3), rx.recv())
+            .await
+            .unwrap();
+        let Some(Input::ClipboardStatus(status)) = result else {
+            panic!("missing clipboard result")
+        };
+        app.notify(status);
+    }
+
+    #[tokio::test]
+    async fn detail_drags_in_either_direction_copy_visible_lines_and_only_trim_ascii_spaces() {
+        use base64::{engine::general_purpose::STANDARD, Engine};
+        use ratatui::backend::TestBackend;
+        let mut app = detail_app();
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let clipboard = clipboard::Clipboard::start(true, vec![], tx.clone());
+        draw(&mut terminal, &mut app).unwrap();
+        let (x, y) = detail_cell(&terminal, "界");
+        let buffer = terminal.backend().buffer();
+        let state = (0..x)
+            .find(|&col| buffer[(col, y + 1)].symbol() == "s")
+            .unwrap();
+        let upper = (x + 1, y);
+        let lower = (state, y + 1);
+        for (anchor, end) in [(upper, lower), (lower, upper)] {
+            for event in [
+                mouse(MouseEventKind::Down(MouseButton::Left), anchor),
+                mouse(MouseEventKind::Drag(MouseButton::Left), end),
+                mouse(MouseEventKind::Up(MouseButton::Left), end),
+            ] {
+                handle_terminal_event(&mut terminal, &mut app, TermEvent::Mouse(event), &tx)
+                    .unwrap();
+                draw(&mut terminal, &mut app).unwrap();
+            }
+            let mut output = Vec::new();
+            send_clipboard(&mut app, &mut output, &clipboard);
+            clipboard_status(&mut app, &mut rx).await;
+            assert_eq!(
+                app.active_message(),
+                Some("Sent selected text to terminal clipboard")
+            );
+            let data = output
+                .strip_prefix(b"\x1b]52;c;")
+                .unwrap()
+                .strip_suffix(b"\x07")
+                .unwrap();
+            assert_eq!(
+                STANDARD.decode(data).unwrap(),
+                "界👩‍💻\u{3000}\n  s".as_bytes()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn interrupted_detail_drags_and_single_cell_clicks_do_not_copy() {
+        use ratatui::backend::TestBackend;
+        let (tx, _) = mpsc::unbounded_channel();
+        let clipboard = clipboard::Clipboard::start(true, vec![], tx.clone());
+        let interruptions = [
+            None,
+            Some(TermEvent::FocusLost),
+            Some(TermEvent::Resize(80, 24)),
+            Some(TermEvent::Mouse(mouse(MouseEventKind::Moved, (0, 0)))),
+            Some(TermEvent::Key(KeyEvent::new(
+                KeyCode::Esc,
+                KeyModifiers::NONE,
+            ))),
+        ];
+        for interruption in interruptions {
+            let mut app = detail_app();
+            let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+            draw(&mut terminal, &mut app).unwrap();
+            let (x, y) = detail_cell(&terminal, "界");
+            let start = (x, y);
+            let end = if interruption.is_some() {
+                (x + 1, y)
+            } else {
+                start
+            };
+            let mut event = |event: TermEvent| {
+                if handle_terminal_event(&mut terminal, &mut app, event, &tx).unwrap() {
+                    draw(&mut terminal, &mut app).unwrap();
+                }
+            };
+            event(TermEvent::Mouse(mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                start,
+            )));
+            event(TermEvent::Mouse(mouse(
+                MouseEventKind::Drag(MouseButton::Left),
+                end,
+            )));
+            if let Some(interruption) = interruption {
+                event(interruption);
+            }
+            event(TermEvent::Mouse(mouse(
+                MouseEventKind::Up(MouseButton::Left),
+                end,
+            )));
+            let mut output = Vec::new();
+            send_clipboard(&mut app, &mut output, &clipboard);
+            assert!(output.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn a_refreshed_detail_pane_cancels_the_old_drag() {
+        use ratatui::backend::TestBackend;
+        let mut app = detail_app();
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        let (tx, _) = mpsc::unbounded_channel();
+        let clipboard = clipboard::Clipboard::start(true, vec![], tx.clone());
+        draw(&mut terminal, &mut app).unwrap();
+        let (x, y) = detail_cell(&terminal, "界");
+        handle_mouse(
+            &mut app,
+            mouse(MouseEventKind::Down(MouseButton::Left), (x, y)),
+            None,
+            &tx,
+        );
+        handle_mouse(
+            &mut app,
+            mouse(MouseEventKind::Drag(MouseButton::Left), (x + 2, y)),
+            None,
+            &tx,
+        );
+        draw(&mut terminal, &mut app).unwrap();
+
+        let mut refreshed = app.repos[0].clone();
+        refreshed.error = Some("Repository became unavailable".into());
+        handle_probe_event(&mut app, probe::Event::Work(Box::new(refreshed)), &tx);
+        draw(&mut terminal, &mut app).unwrap();
+        handle_mouse(
+            &mut app,
+            mouse(MouseEventKind::Up(MouseButton::Left), (x + 2, y)),
+            None,
+            &tx,
+        );
+        let mut output = Vec::new();
+        send_clipboard(&mut app, &mut output, &clipboard);
+        assert!(output.is_empty());
+        assert_ne!(
+            terminal.backend().buffer()[(x, y)].bg,
+            ratatui::style::Color::Blue
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn yank_reports_copied_when_a_fallback_clipboard_tool_succeeds() {
+        let mut app = app_with(1);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let clipboard = clipboard::Clipboard::start(
+            false,
+            vec![
+                clipboard::Tool("/drydock-test-clipboard-tool-does-not-exist", &[]),
+                clipboard::Tool("sh", &["-c", "cat >/dev/null; exit 9"]),
+                clipboard::Tool("sh", &["-c", "test \"$(cat)\" = /p/g/r0"]),
+            ],
+            tx.clone(),
+        );
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE),
+            &tx,
+        );
+        let mut output = Vec::new();
+        send_clipboard(&mut app, &mut output, &clipboard);
+        clipboard_status(&mut app, &mut rx).await;
+        assert_eq!(app.active_message(), Some("Copied /p/g/r0"));
+        assert!(output.is_empty());
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn a_failed_local_copy_reports_failure_even_after_sending_osc52() {
+        let mut app = app_with(1);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let clipboard = clipboard::Clipboard::start(
+            true,
+            vec![clipboard::Tool(
+                "sh",
+                &[
+                    "-c",
+                    "cat >/dev/null; printf unexpected; printf unexpected >&2; exit 9",
+                ],
+            )],
+            tx.clone(),
+        );
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE),
+            &tx,
+        );
+        let mut output = Vec::new();
+        send_clipboard(&mut app, &mut output, &clipboard);
+        clipboard_status(&mut app, &mut rx).await;
+        assert_eq!(
+            app.active_message(),
+            Some("Could not copy: sh exited with exit status: 9")
+        );
+        assert_eq!(output, b"\x1b]52;c;L3AvZy9yMA==\x07");
+    }
+
+    #[tokio::test]
+    async fn an_oversized_osc52_request_sends_no_escape_sequence_and_reports_the_limit() {
+        let mut app = app_with(1);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let clipboard = clipboard::Clipboard::start(true, vec![], tx);
+        copy_text(&mut app, &"界".repeat(24_999));
+        let mut output = Vec::new();
+        send_clipboard(&mut app, &mut output, &clipboard);
+        clipboard_status(&mut app, &mut rx).await;
+        assert!(output.is_empty());
+        assert_eq!(
+            app.active_message(),
+            Some("Could not copy: terminal clipboard limit is 74994 bytes")
+        );
     }
 
     // Holding shift should say what shift does. The terminal that can't
@@ -2459,46 +2966,224 @@ mod tests {
         assert_eq!(app.column_cursor, app.picker_rows().len() - 1);
     }
 
-    /// The click-to-row arithmetic has to agree with what actually gets drawn.
-    /// Both sides are pinned here so a layout change can't quietly shift the
-    /// selection by a row.
-    #[test]
-    fn a_click_lands_on_the_row_under_it() {
-        let mut app = app_with(50);
-        app.rows_on_screen = 10;
-        let first = ui::table_first_row(Rect::new(0, 0, 130, 16));
-        assert_eq!(first, 4, "title, filter bar, border, column header");
+    #[tokio::test]
+    async fn a_table_click_selects_on_release_but_a_micro_drag_only_copies() {
+        use ratatui::backend::TestBackend;
+        let mut app = app_with(3);
+        let mut terminal = Terminal::new(TestBackend::new(130, 16)).unwrap();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let clipboard = clipboard::Clipboard::start(true, vec![], tx.clone());
+        draw(&mut terminal, &mut app).unwrap();
+        let (x, y) = detail_cell(&terminal, "1");
+        assert_eq!(terminal.backend().buffer()[(x - 1, y)].symbol(), "r");
 
-        assert!(app.select_at_row(first, first));
+        let mut send = |app: &mut App, kind, position| {
+            handle_terminal_event(
+                &mut terminal,
+                app,
+                TermEvent::Mouse(mouse(kind, position)),
+                &tx,
+            )
+            .unwrap();
+            draw(&mut terminal, app).unwrap();
+        };
+        let down = MouseEventKind::Down(MouseButton::Left);
+        let up = MouseEventKind::Up(MouseButton::Left);
+        send(&mut app, down, (x - 1, y));
         assert_eq!(app.selected, 0);
-        assert!(app.select_at_row(first + 3, first));
-        assert_eq!(app.selected, 3);
+        send(&mut app, up, (x, y));
+        assert_eq!(app.selected, 1);
 
-        // Scrolled, the same screen row is a different repo.
-        app.scroll = 20;
-        assert!(app.select_at_row(first + 3, first));
-        assert_eq!(app.selected, 23);
+        send(&mut app, down, (x - 1, y - 1));
+        send(
+            &mut app,
+            MouseEventKind::Drag(MouseButton::Left),
+            (x, y - 1),
+        );
+        send(&mut app, MouseEventKind::ScrollDown, (x, y - 1));
+        // Returning to the starting cell must not turn the drag back into a click.
+        send(&mut app, up, (x - 1, y - 1));
+        assert_eq!(app.selected, 1);
+        let mut output = Vec::new();
+        send_clipboard(&mut app, &mut output, &clipboard);
+        assert_eq!(output, b"\x1b]52;c;cg==\x07");
 
-        // The header, the border and the title are not rows.
-        app.selected = 7;
-        for y in 0..first {
-            assert!(!app.select_at_row(y, first), "row {y} is chrome");
+        for position in [(0, y), (x, y - 2), (x, y + 4)] {
+            send(&mut app, down, position);
+            send(&mut app, up, position);
+            assert_eq!(app.selected, 1, "chrome and blank rows don't select");
         }
-        assert_eq!(app.selected, 7, "a click on chrome leaves the selection");
     }
 
-    /// Clicking past the end of a short list must not select a row that isn't
-    /// there. Easy to get wrong, since the table is drawn full height.
-    #[test]
-    fn a_click_below_the_last_repo_does_nothing() {
+    #[tokio::test]
+    async fn help_drag_copies_its_visible_text_and_hides_the_table_hits() {
+        use ratatui::backend::TestBackend;
         let mut app = app_with(3);
-        let first = ui::table_first_row(Rect::new(0, 0, 130, 40));
-        assert!(app.select_at_row(first + 2, first));
-        assert_eq!(app.selected, 2);
-        assert!(!app.select_at_row(first + 3, first));
-        assert_eq!(app.selected, 2);
-        assert!(!app.select_at_row(first + 30, first));
-        assert_eq!(app.selected, 2);
+        app.mode = Mode::Help;
+        let mut terminal = Terminal::new(TestBackend::new(130, 24)).unwrap();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let clipboard = clipboard::Clipboard::start(true, vec![], tx.clone());
+        draw(&mut terminal, &mut app).unwrap();
+        let buffer = terminal.backend().buffer();
+        let title = buffer
+            .area
+            .positions()
+            .find(|p| {
+                buffer[*p].symbol() == "M"
+                    && buffer[(p.x + 1, p.y)].symbol() == "o"
+                    && buffer[(p.x + 2, p.y)].symbol() == "v"
+            })
+            .unwrap();
+        let mut send = |kind, position| {
+            handle_terminal_event(
+                &mut terminal,
+                &mut app,
+                TermEvent::Mouse(mouse(kind, position)),
+                &tx,
+            )
+            .unwrap();
+            draw(&mut terminal, &mut app).unwrap();
+        };
+        let down = MouseEventKind::Down(MouseButton::Left);
+        let drag = MouseEventKind::Drag(MouseButton::Left);
+        let up = MouseEventKind::Up(MouseButton::Left);
+        // The repo underneath the modal's left margin is visible but inert.
+        send(down, (2, 5));
+        send(up, (2, 5));
+        send(down, (title.x, title.y));
+        send(drag, (title.x + 5, title.y));
+        send(up, (title.x + 5, title.y));
+        assert_eq!(app.selected, 0);
+        let mut output = Vec::new();
+        send_clipboard(&mut app, &mut output, &clipboard);
+        assert_eq!(output, b"\x1b]52;c;TW92aW5n\x07");
+    }
+
+    #[tokio::test]
+    async fn a_background_reorder_cancels_table_clicks_and_drags() {
+        use ratatui::backend::TestBackend;
+
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let clipboard = clipboard::Clipboard::start(true, vec![], tx.clone());
+        for dragging in [false, true] {
+            let mut app = app_with(3);
+            app.query.sort = Sort::Name;
+            app.recompute();
+            let mut terminal = Terminal::new(TestBackend::new(130, 16)).unwrap();
+            draw(&mut terminal, &mut app).unwrap();
+            let (x, y) = detail_cell(&terminal, "1");
+            let send = |app: &mut App, terminal: &mut Terminal<TestBackend>, kind, pos| {
+                handle_terminal_event(terminal, app, TermEvent::Mouse(mouse(kind, pos)), &tx)
+                    .unwrap();
+                draw(terminal, app).unwrap();
+            };
+            let down = MouseEventKind::Down(MouseButton::Left);
+            let up = MouseEventKind::Up(MouseButton::Left);
+            send(&mut app, &mut terminal, down, (x, y));
+            if dragging {
+                send(
+                    &mut app,
+                    &mut terminal,
+                    MouseEventKind::Drag(MouseButton::Left),
+                    (x - 1, y),
+                );
+            }
+
+            let mut updated = app.repos[1].clone();
+            updated.name = "z".into();
+            handle_probe_event(&mut app, probe::Event::Work(Box::new(updated)), &tx);
+            draw(&mut terminal, &mut app).unwrap();
+            assert_eq!(terminal.backend().buffer()[(x, y)].symbol(), "2");
+
+            send(&mut app, &mut terminal, up, (x, y));
+            assert_eq!(app.current().unwrap().root, PathBuf::from("/p/g/r0"));
+            let mut output = Vec::new();
+            send_clipboard(&mut app, &mut output, &clipboard);
+            assert!(output.is_empty());
+
+            send(&mut app, &mut terminal, down, (x, y));
+            send(&mut app, &mut terminal, up, (x, y));
+            assert_eq!(app.current().unwrap().root, PathBuf::from("/p/g/r2"));
+        }
+    }
+
+    #[test]
+    fn column_width_drags_roll_back_on_interruption_and_double_click_resets() {
+        use ratatui::backend::TestBackend;
+
+        // Exercise the real config path with an isolated environment for the
+        // subprocess. Other tests and a running dashboard can keep using theirs.
+        const TEST: &str =
+            "tui::tests::column_width_drags_roll_back_on_interruption_and_double_click_resets";
+        const CHILD: &str = "DRYDOCK_TEST_COLUMN_POINTER";
+        if std::env::var_os(CHILD).is_none() {
+            let config_dir = tempfile::tempdir().unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", TEST])
+                .env(CHILD, "1")
+                .env("XDG_CONFIG_HOME", config_dir.path())
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stdout)
+            );
+            return;
+        }
+
+        let (tx, _rx) = mpsc::unbounded_channel();
+        for interruption in [
+            TermEvent::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            TermEvent::Key(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE)),
+            TermEvent::Resize(130, 16),
+            TermEvent::FocusLost,
+            TermEvent::Mouse(mouse(MouseEventKind::Moved, (0, 0))),
+        ] {
+            let mut app = app_with(3);
+            app.columns = vec![Column::Group, Column::Repo];
+            app.column_widths.insert(Column::Group, 14);
+            let mut terminal = Terminal::new(TestBackend::new(130, 16)).unwrap();
+            draw(&mut terminal, &mut app).unwrap();
+            let mut send = |app: &mut App, event| {
+                handle_terminal_event(&mut terminal, app, event, &tx).unwrap();
+                draw(&mut terminal, app).unwrap();
+            };
+            let mouse = |kind, pos| TermEvent::Mouse(mouse(kind, pos));
+            let down = MouseEventKind::Down(MouseButton::Left);
+            let drag = MouseEventKind::Drag(MouseButton::Left);
+            let up = MouseEventKind::Up(MouseButton::Left);
+            send(&mut app, mouse(down, (15, 3)));
+            send(&mut app, mouse(drag, (19, 4)));
+            assert_eq!(app.column_widths.get(&Column::Group), Some(&18));
+            send(&mut app, mouse(MouseEventKind::ScrollDown, (19, 4)));
+            assert_eq!(app.selected, 0);
+            send(&mut app, interruption);
+            send(&mut app, mouse(up, (19, 4)));
+            assert_eq!(app.column_widths.get(&Column::Group), Some(&14));
+            assert!(app.clipboard_request.is_none());
+            assert!(!crate::paths::config_file().unwrap().exists());
+
+            app.mode = Mode::Normal;
+            draw(&mut terminal, &mut app).unwrap();
+            for kind in [down, up, down, up] {
+                handle_terminal_event(&mut terminal, &mut app, mouse(kind, (15, 3)), &tx).unwrap();
+                draw(&mut terminal, &mut app).unwrap();
+            }
+            assert!(!app.column_widths.contains_key(&Column::Group));
+            assert!(!crate::config::load()
+                .unwrap()
+                .ui
+                .column_widths
+                .contains_key(&Column::Group));
+            std::fs::remove_file(crate::paths::config_file().unwrap()).unwrap();
+
+            for kind in [down, drag, up] {
+                handle_terminal_event(&mut terminal, &mut app, mouse(kind, (15, 3)), &tx).unwrap();
+                draw(&mut terminal, &mut app).unwrap();
+            }
+            assert!(!app.column_widths.contains_key(&Column::Group));
+        }
     }
 
     /// A sweep that never reports back must not block the ones after it. This
@@ -2527,21 +3212,5 @@ mod tests {
         app.sweep_started = None;
         start_sweep(&mut app, &tx, Tier::Full);
         assert!(app.sweep_started.is_some());
-    }
-
-    #[test]
-    fn ssh_remotes_become_browsable() {
-        assert_eq!(
-            web_url("git@github.com:getgrav/grav.git"),
-            "https://github.com/getgrav/grav"
-        );
-        assert_eq!(
-            web_url("https://github.com/getgrav/grav.git"),
-            "https://github.com/getgrav/grav"
-        );
-        assert_eq!(
-            web_url("ssh://git@git.example.com/team/repo.git"),
-            "https://git.example.com/team/repo"
-        );
     }
 }

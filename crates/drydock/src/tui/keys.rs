@@ -44,7 +44,7 @@ impl Default for Keys {
 /// Every key with a fixed meaning in some view: the table, the detail view,
 /// the column picker, help and history. A new binding in `mod.rs` or
 /// `history.rs` belongs here too, or a config could put a hand-off on it.
-const BUILT_IN: &str = " qC?jkdurNHhbcixenas&S[]01234/wRfFJKWp";
+const BUILT_IN: &str = " qC?jkdurNHhbcixenas&S[]01234/wlRfFJKWp";
 
 impl Keys {
     /// Check a `[keys]` table. Anything wrong with it and none of it is used:
@@ -193,7 +193,7 @@ mod tests {
     // be worse than no setting at all.
     #[test]
     fn a_key_drydock_already_uses_is_refused_in_any_view() {
-        for key in ["q", "j", "f", "/", "n", "p", "W", "J", "C", " "] {
+        for key in ["q", "j", "f", "/", "n", "p", "W", "J", "C", "l", " "] {
             let err = Keys::resolve(&table(&[("editor", key)])).unwrap_err();
             assert!(err.contains("editor ="), "{key:?}: {err}");
         }

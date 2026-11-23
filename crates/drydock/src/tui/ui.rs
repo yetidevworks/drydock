@@ -14,8 +14,10 @@ use ratatui::{
 
 use crossterm::event::KeyModifiers;
 use std::collections::BTreeMap;
+use unicode_width::UnicodeWidthStr;
 
 use super::keys::HandOff;
+use super::selection::{ContentKey, PaneSnapshot, RowTarget};
 use super::{App, Mode};
 use crate::column::{Column, Width, BRANCH_CAP};
 use crate::fmt;
@@ -252,11 +254,6 @@ fn table_inner_width(area: Rect) -> usize {
     area.width.saturating_sub(2) as usize
 }
 
-/// Screen row of the column header, where the edges can be dragged.
-pub fn table_header_row(area: Rect) -> u16 {
-    table_first_row(area) - 1
-}
-
 /// The edge a mouse at this screen column is on, if any. The gutter space at
 /// the end of a column and the first character after it both count: a
 /// one-character target is easy to miss with a mouse.
@@ -274,19 +271,12 @@ pub fn table_rows(area: Rect) -> usize {
     area.height.saturating_sub(7).max(1) as usize
 }
 
-/// Screen row of the first repo in the table, so a click can be turned back
-/// into a row. Counts down past the title, the filter bar, the table's top
-/// border and the column header.
-pub fn table_first_row(area: Rect) -> u16 {
-    area.y + 4
-}
-
 /// Draws one frame and reports how far the overlay on top of it — if any —
 /// can usefully be scrolled. Measured here because it's the only place that
 /// knows both how many lines the pane came to and how many of them fit; the
 /// input handlers clamp against it so the wheel can't spin off into blank
 /// space below the content.
-pub fn render(f: &mut Frame, app: &App) -> u16 {
+pub(super) fn render(f: &mut Frame, app: &App) -> (u16, Vec<PaneSnapshot>) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -300,23 +290,31 @@ pub fn render(f: &mut Frame, app: &App) -> u16 {
 
     render_title(f, app, chunks[0]);
     render_filters(f, app, chunks[1]);
-    render_table(f, app, chunks[2]);
+    let table = render_table(f, app, chunks[2]);
     render_keys(f, app, chunks[3]);
     render_status(f, app, chunks[4]);
 
-    match app.mode {
-        Mode::Help => render_help(f, app, f.area()),
-        Mode::Detail => render_detail(f, app, f.area()),
+    let (scroll, panes) = match app.mode {
+        Mode::Help => {
+            let (scroll, pane) = render_help(f, app, f.area());
+            (scroll, pane.into_iter().collect())
+        }
+        Mode::Detail => {
+            let (scroll, pane) = render_detail(f, app, f.area());
+            (scroll, pane.into_iter().collect())
+        }
         Mode::Columns => {
             render_columns(f, app, f.area());
-            0
+            (0, Vec::new())
         }
-        Mode::History => {
-            super::history::render(f, app);
-            0
-        }
-        _ => 0,
+        Mode::History => (0, super::history::render(f, app)),
+        Mode::Normal | Mode::Search => (0, table.into_iter().collect()),
+    };
+    if let Some(picker) = &app.link_picker {
+        let pane = super::link_picker::render(f, picker);
+        return (scroll, pane.into_iter().collect());
     }
+    (scroll, panes)
 }
 
 /// How far a pane of `lines` can scroll inside `area` before it's showing
@@ -484,7 +482,7 @@ fn render_filters(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
-fn render_table(f: &mut Frame, app: &App, area: Rect) {
+fn render_table(f: &mut Frame, app: &App, area: Rect) -> Option<PaneSnapshot> {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(DIM))
@@ -500,7 +498,7 @@ fn render_table(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(block, area);
 
     if inner.height < 2 {
-        return;
+        return None;
     }
     let layout = TableLayout::for_width(
         inner.width as usize,
@@ -512,10 +510,8 @@ fn render_table(f: &mut Frame, app: &App, area: Rect) {
 
     let rows = inner.height.saturating_sub(1) as usize;
     let end = (app.scroll + rows).min(app.visible.len());
-    for (offset, idx) in app.visible[app.scroll.min(app.visible.len())..end]
-        .iter()
-        .enumerate()
-    {
+    let drawn_rows = &app.visible[app.scroll.min(app.visible.len())..end];
+    for (offset, idx) in drawn_rows.iter().enumerate() {
         let selected = app.scroll + offset == app.selected;
         lines.push(repo_line(&app.repos[*idx], &layout, app.now, selected));
     }
@@ -543,6 +539,19 @@ fn render_table(f: &mut Frame, app: &App, area: Rect) {
     }
 
     f.render_widget(Paragraph::new(lines), inner);
+    if !matches!(app.mode, Mode::Normal | Mode::Search) {
+        return None;
+    }
+    let body = Rect::new(inner.x, inner.y + 1, inner.width, inner.height - 1);
+    let key = ContentKey::Table {
+        scroll: app.scroll,
+        selected: app.selected,
+    };
+    let targets = drawn_rows
+        .iter()
+        .map(|&idx| Some(RowTarget::Repo(app.repos[idx].root.clone())))
+        .collect();
+    PaneSnapshot::capture(f.buffer_mut(), body, key).map(|pane| pane.with_targets(targets))
 }
 
 /// The REPO cell. A linked worktree reads `origin ↳ worktree`, with the
@@ -906,6 +915,10 @@ pub(super) fn key_hints(app: &App) -> Vec<(String, &'static str)> {
         row
     };
 
+    if app.link_picker.is_some() {
+        return fixed(&[("j/k", "choose link"), ("⏎", "open"), ("esc/q/l", "close")]);
+    }
+
     match app.mode {
         // Ctrl wins when both are down: its bindings are the same everywhere,
         // so showing them is never wrong, and a chord in progress is more
@@ -921,7 +934,7 @@ pub(super) fn key_hints(app: &App) -> Vec<(String, &'static str)> {
             if shift {
                 &[]
             } else {
-                &[("esc", "back"), ("j/k", "scroll")]
+                &[("esc", "back"), ("j/k", "scroll"), ("l", "links")]
             },
             &[
                 (HandOff::FileManager, "finder"),
@@ -933,28 +946,32 @@ pub(super) fn key_hints(app: &App) -> Vec<(String, &'static str)> {
             &[],
         ),
         Mode::Search => fixed(&[("esc", "cancel"), ("enter", "keep"), ("type", "to filter")]),
-        Mode::History => join(
-            if shift {
-                &[("J/K", "scroll diff"), ("W", "wrap long lines")]
-            } else {
+        Mode::History => {
+            let plain = [
+                ("space", "close"),
+                ("j/k", "commit"),
+                ("l", "links"),
+                ("J/K", "scroll"),
+                ("^d/^u", "half page"),
+                ("n/p", "next/prev file"),
+                ("W", "wrap"),
+                ("a", "all branches"),
+            ];
+            join(
+                if shift {
+                    &[("J/K", "scroll diff"), ("W", "wrap long lines")]
+                } else {
+                    &plain
+                },
                 &[
-                    ("space", "close"),
-                    ("j/k", "commit"),
-                    ("J/K", "scroll"),
-                    ("^d/^u", "half page"),
-                    ("n/p", "next/prev file"),
-                    ("W", "wrap"),
-                    ("a", "all branches"),
-                ]
-            },
-            &[
-                (HandOff::Copy, "copy hash"),
-                (HandOff::GitClient, "client"),
-                (HandOff::Editor, "editor"),
-                (HandOff::Terminal, "terminal"),
-            ],
-            &[],
-        ),
+                    (HandOff::Copy, "copy hash"),
+                    (HandOff::GitClient, "client"),
+                    (HandOff::Editor, "editor"),
+                    (HandOff::Terminal, "terminal"),
+                ],
+                &[],
+            )
+        }
         Mode::Columns if shift => fixed(&[("J/K", "move column"), ("C", "close")]),
         _ if shift => join(
             &[],
@@ -968,37 +985,65 @@ pub(super) fn key_hints(app: &App) -> Vec<(String, &'static str)> {
                 ("R", "rescan"),
             ],
         ),
-        _ => join(
-            &[
-                ("j/k", "move"),
-                ("⏎", "detail"),
-                ("space", "history"),
-                ("d", "dirty"),
-                ("u", "unpushed"),
-                ("r", "needs release"),
-                ("h", "hold"),
-                ("a", "clear"),
-                ("s", "sort"),
-                ("/", "search"),
-                ("[ ]", "group"),
-                ("1-4", "since"),
-            ],
-            TABLE_HAND_OFFS,
-            &[("^f", "fetch all"), ("?", "help")],
-        ),
+        _ => {
+            let mut hints = join(
+                &[
+                    ("j/k", "move"),
+                    ("⏎", "detail"),
+                    ("space", "history"),
+                    ("d", "dirty"),
+                    ("u", "unpushed"),
+                    ("r", "needs release"),
+                    ("h", "hold"),
+                    ("a", "clear"),
+                    ("s", "sort"),
+                    ("/", "search"),
+                    ("[ ]", "group"),
+                    ("1-4", "since"),
+                ],
+                TABLE_HAND_OFFS,
+                &[("^f", "fetch all"), ("?", "help")],
+            );
+            if app.mode == Mode::Normal {
+                hints.insert(3, ("l".into(), "links"));
+            }
+            hints
+        }
     }
 }
 
 fn render_keys(f: &mut Frame, app: &App, area: Rect) {
-    let keys = key_hints(app);
+    let mut hints = key_hints(app);
+    let hint_width = |(key, action): &(String, &str)| key.width() + 1 + action.width() + 2;
+    // Every hint has two leading spaces except the first.
+    let mut remaining = usize::from(area.width) + 1;
+    if let Some(links) = hints.iter().position(|(key, _)| key == "l") {
+        let mut width = hint_width(&hints[links]);
+        let preceding = hints[..links]
+            .iter()
+            .take_while(|hint| {
+                width += hint_width(hint);
+                width <= remaining
+            })
+            .count();
+        hints[preceding..=links].rotate_right(1);
+    }
 
-    let mut spans = vec![Span::raw(" ")];
-    for (key, what) in keys {
+    let mut spans = Vec::new();
+    for hint in hints {
+        let width = hint_width(&hint);
+        if width > remaining {
+            break;
+        }
+        remaining -= width;
+        let (key, what) = hint;
+        let spacing = if spans.is_empty() { " " } else { "  " };
+        spans.push(Span::raw(spacing));
         spans.push(Span::styled(
             key,
             Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
         ));
-        spans.push(Span::styled(format!(" {what}  "), Style::default().fg(DIM)));
+        spans.push(Span::styled(format!(" {what}"), Style::default().fg(DIM)));
     }
     f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
@@ -1141,7 +1186,7 @@ fn with_hand_off_keys(text: &str, app: &App) -> String {
         .replace("{copy}", &keys.copy.to_string())
 }
 
-fn render_help(f: &mut Frame, app: &App, area: Rect) -> u16 {
+fn render_help(f: &mut Frame, app: &App, area: Rect) -> (u16, Option<PaneSnapshot>) {
     let area = centred(area, 72, 92);
     f.render_widget(Clear, area);
 
@@ -1159,6 +1204,7 @@ fn render_help(f: &mut Frame, app: &App, area: Rect) -> u16 {
                 ),
                 ("wheel", "move the selection, or scroll the detail view"),
                 ("enter", "open the detail view"),
+                ("drag in a pane", "select text and release to copy"),
                 (
                     "space",
                     "recent commits and their diffs, space again to close",
@@ -1232,6 +1278,8 @@ fn render_help(f: &mut Frame, app: &App, area: Rect) -> u16 {
                 ("{terminal} / ctrl-o", "open a terminal there"),
                 ("{git_client}", "open in your git client"),
                 ("w", "open the remote in a browser"),
+                ("l", "choose a link in the table, detail or history"),
+                ("", "copy the repo path if the link is unavailable"),
                 ("{copy}", "copy the path"),
                 ("R / ctrl-r", "rescan now"),
                 ("C", "choose which columns to show"),
@@ -1248,7 +1296,7 @@ fn render_help(f: &mut Frame, app: &App, area: Rect) -> u16 {
         for (key, what) in *entries {
             let key = with_hand_off_keys(key, app);
             lines.push(Line::from(vec![
-                Span::styled(format!("   {:<16}", key), Style::default().fg(Color::White)),
+                Span::styled(format!("   {key:<16}"), Style::default().fg(Color::White)),
                 Span::styled((*what).to_string(), Style::default().fg(DIM)),
             ]));
         }
@@ -1293,13 +1341,11 @@ fn render_help(f: &mut Frame, app: &App, area: Rect) -> u16 {
         .title(" keys · j/k to scroll · esc to close ")
         .title_alignment(Alignment::Center);
     let scrollable = max_scroll(lines.len(), area);
-    f.render_widget(
-        Paragraph::new(lines)
-            .block(block)
-            .scroll((app.detail_scroll.min(scrollable), 0)),
-        area,
-    );
-    scrollable
+    let scroll = app.detail_scroll.min(scrollable);
+    let inner = block.inner(area);
+    f.render_widget(Paragraph::new(lines).block(block).scroll((scroll, 0)), area);
+    let pane = PaneSnapshot::capture(f.buffer_mut(), inner, ContentKey::Help { scroll });
+    (scrollable, pane)
 }
 
 /// The column picker. Shows every column, the ones on screen first in the
@@ -1371,13 +1417,15 @@ fn render_columns(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(Paragraph::new(lines).block(block), area);
 }
 
-fn render_detail(f: &mut Frame, app: &App, area: Rect) -> u16 {
-    let Some(repo) = app.current() else { return 0 };
+fn render_detail(f: &mut Frame, app: &App, area: Rect) -> (u16, Option<PaneSnapshot>) {
+    let Some(repo) = app.current() else {
+        return (0, None);
+    };
     let area = centred(area, 84, 86);
     f.render_widget(Clear, area);
 
     let mut lines: Vec<Line> = Vec::new();
-    let label = |text: &str| Span::styled(format!("  {:<14}", text), Style::default().fg(DIM));
+    let label = |text: &str| Span::styled(format!("  {text:<14}"), Style::default().fg(DIM));
 
     lines.push(Line::from(vec![
         label("path"),
@@ -1675,13 +1723,17 @@ fn render_detail(f: &mut Frame, app: &App, area: Rect) -> u16 {
         .title_alignment(Alignment::Center);
 
     let scrollable = max_scroll(lines.len(), area);
-    f.render_widget(
-        Paragraph::new(lines)
-            .block(block)
-            .scroll((app.detail_scroll.min(scrollable), 0)),
-        area,
-    );
-    scrollable
+    let scroll = app.detail_scroll.min(scrollable);
+    let inner = block.inner(area);
+    f.render_widget(Paragraph::new(lines).block(block).scroll((scroll, 0)), area);
+    let key = ContentKey::Detail {
+        root: repo.root.clone(),
+        scroll,
+    };
+    (
+        scrollable,
+        PaneSnapshot::capture(f.buffer_mut(), inner, key),
+    )
 }
 
 // ---------------------------------------------------------------------------
