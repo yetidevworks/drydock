@@ -1,3 +1,10 @@
+# 1.4.3
+
+## 11/24/2026
+
+1. [](#bugfix)
+    * **History shows file names with quotes, backslashes, tabs or spaces correctly** ([#19](https://github.com/yetidevworks/drydock/pull/19)). Git quotes and escapes those names in a diff's headers, and drydock showed them as written, so `name"quote.txt` appeared as `"b/name\"quote.txt"`, a name with a space carried a stray tab, and a binary file in a folder like `dir b/` lost the folder. Renamed and copied files get the same treatment. Thanks to @iasi777 for the fix.
+
 # 1.4.2
 
 ## 11/22/2026
