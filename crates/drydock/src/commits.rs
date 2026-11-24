@@ -549,7 +549,7 @@ fn parse_patch(raw: &str) -> Vec<PatchLine> {
         if let Some(rest) = text.strip_prefix("diff --git ") {
             flush(&mut pending, &mut out);
             in_hunk = false;
-            pending = Some((path_from_diff_line(rest), Vec::new()));
+            pending = Some((path_from_diff_line(rest).unwrap_or_default(), Vec::new()));
             continue;
         }
         if in_hunk {
@@ -605,16 +605,21 @@ fn parse_patch(raw: &str) -> Vec<PatchLine> {
             continue;
         };
         if let Some(p) = text.strip_prefix("+++ ") {
-            if p != "/dev/null" {
-                *path = p.strip_prefix("b/").unwrap_or(p).to_string();
+            if let Some(name) = patch_path(p, "b/") {
+                *path = name;
             }
         } else if let Some(p) = text.strip_prefix("--- ") {
             // A deleted file only has its old path.
-            if p != "/dev/null" {
-                *path = p.strip_prefix("a/").unwrap_or(p).to_string();
+            if let Some(name) = patch_path(p, "a/") {
+                *path = name;
             }
-        } else if let Some(p) = text.strip_prefix("rename to ") {
-            *path = p.to_string();
+        } else if let Some(p) = text
+            .strip_prefix("rename to ")
+            .or_else(|| text.strip_prefix("copy to "))
+        {
+            if let Some(name) = patch_path(p, "") {
+                *path = name;
+            }
         } else if text.starts_with("Binary files ") {
             notes.push(line(LineKind::Note, "binary file, not shown".into()));
         } else if let Some(mode) = text.strip_prefix("new mode ") {
@@ -643,14 +648,70 @@ fn numbered(kind: LineKind, text: &str, old: Option<u32>, new: Option<u32>) -> P
     }
 }
 
-/// `a/x b/x` from a `diff --git` line. Only a fallback: the `+++` and `---`
-/// lines that follow replace it, and only a binary file or a pure rename or
-/// mode change goes without them.
-fn path_from_diff_line(rest: &str) -> String {
-    match rest.rfind(" b/") {
-        Some(at) => rest[at + 3..].to_string(),
-        None => rest.to_string(),
+/// Decode a Git C-quoted path, returning the unquoted path and whatever
+/// follows the closing quote.
+fn quoted_path(text: &str) -> Option<(String, &str)> {
+    let mut bytes = text.strip_prefix('"')?.bytes();
+    let mut path = Vec::new();
+    while let Some(byte) = bytes.next() {
+        match byte {
+            b'"' => {
+                let remaining = &text[text.len() - bytes.len()..];
+                return Some((String::from_utf8_lossy(&path).into_owned(), remaining));
+            }
+            b'\\' => {
+                let escaped = match bytes.next()? {
+                    b'a' => b'\x07',
+                    b'b' => b'\x08',
+                    b't' => b'\t',
+                    b'n' => b'\n',
+                    b'v' => b'\x0b',
+                    b'f' => b'\x0c',
+                    b'r' => b'\r',
+                    value @ (b'\\' | b'"') => value,
+                    first @ b'0'..=b'3' => {
+                        let digit = |b| (b'0'..=b'7').contains(&b).then(|| b - b'0');
+                        (first - b'0') * 64 + digit(bytes.next()?)? * 8 + digit(bytes.next()?)?
+                    }
+                    _ => return None,
+                };
+                path.push(escaped);
+            }
+            byte => path.push(byte),
+        }
     }
+    None
+}
+
+/// Decode a path from a `---`, `+++`, `rename to` or `copy to` header.
+/// Git appends a tab to unquoted paths that contain spaces, and C-quotes
+/// paths with quotes, control characters or non-ASCII bytes.
+fn patch_path(text: &str, prefix: &str) -> Option<String> {
+    let text = text.strip_suffix('\t').unwrap_or(text);
+    if text.starts_with('"') {
+        let (decoded, "") = quoted_path(text)? else {
+            return None;
+        };
+        return decoded.strip_prefix(prefix).map(str::to_owned);
+    }
+    text.strip_prefix(prefix).map(str::to_owned)
+}
+
+/// `a/x b/x` from a `diff --git` line. Only a fallback: `+++`, `---` and
+/// `rename to` replace it when present, leaving only binary files, empty
+/// files and pure mode changes where both sides share the same path.
+fn path_from_diff_line(rest: &str) -> Option<String> {
+    if rest.starts_with('"') {
+        let (old, rest) = quoted_path(rest)?;
+        let old = old.strip_prefix("a/")?;
+        let new = patch_path(rest.strip_prefix(' ')?, "b/")?;
+        return (old == new).then_some(new);
+    }
+
+    let (old, new) = rest.split_at_checked(rest.len() / 2)?;
+    let old = old.strip_prefix("a/")?;
+    let new = new.strip_prefix(" b/")?;
+    (old == new).then(|| new.to_owned())
 }
 
 /// Where a hunk starts in each file, from `@@ -12,7 +12,9 @@`.
@@ -844,6 +905,65 @@ mod tests {
         assert_eq!(lines.len(), 2);
         assert_eq!(lines[0].text, "logo.png");
         assert_eq!(lines[1].kind, LineKind::Note);
+    }
+
+    #[test]
+    fn quoted_paths_with_escapes_and_non_ascii_are_decoded() {
+        let raw = concat!(
+            "diff --git \"a/name\\\"quote.txt\" \"b/name\\\"quote.txt\"\n",
+            "--- \"a/name\\\"quote.txt\"\n",
+            "+++ \"b/name\\\"quote.txt\"\n",
+            "@@ -1 +1 @@\n-before\n+after\n",
+            "diff --git \"a/caf\\303\\251/\\344\\270\\255\\346\\226\\207.txt\" \"b/caf\\303\\251/\\344\\270\\255\\346\\226\\207.txt\"\n",
+            "--- \"a/caf\\303\\251/\\344\\270\\255\\346\\226\\207.txt\"\n",
+            "+++ /dev/null\n",
+            "@@ -1 +0,0 @@\n-gone\n",
+            "diff --git a/old.txt \"b/new \\\"name\\\".txt\"\n",
+            "similarity index 100%\n",
+            "rename from old.txt\n",
+            "rename to \"new \\\"name\\\".txt\"\n",
+            "diff --git a/src.txt \"b/copy \\303\\251.txt\"\n",
+            "similarity index 100%\n",
+            "copy from src.txt\n",
+            "copy to \"copy \\303\\251.txt\"\n",
+        );
+        let paths: Vec<String> = parse_patch(raw)
+            .into_iter()
+            .filter(|line| line.kind == LineKind::File)
+            .map(|line| line.text)
+            .collect();
+        assert_eq!(
+            paths,
+            [
+                "name\"quote.txt",
+                "café/中文.txt",
+                "new \"name\".txt",
+                "copy é.txt",
+            ]
+        );
+    }
+
+    #[test]
+    fn paths_with_spaces_keep_their_exact_name() {
+        let raw = concat!(
+            "diff --git a/my docs/note.txt b/my docs/note.txt\n",
+            "--- a/my docs/note.txt\t\n",
+            "+++ b/my docs/note.txt\t\n",
+            "@@ -1 +1 @@\n-a\n+b\n",
+            "diff --git a/dir b/blob.bin b/dir b/blob.bin\n",
+            "Binary files a/dir b/blob.bin and b/dir b/blob.bin differ\n",
+            "diff --git \"a/my \\\"img\\\".png\" \"b/my \\\"img\\\".png\"\n",
+            "Binary files \"a/my \\\"img\\\".png\" and \"b/my \\\"img\\\".png\" differ\n",
+        );
+        let paths: Vec<String> = parse_patch(raw)
+            .into_iter()
+            .filter(|line| line.kind == LineKind::File)
+            .map(|line| line.text)
+            .collect();
+        assert_eq!(
+            paths,
+            ["my docs/note.txt", "dir b/blob.bin", "my \"img\".png"]
+        );
     }
 
     #[test]
