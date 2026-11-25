@@ -253,6 +253,10 @@ Some implementation notes worth knowing:
 - Every invocation passes **`--no-optional-locks`**. Without it, polling hundreds
   of repos would take `index.lock` and rewrite indexes constantly, fighting your
   editor and any GUI client you have open.
+- A file that only differs from the index **before its clean filter runs** is not
+  counted as changed. `git status` lists one whenever its size differs, though
+  `git diff` is empty and there is nothing to commit. Git LFS files, and repos
+  with more than 20 such files, are left as `git status` reports them.
 - The index mtime is deliberately **not** treated as activity. Any tool that runs
   `git status` refreshes it, so an editor sitting open on a repo would otherwise
   make it read as recently active when nothing had happened.

@@ -19,6 +19,7 @@
 //! At 500-plus repos, a process spawn avoided is worth having.
 
 use anyhow::{anyhow, Context, Result};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::process::Command;
@@ -36,6 +37,10 @@ const GIT_TIMEOUT: Duration = Duration::from_secs(30);
 /// How many tags to pull dates for. Only used to date the tag `describe`
 /// picked, so the newest few hundred is plenty.
 const TAG_LIMIT: usize = 400;
+
+/// How many changed files to run through their clean filters per repo. Each can
+/// cost a process, and a repo with more than this has real work in it anyway.
+const FILTER_CHECK_LIMIT: usize = 20;
 
 /// A `git` command against a repo with the safety rails applied, ready to run.
 fn git_command(root: &Path, args: &[&str]) -> Command {
@@ -84,6 +89,41 @@ pub(crate) async fn run_git(root: &Path, args: &[&str]) -> Result<String> {
 /// error. `describe` on a repo with no tags is the motivating case.
 async fn try_git(root: &Path, args: &[&str]) -> Option<String> {
     run_git(root, args).await.ok()
+}
+
+/// Like [`run_git`], but with `input` on stdin.
+async fn run_git_with_input(root: &Path, args: &[&str], input: &str) -> Result<String> {
+    use tokio::io::AsyncWriteExt;
+
+    let mut cmd = git_command(root, args);
+    cmd.stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null());
+    let mut child = cmd
+        .spawn()
+        .with_context(|| format!("Running git {}", args.join(" ")))?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| anyhow!("git {} took no input", args.join(" ")))?;
+
+    // Written while the output is being read: git answers as it goes, and with
+    // enough paths both pipes fill. A failed write means git has exited early,
+    // which its exit status reports.
+    let write = async move {
+        let _ = stdin.write_all(input.as_bytes()).await;
+    };
+    let (_, output) = tokio::time::timeout(GIT_TIMEOUT, async {
+        tokio::join!(write, child.wait_with_output())
+    })
+    .await
+    .map_err(|_| anyhow!("git {} timed out", args.join(" ")))?;
+    let output = output.with_context(|| format!("Running git {}", args.join(" ")))?;
+
+    if !output.status.success() {
+        return Err(anyhow!("git {} failed", args.join(" ")));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
 /// Like [`run_git`], but stops reading after `cap` bytes and says whether it
@@ -994,6 +1034,8 @@ pub async fn probe_work(root: &Path, cfg: &StatusConfig) -> Result<WorkInfo> {
     )
     .await?;
 
+    let unchanged = unchanged_after_filter(root, &raw).await;
+
     let mut info = WorkInfo {
         staged: 0,
         unstaged: 0,
@@ -1017,7 +1059,13 @@ pub async fn probe_work(root: &Path, cfg: &StatusConfig) -> Result<WorkInfo> {
                 let xy = rest.get(..2).unwrap_or("..");
                 let mut chars = xy.chars();
                 let x = chars.next().unwrap_or('.');
-                let y = chars.next().unwrap_or('.');
+                let mut y = chars.next().unwrap_or('.');
+                if unchanged.contains(line) {
+                    y = '.';
+                    if x == '.' {
+                        continue;
+                    }
+                }
                 if x != '.' {
                     info.staged += 1;
                 }
@@ -1029,7 +1077,7 @@ pub async fn probe_work(root: &Path, cfg: &StatusConfig) -> Result<WorkInfo> {
                 } else {
                     ChangeKind::Staged
                 };
-                (path, xy.to_string(), kind)
+                (path, format!("{x}{y}"), kind)
             }
             // u <XY> <sub> <m1> <m2> <m3> <mW> <h1> <h2> <h3> <path>
             "u" => {
@@ -1059,6 +1107,107 @@ pub async fn probe_work(root: &Path, cfg: &StatusConfig) -> Result<WorkInfo> {
 
     stat_changed_files(root, &mut info);
     Ok(info)
+}
+
+/// The status records that name a file whose content, put through its clean
+/// filter, is already what the index holds.
+///
+/// When a file's size differs from the one in the index, git calls it modified
+/// without running the filter, and goes on doing so until something refreshes
+/// the index. So a filter that strips lines leaves a file showing as modified
+/// with an empty diff and nothing to commit. Hashing the file through the
+/// filter is the same comparison `git add` would make.
+///
+/// `git diff` gets this right too, but it rewrites the index as it goes, even
+/// with `--no-optional-locks`.
+///
+/// Anything that can't be checked stays reported as git had it.
+async fn unchanged_after_filter<'a>(root: &Path, raw: &'a str) -> HashSet<&'a str> {
+    let modified: Vec<Modified> = raw.lines().filter_map(Modified::parse).collect();
+    let Some(attrs) = paths_through(root, &["check-attr", "--stdin", "filter"], &modified).await
+    else {
+        return HashSet::new();
+    };
+
+    let filtered: Vec<Modified> = modified
+        .into_iter()
+        .zip(&attrs)
+        .filter(|(_, attr)| has_lossy_filter(attr))
+        .map(|(file, _)| file)
+        .collect();
+    if filtered.len() > FILTER_CHECK_LIMIT {
+        return HashSet::new();
+    }
+    let Some(hashes) = paths_through(root, &["hash-object", "--stdin-paths"], &filtered).await
+    else {
+        return HashSet::new();
+    };
+
+    filtered
+        .iter()
+        .zip(&hashes)
+        .filter(|(file, hash)| file.index_hash == hash.as_str())
+        .map(|(file, _)| file.line)
+        .collect()
+}
+
+/// Whether a `check-attr` line, `<path>: filter: <value>`, names a filter that
+/// could make a changed file come out the same.
+///
+/// Not Git LFS: it stores a copy of whatever it cleans, so hashing a file
+/// through it would write to the repo. It's also lossless, so a file of a
+/// different size really has changed.
+fn has_lossy_filter(attr: &str) -> bool {
+    let value = attr.rsplit(": ").next().unwrap_or("");
+    !matches!(value, "unspecified" | "unset" | "set" | "lfs")
+}
+
+/// Feed the files' paths to a git command that answers with one line each.
+/// `None` when there is nothing to ask, or the answer doesn't line up.
+///
+/// Paths go in as status printed them: git quotes the awkward ones the same way
+/// in both directions.
+async fn paths_through(root: &Path, args: &[&str], files: &[Modified<'_>]) -> Option<Vec<String>> {
+    if files.is_empty() {
+        return None;
+    }
+    let input: String = files.iter().map(|f| format!("{}\n", f.path)).collect();
+    let out = run_git_with_input(root, args, &input).await.ok()?;
+    let lines: Vec<String> = out.lines().map(str::to_string).collect();
+    (lines.len() == files.len()).then_some(lines)
+}
+
+/// A status record for a regular file whose unstaged change, if it has one, is
+/// to its content alone.
+struct Modified<'a> {
+    line: &'a str,
+    path: String,
+    index_hash: &'a str,
+}
+
+impl<'a> Modified<'a> {
+    fn parse(line: &'a str) -> Option<Self> {
+        let (tag, rest) = line.split_once(' ')?;
+        let leading = match tag {
+            "1" => 8,
+            "2" => 9,
+            _ => return None,
+        };
+        // <XY> <sub> <mH> <mI> <mW> <hH> <hI> ...
+        let fields: Vec<&str> = rest.splitn(8, ' ').collect();
+        let [xy, _, _, index_mode, work_mode, _, index_hash, _] = fields[..] else {
+            return None;
+        };
+        // Regular files only: `hash-object` would follow a symlink.
+        if !xy.ends_with('M') || index_mode != work_mode || !work_mode.starts_with("100") {
+            return None;
+        }
+        Some(Self {
+            line,
+            path: field_tail(rest, leading),
+            index_hash,
+        })
+    }
 }
 
 /// Take the final field of a porcelain v2 record, given how many
@@ -1140,6 +1289,135 @@ mod tests {
         assert_ne!(before, after);
         assert_eq!(before.info_exclude_mtime, Some(1_000));
         assert_eq!(after.info_exclude_mtime, Some(2_000));
+    }
+
+    // Git calls a file modified when its size differs from the index, without
+    // running its clean filter. A filter that strips lines then leaves it
+    // modified with nothing to commit, which isn't work anyone can act on.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_file_its_clean_filter_makes_unchanged_is_not_dirty() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let write = |name: &str, text: &str| std::fs::write(root.join(name), text).unwrap();
+        git(root, &["init", "-q", "-b", "main", "."]);
+        git(root, &["config", "filter.strip.clean", "sed /noise/d"]);
+        git(root, &["config", "filter.same.clean", "cat"]);
+        write(".gitattributes", "*.txt filter=strip\n*.lnk filter=same\n");
+
+        let names = [
+            "plain.txt",
+            "a space.txt",
+            "colon: filter: x.txt",
+            "q\"t.txt",
+        ];
+        for name in names {
+            write(name, "keep\n");
+        }
+        for name in ["real.txt", "both.txt", "mode.txt", "none.md"] {
+            write(name, "keep\n");
+        }
+        std::os::unix::fs::symlink("none.md", root.join("link.lnk")).unwrap();
+        git(root, &["add", "."]);
+        git(root, &["commit", "-qm", "init"]);
+
+        for name in names {
+            write(name, "keep\nnoise\n");
+        }
+        let cfg = StatusConfig::default();
+        let index = root.join(".git/index");
+        let stamp = || std::fs::metadata(&index).unwrap().modified().unwrap();
+        let before = stamp();
+        let raw = run_git(root, &["status", "--porcelain=v2"]).await.unwrap();
+        assert_eq!(raw.lines().count(), names.len(), "the premise: {raw}");
+
+        let info = probe_work(root, &cfg).await.unwrap();
+        assert_eq!((info.staged, info.unstaged), (0, 0), "{:?}", info.files);
+        assert!(info.files.is_empty());
+        assert_eq!(stamp(), before, "the index must not be rewritten");
+
+        // Real changes still count, whatever else is going on with the file.
+        write("real.txt", "keep\nmore\n");
+        write("none.md", "keep\nnoise\n");
+        write("mode.txt", "keep\nnoise\n");
+        let exec = std::os::unix::fs::PermissionsExt::from_mode(0o755);
+        std::fs::set_permissions(root.join("mode.txt"), exec).unwrap();
+        // The new target holds what the old link's blob did, which is what
+        // following the link would compare.
+        write("target", "none.md");
+        std::fs::remove_file(root.join("link.lnk")).unwrap();
+        std::os::unix::fs::symlink("target", root.join("link.lnk")).unwrap();
+        // Staged for real, then noise on top: only the staged half is left.
+        write("both.txt", "keep\nstaged\n");
+        git(root, &["add", "both.txt"]);
+        write("both.txt", "keep\nstaged\nnoise\n");
+
+        let info = probe_work(root, &cfg).await.unwrap();
+        let mut got: Vec<_> = info
+            .files
+            .iter()
+            .map(|f| (f.path.as_str(), f.code.as_str()))
+            .collect();
+        got.sort();
+        assert_eq!(
+            got,
+            [
+                ("both.txt", "M."),
+                ("link.lnk", ".M"),
+                ("mode.txt", ".M"),
+                ("none.md", ".M"),
+                ("real.txt", ".M"),
+                ("target", "??"),
+            ]
+        );
+        assert_eq!((info.staged, info.unstaged), (1, 4));
+
+        // A filter that can't run proves nothing.
+        git(root, &["config", "filter.strip.clean", "false"]);
+        git(root, &["config", "filter.strip.required", "true"]);
+        let info = probe_work(root, &cfg).await.unwrap();
+        assert!(info.files.iter().any(|f| f.path == "plain.txt"));
+    }
+
+    // Past the limit nothing is hashed, and asking which of a great many files
+    // have a filter must not fill one pipe while git waits on the other.
+    #[tokio::test]
+    async fn a_great_many_filtered_files_are_left_as_git_reports_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        git(root, &["init", "-q", "-b", "main", "."]);
+        git(root, &["config", "filter.strip.clean", "sed /noise/d"]);
+        // Committed before the filter applies, so setup doesn't run it.
+        let names: Vec<String> = (0..2_000)
+            .map(|i| format!("{}-{i}.txt", "long".repeat(25)))
+            .collect();
+        for name in &names {
+            std::fs::write(root.join(name), "keep\n").unwrap();
+        }
+        git(root, &["add", "."]);
+        git(root, &["commit", "-qm", "init"]);
+        std::fs::write(root.join(".gitattributes"), "*.txt filter=strip\n").unwrap();
+        for name in &names {
+            std::fs::write(root.join(name), "keep\nnoise\n").unwrap();
+        }
+
+        let info = probe_work(root, &StatusConfig::default()).await.unwrap();
+        assert_eq!(info.unstaged as usize, names.len());
+
+        let input = names.join("\n") + "\n";
+        let attrs = run_git_with_input(root, &["check-attr", "--stdin", "filter"], &input).await;
+        assert_eq!(attrs.unwrap().lines().count(), names.len());
+    }
+
+    #[test]
+    fn only_a_filter_that_can_drop_content_is_worth_running() {
+        assert!(has_lossy_filter("a.ipynb: filter: nbstripout"));
+        assert!(has_lossy_filter("x: filter: lfs: filter: strip"));
+        assert!(!has_lossy_filter("a.bin: filter: lfs"));
+        assert!(!has_lossy_filter("a.md: filter: unspecified"));
+        assert!(!has_lossy_filter(
+            "a: filter: strip.md: filter: unspecified"
+        ));
     }
 
     #[test]
