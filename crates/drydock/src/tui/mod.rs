@@ -4,6 +4,7 @@
 //! streams in fresh results as a sweep runs behind it. Key handling and
 //! rendering are split: this module owns state and events, `ui` owns pixels.
 
+mod clipboard;
 mod history;
 mod keys;
 mod ui;
@@ -1774,21 +1775,7 @@ fn copy_path(app: &mut App) {
 }
 
 fn copy_text(app: &mut App, text: &str) {
-    let result = (|| -> std::io::Result<()> {
-        use std::io::Write;
-        let mut child = std::process::Command::new("pbcopy")
-            .stdin(std::process::Stdio::piped())
-            .spawn()?;
-        if let Some(stdin) = child.stdin.as_mut() {
-            stdin.write_all(text.as_bytes())?;
-        }
-        child.wait()?;
-        Ok(())
-    })();
-    match result {
-        Ok(()) => app.notify(format!("Copied {text}")),
-        Err(err) => app.notify(format!("Could not copy: {err}")),
-    }
+    app.notify(clipboard::copy(text));
 }
 
 // ---------------------------------------------------------------------------
