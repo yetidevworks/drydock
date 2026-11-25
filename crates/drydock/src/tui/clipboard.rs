@@ -96,3 +96,37 @@ fn encode_base64(input: &[u8]) -> String {
     }
     out
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn base64_matches_the_rfc_4648_vectors() {
+        for (input, expected) in [
+            ("", ""),
+            ("f", "Zg=="),
+            ("fo", "Zm8="),
+            ("foo", "Zm9v"),
+            ("foob", "Zm9vYg=="),
+            ("fooba", "Zm9vYmE="),
+            ("foobar", "Zm9vYmFy"),
+            ("中文", "5Lit5paH"),
+        ] {
+            assert_eq!(encode_base64(input.as_bytes()), expected, "{input:?}");
+        }
+    }
+
+    #[test]
+    fn osc52_writes_one_sequence_and_nothing_when_it_cannot() {
+        let mut out = Vec::new();
+        write_osc52(&mut out, "/tmp/repo", true).unwrap();
+        assert_eq!(out, b"\x1b]52;c;L3RtcC9yZXBv\x07");
+
+        let mut out = Vec::new();
+        assert!(write_osc52(&mut out, "/tmp/repo", false).is_err());
+        let too_big = "a".repeat(OSC52_MAX_BYTES + 1);
+        assert!(write_osc52(&mut out, &too_big, true).is_err());
+        assert!(out.is_empty(), "a refused copy writes nothing");
+    }
+}

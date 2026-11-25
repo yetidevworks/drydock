@@ -1,8 +1,10 @@
 # 1.4.3
 
-## 11/24/2026
+## 11/25/2026
 
-1. [](#bugfix)
+1. [](#improved)
+    * **Copying works on Linux and over SSH** ([#20](https://github.com/yetidevworks/drydock/pull/20)). The copy key only ever ran `pbcopy`, so it failed everywhere but a local Mac. On Linux it now tries `wl-copy`, `xclip`, then `xsel`, and over SSH, or when no local tool works, it sends the text to your terminal with OSC 52, so a path or commit hash copied on a remote box lands in your local clipboard. Under tmux that needs `set -g set-clipboard on`. Thanks to @iasi777 for the change.
+2. [](#bugfix)
     * **History shows file names with quotes, backslashes, tabs or spaces correctly** ([#19](https://github.com/yetidevworks/drydock/pull/19)). Git quotes and escapes those names in a diff's headers, and drydock showed them as written, so `name"quote.txt` appeared as `"b/name\"quote.txt"`, a name with a space carried a stray tab, and a binary file in a folder like `dir b/` lost the folder. Renamed and copied files get the same treatment. Thanks to @iasi777 for the fix.
 
 # 1.4.2

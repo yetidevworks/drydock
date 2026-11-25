@@ -179,11 +179,7 @@ It reads the newest 400 commits and stops a diff at a couple of megabytes, which
 
 ### Clipboard
 
-`y` copies the selected path or commit hash using `pbcopy` on macOS, or
-`wl-copy`, `xclip`, then `xsel` on Linux, stopping at the first success.
-Over SSH, or if no local tool succeeds, drydock sends OSC 52 to your terminal;
-the terminal must support and allow clipboard writes. In tmux, add
-`set -g set-clipboard on` to `~/.tmux.conf` so applications can set the clipboard.
+The copy key (`y` by default) copies the selected path, or the commit hash in history, using `pbcopy` on macOS, or `wl-copy`, `xclip`, then `xsel` on Linux, stopping at the first one that works. Over SSH, or when no local tool works, drydock sends the text to your terminal with OSC 52 instead, which the terminal has to support and allow. In tmux, add `set -g set-clipboard on` to `~/.tmux.conf` so it passes the copy through.
 
 ### Commands
 
