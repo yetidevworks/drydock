@@ -177,6 +177,14 @@ The list is the branch you have checked out plus its upstream, so commits you ha
 
 It reads the newest 400 commits and stops a diff at a couple of megabytes, which is far past what anyone scrolls in a terminal; `t` opens the repo in your git client for anything bigger. The view follows the repo while it's open, so a commit, a pull or a fetch shows up without closing it.
 
+### Clipboard
+
+`y` copies the selected path or commit hash using `pbcopy` on macOS, or
+`wl-copy`, `xclip`, then `xsel` on Linux, stopping at the first success.
+Over SSH, or if no local tool succeeds, drydock sends OSC 52 to your terminal;
+the terminal must support and allow clipboard writes. In tmux, add
+`set -g set-clipboard on` to `~/.tmux.conf` so applications can set the clipboard.
+
 ### Commands
 
 ```sh

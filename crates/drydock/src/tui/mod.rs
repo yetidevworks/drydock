@@ -175,9 +175,6 @@ pub struct App {
     /// The whole terminal, as of the last frame, so key handlers can size
     /// their steps to what's on screen.
     pub area: Rect,
-    /// Text queued by a copy key during this turn, flushed to the clipboard
-    /// immediately by the event loop before any queued quit key can run.
-    pending_copy: Option<String>,
     pub should_quit: bool,
 }
 
@@ -245,7 +242,6 @@ impl App {
             rows_on_screen: 20,
             history: None,
             area: Rect::new(0, 0, 120, 40),
-            pending_copy: None,
             should_quit: false,
         };
         app.reindex();
@@ -581,8 +577,6 @@ enum Input {
     AutoFetch,
     /// Git answering the history view.
     History(Box<history::Loaded>),
-    /// A local clipboard tool finished (or missed and needs OSC 52).
-    Clipboard(clipboard::Outcome),
     Tick,
 }
 
@@ -613,7 +607,6 @@ pub async fn run(roots: Vec<String>) -> Result<()> {
 
 async fn run_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) -> Result<()> {
     let (tx, mut rx) = mpsc::unbounded_channel::<Input>();
-    let mut clipboard = clipboard::Clipboard::for_terminal(tx.clone());
 
     // Paint before doing anything else, always. Nothing below this line gets to
     // decide whether the user sees a window or a blank screen: if some piece of
@@ -741,11 +734,6 @@ async fn run_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut A
                     && !matches!(key.code, KeyCode::Modifier(_))
                 {
                     handle_key(app, key, &tx);
-                    if let Some(text) = app.pending_copy.take() {
-                        if let Some(status) = clipboard.copy(terminal.backend_mut(), text) {
-                            app.notify(status);
-                        }
-                    }
                 }
                 dirty = true;
             }
@@ -765,12 +753,6 @@ async fn run_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut A
             Input::History(loaded) => {
                 history::on_loaded(app, *loaded, &tx);
                 dirty = true;
-            }
-            Input::Clipboard(outcome) => {
-                if let Some(status) = clipboard.finish(terminal.backend_mut(), outcome) {
-                    app.notify(status);
-                    dirty = true;
-                }
             }
             Input::Changed(paths) => {
                 reprobe_paths(app, paths, &tx);
@@ -804,7 +786,6 @@ async fn run_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut A
             break;
         }
     }
-    clipboard.flush(terminal.backend_mut(), &mut rx).await;
     Ok(())
 }
 
@@ -1794,7 +1775,7 @@ fn copy_path(app: &mut App) {
 }
 
 fn copy_text(app: &mut App, text: &str) {
-    app.pending_copy = Some(text.to_string());
+    app.notify(clipboard::copy(text));
 }
 
 // ---------------------------------------------------------------------------
@@ -2548,18 +2529,6 @@ mod tests {
         assert_eq!(
             web_url("ssh://git@git.example.com/team/repo.git"),
             "https://git.example.com/team/repo"
-        );
-    }
-
-    #[test]
-    fn copy_key_sets_pending_copy_in_the_same_turn() {
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        let mut app = app_with(1);
-        handle_key(&mut app, KeyEvent::from(KeyCode::Char('y')), &tx);
-        assert_eq!(app.pending_copy.as_deref(), Some("/p/g/r0"));
-        assert!(
-            rx.try_recv().is_err(),
-            "copy should not wait behind queued events such as quit"
         );
     }
 }
